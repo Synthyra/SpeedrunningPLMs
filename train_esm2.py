@@ -31,6 +31,8 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
+import warnings
+warnings.filterwarnings("ignore")
 
 from optimizer import Muon
 from model import ModelConfig, ESM, CastedLinear
@@ -59,7 +61,7 @@ def get_args():
     parser.add_argument('--cooldown_steps', type=int, default=1000, help='number of cooldown steps')
     
     # Evaluation and logging hyperparams
-    parser.add_argument('--valid_loss_every', type=int, default=1000, help='every how many steps to evaluate val loss? 0 for only at the end')
+    parser.add_argument('--eval_every', type=int, default=1000, help='every how many steps to evaluate val loss? 0 for only at the end')
     parser.add_argument('--hf_model_name', type=str, default='Synthyra/esm_speedrun', help='huggingface model name')
     parser.add_argument('--token', type=str, default=None, help='huggingface token')
     parser.add_argument('--save_every', type=int, default=None, help='save every how many steps? None for no saving')
@@ -241,7 +243,7 @@ if __name__ == "__main__":
             sw_prev = sw_size
 
         # once in a while evaluate the validation dataset
-        if args.valid_loss_every > 0 and step % args.valid_loss_every == 0 or last_step:
+        if args.eval_every > 0 and step % args.eval_every == 0 or last_step:
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
