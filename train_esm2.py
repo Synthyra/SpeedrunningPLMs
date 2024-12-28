@@ -249,15 +249,38 @@ if __name__ == "__main__":
             model.eval()
             valid_loader.reset()
             val_loss = 0.0
+            val_true, val_pred = [], []
             with torch.no_grad():
                 for _ in range(valid_steps):
                     input_ids = valid_loader.next_batch()
-                    val_loss += model(input_ids, sliding_window_size)
+                    logits, loss, labels = model.inference(input_ids, sliding_window_size)
+                    val_true.extend(labels.cpu().numpy().flatten())
+                    val_pred.extend(logits.argmax(dim=-1).cpu().numpy().flatten())
+                    val_loss += loss.detach().cpu().item()
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss /= valid_steps
-            # log val loss to console and to logfile
-            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
+            val_perplexity = torch.exp(torch.tensor(val_loss)).item()
+            
+            # Calculate validation metrics
+            val_true = np.array(val_true)
+            val_pred = np.array(val_pred)
+            mask = (val_true != -100)
+            val_true = val_true[mask]
+            val_pred = val_pred[mask]
+            
+            val_precision = precision_score(val_true, val_pred, average='weighted')
+            val_recall = recall_score(val_true, val_pred, average='weighted')
+            val_f1 = f1_score(val_true, val_pred, average='weighted')
+            val_accuracy = accuracy_score(val_true, val_pred)
+            val_mcc = matthews_corrcoef(val_true, val_pred)
+            
+            # log validation metrics to console
+            print0(f'step:{step}/{args.num_steps}')
+            print0(f'Loss: {val_loss:.4f} | Perplexity: {val_perplexity:.4f}')
+            print0(f'Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f} | Accuracy: {val_accuracy:.4f} | MCC: {val_mcc:.4f}')
+            print0(f'Train Time: {training_time_ms:.0f}ms | Step Avg: {training_time_ms/(timed_steps-1):.2f}ms | Param Count: {get_param_count(model):,}')
+            
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -351,13 +374,8 @@ if __name__ == "__main__":
     mcc = matthews_corrcoef(all_true, all_pred)
 
     print0("Final Results:")
-    print0(f"  Loss:        {average_loss:.4f}")
-    print0(f"  Perplexity:  {perplexity:.4f}")
-    print0(f"  Precision:   {precision:.4f}")
-    print0(f"  Recall:      {recall:.4f}")
-    print0(f"  F1:          {f1:.4f}")
-    print0(f"  Accuracy:    {accuracy:.4f}")
-    print0(f"  MCC:         {mcc:.4f}")
+    print0(f"Loss: {average_loss:.4f}, Perplexity: {perplexity:.4f}")
+    print0(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, Accuracy: {accuracy:.4f}, MCC: {mcc:.4f}")
 
     print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
     # -------------------------------------------------------------------------
