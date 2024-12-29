@@ -280,7 +280,7 @@ class ESM(PreTrainedModel):
         loss = None
         if labels is not None:
             loss = self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
-        return logits, loss, labels
+        return logits.cpu(), loss.cpu(), labels.cpu()
 
     def forward(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor) -> torch.Tensor:
         input_ids, labels = self.masker(input_ids)
