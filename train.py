@@ -22,7 +22,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from optimizer import Muon
-from dataloading import DistributedPaddedDataLoader, OptimizedDistributedPaddedDataLoader
+from dataloading import DistributedPaddedDataLoader, OptimizedDistributedPaddedDataLoader, DistributedPaddedIterableDataset8
 from model.model import PLM, PLMConfig
 from model.utils import Linear
 
@@ -108,7 +108,7 @@ def main(args, model_config):
     pad_token_id = tokenizer.pad_token_id
     
     # Use optimized dataloader with multiple workers
-    train_loader = OptimizedDistributedPaddedDataLoader(
+    train_loader = DistributedPaddedIterableDataset8(
         filename_pattern=args.input_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,
@@ -119,7 +119,7 @@ def main(args, model_config):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
     )
-    valid_loader = OptimizedDistributedPaddedDataLoader(
+    valid_loader = DistributedPaddedIterableDataset8(
         filename_pattern=args.input_valid_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,
@@ -130,7 +130,7 @@ def main(args, model_config):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
     )
-    test_loader = OptimizedDistributedPaddedDataLoader(
+    test_loader = DistributedPaddedIterableDataset8(
         filename_pattern=args.input_test_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,
@@ -317,6 +317,7 @@ def main(args, model_config):
                 if ddp_world_size > 1 and i < args.grad_accum - 1:
                     stack.enter_context(model.no_sync())
                 input_ids, labels, mask_rate = train_loader.next_batch()
+                print(f'len(input_ids): {len(input_ids)}')
                 loss = model(input_ids, labels, mask_rate, sliding_window_size) / args.grad_accum
                 loss.backward()
 
