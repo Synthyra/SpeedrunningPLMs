@@ -22,7 +22,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from optimizer import Muon
-from dataloading import DistributedPaddedDataLoader, OptimizedDistributedPaddedDataLoader, DistributedPaddedIterableDataset8
+from dataloading import DistributedPaddedDataLoader, OptimizedDistributedPaddedDataLoader, OptimizedDistributedPaddedDataLoader8
 from model.model import PLM, PLMConfig
 from model.utils import Linear
 
@@ -108,7 +108,7 @@ def main(args, model_config):
     pad_token_id = tokenizer.pad_token_id
     
     # Use optimized dataloader with multiple workers
-    train_loader = DistributedPaddedIterableDataset8(
+    train_loader = OptimizedDistributedPaddedDataLoader8(
         filename_pattern=args.input_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,
@@ -119,7 +119,7 @@ def main(args, model_config):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
     )
-    valid_loader = DistributedPaddedIterableDataset8(
+    valid_loader = OptimizedDistributedPaddedDataLoader8(
         filename_pattern=args.input_valid_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,
@@ -130,7 +130,7 @@ def main(args, model_config):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
     )
-    test_loader = DistributedPaddedIterableDataset8(
+    test_loader = OptimizedDistributedPaddedDataLoader8(
         filename_pattern=args.input_test_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,

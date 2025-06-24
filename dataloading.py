@@ -466,7 +466,7 @@ class DistributedPaddedIterableDataset8(IterableDataset):
     def __init__(
         self,
         filename_pattern: str,
-        seq_len: int,
+        max_seq_len: int,
         process_rank: int,
         num_processes: int,
         max_epochs: int,
@@ -475,7 +475,7 @@ class DistributedPaddedIterableDataset8(IterableDataset):
         num_workers: int = 1,
     ):
         self.filename_pattern = filename_pattern
-        self.max_seq_len = seq_len  # Maximum allowed sequence length
+        self.max_seq_len = max_seq_len  # Maximum allowed sequence length
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.max_epochs = max_epochs
@@ -651,3 +651,76 @@ class DistributedPaddedIterableDataset8(IterableDataset):
         labels[~mask_indices] = -100
         
         return noisy_batch, labels, mask_rate
+
+
+class OptimizedDistributedPaddedDataLoader8:
+    """Drop-in replacement for DistributedPaddedDataLoader using multi-worker optimization."""
+    
+    def __init__(
+        self,
+        filename_pattern: str,
+        seq_len: int,
+        process_rank: int,
+        num_processes: int,
+        max_epochs: int,
+        training: bool,
+        tokenizer: EsmTokenizer,
+        num_workers: int = 4,
+        prefetch_factor: int = 2,
+    ):
+        self.filename_pattern = filename_pattern
+        self.seq_len = seq_len
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.training = training
+        
+        # Create the dataset to get file count
+        self._dataset = DistributedPaddedIterableDataset8(
+            filename_pattern=filename_pattern,
+            max_seq_len=seq_len,
+            process_rank=process_rank,
+            num_processes=num_processes,
+            max_epochs=max_epochs,
+            training=training,
+            tokenizer=tokenizer,
+            num_workers=num_workers,
+        )
+        
+        # Store file list for compatibility - only this process's files
+        self.files = self._dataset.process_files
+        
+        # Create the optimized dataloader
+        self.dataloader = DataLoader(
+            self._dataset,
+            batch_size=None,  # Dataset returns complete batches
+            num_workers=num_workers,
+            pin_memory=True,  # Pin memory for faster GPU transfer
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+        )
+        
+        # Create iterator
+        self._iterator = None
+        self._exhausted = False
+    
+    def reset(self):
+        """Reset the dataloader iterator."""
+        self._iterator = iter(self.dataloader)
+        self._exhausted = False
+    
+    def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get the next batch, ensuring GPU transfer happens here."""
+        if self._iterator is None:
+            self.reset()
+        
+        try:
+            input_ids, labels, mask_rate = next(self._iterator)
+            # Transfer to GPU with non-blocking
+            input_ids = input_ids.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
+            mask_rate = mask_rate.cuda(non_blocking=True)
+            return input_ids, labels, mask_rate
+        except StopIteration:
+            self._exhausted = True
+            # Return empty tensors to signal end of data
+            return torch.empty(0, device='cuda'), torch.empty(0, device='cuda'), torch.empty(0, device='cuda')
