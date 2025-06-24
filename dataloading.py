@@ -466,7 +466,7 @@ class DistributedPaddedIterableDataset8(IterableDataset):
     def __init__(
         self,
         filename_pattern: str,
-        max_seq_len: int,
+        seq_len: int,
         process_rank: int,
         num_processes: int,
         max_epochs: int,
@@ -475,7 +475,7 @@ class DistributedPaddedIterableDataset8(IterableDataset):
         num_workers: int = 1,
     ):
         self.filename_pattern = filename_pattern
-        self.max_seq_len = max_seq_len  # Maximum allowed sequence length
+        self.max_seq_len = seq_len  # Maximum allowed sequence length
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.max_epochs = max_epochs
