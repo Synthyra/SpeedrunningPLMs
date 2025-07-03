@@ -8,4 +8,5 @@ transformers
 datasets
 optree
 wandb
+scipy
 PyYAML
