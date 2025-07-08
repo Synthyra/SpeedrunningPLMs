@@ -29,6 +29,7 @@ class PLMConfig(PretrainedConfig):
         unet: bool = False,
         mlm: bool = False,
         token_dropout: bool = True,
+        max_seq_len: int = 64*1024,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -47,6 +48,7 @@ class PLMConfig(PretrainedConfig):
         self.unet = unet
         self.mlm = mlm
         self.token_dropout = token_dropout
+        self.max_seq_len = max_seq_len
 
 
 @dataclass

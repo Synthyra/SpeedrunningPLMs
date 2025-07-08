@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch import Tensor
 from typing import Optional
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
@@ -8,27 +9,23 @@ from model.utils import norm, Linear
 
 
 class Rotary(nn.Module):
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
-        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            t = torch.arange(seq_len, device=x.device)
-            freqs = torch.outer(t, self.inv_freq)
-            self.seq_len_cached = seq_len
-            self.cos_cached = freqs.cos()
-            self.sin_cached = freqs.sin()
-        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-        # apply_rotary_emb(x, cos, sin)
-        x1, x2 = x.chunk(2, dim=3)
+    def forward(self, x_BTHD: Tensor):
+        assert self.cos.size(0) >= x_BTHD.size(-3)
+        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x)
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 
 class SelfAttention(nn.Module):
@@ -37,13 +34,14 @@ class SelfAttention(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
+        self.max_seq_len = config.max_seq_len
         self.d_head = self.hidden_size // self.n_heads
 
         assert self.hidden_size % self.n_heads == 0
         self.Wq = Linear(self.hidden_size, self.hidden_size)
         self.Wk = Linear(self.hidden_size, self.hidden_size)
         self.Wv = Linear(self.hidden_size, self.hidden_size)
-        self.rotary = Rotary(self.d_head) # dim // num_attention_heads = head_dim
+        self.rotary = Rotary(self.d_head, self.max_seq_len) # dim // num_attention_heads = head_dim
         self.Wo = Linear(self.hidden_size, self.hidden_size)
         self.Wo.weight.data.zero_() # zero init suggested by @Grad6230497
         

@@ -14,6 +14,7 @@ import subprocess
 import math
 import argparse
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 #import torch._dynamo
 import torch._inductor.config as inductor_config
@@ -25,9 +26,10 @@ from pathlib import Path
 from tqdm import tqdm
 
 from model.model import PLM, PLMConfig
-from model.utils import Linear
+#from model.utils import Linear
 from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
 from optimizer import Muon
+from optimizer_bf16 import Muon as Muon_bf16
 from utils import (
     set_seed,
     load_config_from_yaml,
@@ -47,7 +49,6 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
-#torch._dynamo.config.suppress_errors = True
 inductor_config.max_autotune_gemm_backends = "ATEN,CUTLASS,FBGEMM"
 
 
@@ -80,17 +81,17 @@ def arg_parser():
     parser.add_argument("--expansion_ratio", type=float, default=8/3, help="Expansion ratio for MLP")
     parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
     parser.add_argument("--attention_soft_cap", type=float, default=64.0, help="Attention softmax cap")
-    parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
+    parser.add_argument("--add_att_soft_cap", type=bool, default=False, help="Add attention softmax cap")
     parser.add_argument("--p_attention", action="store_true", help="Use P attention")
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
     parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
     parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
-    parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
+    parser.add_argument("--bfloat16", type=bool, default=True, help="Use bfloat16")
     
     # Data hyperparams
-    parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
-    parser.add_argument("--input_valid_bin", type=str, default='data/omgprot50/omgprot50_valid_*.bin', help="Input validation bin files pattern")
-    parser.add_argument("--input_test_bin", type=str, default='data/omgprot50/omgprot50_test_*.bin', help="Input test bin files pattern")
+    parser.add_argument("--input_bin", type=str, default='data/omg_prot50/omg_prot50_train_*.bin', help="Input training bin files pattern")
+    parser.add_argument("--input_valid_bin", type=str, default='data/omg_prot50/omg_prot50_valid_*.bin', help="Input validation bin files pattern")
+    parser.add_argument("--input_test_bin", type=str, default='data/omg_prot50/omg_prot50_test_*.bin', help="Input test bin files pattern")
     parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
     parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
     parser.add_argument("--starting_mask_rate", type=float, default=0.1, help="Starting mask rate for masked language modeling")
@@ -288,7 +289,7 @@ class Trainer:
             )
             self.print0(f"Auto gradient clipping enabled with {self.args.auto_grad_clip_p}% percentile")
         
-        self.optimizers = self.init_optimizers()
+        self.optimizers, self.opt2params = self.init_optimizers()
         self.lr_schedulers, self.sliding_window_size_scheduler, self.mask_rate_scheduler = self.init_schedulers()
         self.print0(f"Ready for training!")
         
@@ -333,6 +334,10 @@ class Trainer:
         model = model.cuda()
         if self.args.bfloat16:
             model = model.bfloat16()
+
+        if self.ddp_world_size > 1:
+            for param in model.parameters():
+                dist.broadcast(param.detach(), 0)
             
         # Synchronize before compilation
         if self.ddp_world_size > 1:
@@ -340,11 +345,11 @@ class Trainer:
         
         self.print0("Coordinate descent tuning - can take up to 30 minutes")
         inductor_config.coordinate_descent_tuning = True
+        #torch._dynamo.config.compiled_autograd = True
         self.print0("Calling torch.compile()")
-        # Enable scalar output capture for .item() calls in compiled functions
-        #torch._dynamo.config.capture_scalar_outputs = True
+        #model = torch.compile(model, dynamic=False)
         model = torch.compile(model)
-        
+
         if self.ddp_world_size > 1:
             # Use static graph if model architecture doesn't change
             model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
@@ -367,17 +372,24 @@ class Trainer:
                 p for n, p in self.model.named_parameters() 
                 if p.ndim < 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
             ]
-            optimizer1 = torch.optim.Adam([
+            adam_param_groups = [
                 dict(params=embed_params, lr=self.args.lr_embed),
                 dict(params=head_params, lr=self.args.lr_head),
                 dict(params=scalar_params, lr=self.args.lr_scalar)
-            ], betas=(0.8, 0.95), fused=True)
-            optimizer2 = Muon(hidden_matrix_params, lr=self.args.lr_hidden, momentum=0.95)
+            ]
+            muon_cls = Muon_bf16 if self.args.bfloat16 else Muon
+            optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=13-10, weight_decay=0.0, fused=True)
+            optimizer2 = muon_cls(hidden_matrix_params, lr=self.args.lr_hidden, momentum=0.95, rank=self.ddp_rank, world_size=self.ddp_world_size)
             optimizers = [optimizer1, optimizer2]
         else:
             optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.lr)
             optimizers = [optimizer]
-        return optimizers
+
+        def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
+            return [p for group in opt.param_groups for p in group["params"]]
+        
+        opt2params = {opt: opt_params(opt) for opt in optimizers}
+        return optimizers, opt2params
     
     def init_schedulers(self):
         self.print0("Initializing schedulers...")
@@ -397,7 +409,7 @@ class Trainer:
                 num_training_steps=self.args.num_steps
             )
             lr_schedulers.append(muon_scheduler)
-        sliding_window_size_scheduler = LerpTensor(start_val=512, end_val=self.args.max_length, precision=128)
+        sliding_window_size_scheduler = LerpTensor(start_val=512, end_val=self.args.max_length + 128, precision=128)
         if self.args.mask_rate_schedule:
             mask_rate_scheduler = LerpFloat(
                 start_val=self.args.starting_mask_rate, 
@@ -505,6 +517,12 @@ class Trainer:
                 loss.backward()
                 accumulated_loss += loss.item()  # Accumulate the scaled loss
 
+        if self.ddp_world_size > 1:
+            opt2futures = {
+                opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
+                for opt, params in self.opt2params.items()
+            }
+
         # momentum warmup for Muon
         if self.args.use_muon:
             frac = min(step/self.args.muon_momentum_warmup_steps, 1)
@@ -526,6 +544,8 @@ class Trainer:
 
         # step the optimizers and schedulers
         for opt, sched in zip(self.optimizers, self.lr_schedulers):
+            if self.ddp_world_size > 1:
+                torch.futures.collect_all(opt2futures[opt]).wait()
             opt.step()
             sched.step()
 
@@ -560,7 +580,9 @@ class Trainer:
                     self.train_timer.start()
                 timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-                frac_done = step / self.args.num_steps  # training progress
+                # warmup sliding window over the course of 10% of the training steps
+                frac_done = step / (self.args.num_steps // 10)  # training progress
+
                 self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
                 if self.mask_rate_scheduler:
                     frac_done_mask = step / self.args.mask_rate_steps
@@ -693,7 +715,7 @@ if __name__ == '__main__':
         args.num_steps = 10
         args.cooldown_steps = 2
         args.max_length = 512
-        args.auto_grad_clip = True
+        args.auto_grad_clip = False
         args.grad_clip = 0.0  # Disable regular grad clip for bugfix testing
 
     # Validate gradient clipping arguments
@@ -714,6 +736,7 @@ if __name__ == '__main__':
         tie_embeddings=args.tie_embeddings,
         unet=args.unet,
         mlm=args.mlm,
+        max_seq_len=args.batch_size,
     )
 
     # Initialize wandb before clearing tokens for security

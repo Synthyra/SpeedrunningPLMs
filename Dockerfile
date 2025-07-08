@@ -1,5 +1,8 @@
 # sudo docker build -t speedrun_plm .
 # sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm torchrun --standalone --nproc_per_node=4 train.py
+# for bugfixing
+# docker run --gpus all --shm-size=128g -v ${PWD}:/workspace peedrun_plm python train.py --bugfix
+# docker run --gpus all -v ${PWD}:/workspace speedrun_plm python train.py --bugfix
 
 # 1️⃣  CUDA / cuDNN base with no Python
 FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
@@ -35,8 +38,8 @@ COPY requirements.txt .
 
 RUN pip install --upgrade pip setuptools && \
     # force-install torch built for CUDA 12.6
-    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126 && \
-    pip install -r requirements.txt
+    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U && \
+    pip install -r requirements.txt -U
 
 # 5️⃣  Copy the rest of the source
 COPY . .
