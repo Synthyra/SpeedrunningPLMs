@@ -378,7 +378,7 @@ class Trainer:
                 dict(params=scalar_params, lr=self.args.lr_scalar)
             ]
             muon_cls = Muon_bf16 if self.args.bfloat16 else Muon
-            optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=13-10, weight_decay=0.0, fused=True)
+            optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
             optimizer2 = muon_cls(hidden_matrix_params, lr=self.args.lr_hidden, momentum=0.95, rank=self.ddp_rank, world_size=self.ddp_world_size)
             optimizers = [optimizer1, optimizer2]
         else:
@@ -449,11 +449,7 @@ class Trainer:
         if self.ddp_world_size > 1:
             # Convert to tensors before all_reduce
             avg_loss = torch.tensor(avg_loss, device=self.device)
-            # Handle total_tokens properly - it's already a tensor, so move to device and detach
-            if isinstance(total_tokens, torch.Tensor):
-                total_tokens = total_tokens.to(self.device)
-            else:
-                total_tokens = torch.tensor(total_tokens, device=self.device)
+            total_tokens = torch.tensor(total_tokens, device=self.device)
             dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
             dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
             # Ensure all processes finish evaluation
