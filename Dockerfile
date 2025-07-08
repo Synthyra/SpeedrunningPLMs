@@ -1,7 +1,7 @@
 # sudo docker build -t speedrun_plm .
 # sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm torchrun --standalone --nproc_per_node=4 train.py
 # for bugfixing
-# docker run --gpus all --shm-size=128g -v ${PWD}:/workspace peedrun_plm python train.py --bugfix
+# docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm python train.py --bugfix
 # docker run --gpus all -v ${PWD}:/workspace speedrun_plm python train.py --bugfix
 
 # 1️⃣  CUDA / cuDNN base with no Python

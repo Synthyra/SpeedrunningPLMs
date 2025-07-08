@@ -449,7 +449,11 @@ class Trainer:
         if self.ddp_world_size > 1:
             # Convert to tensors before all_reduce
             avg_loss = torch.tensor(avg_loss, device=self.device)
-            total_tokens = torch.tensor(total_tokens, device=self.device)
+            # Handle total_tokens properly - it's already a tensor, so move to device and detach
+            if isinstance(total_tokens, torch.Tensor):
+                total_tokens = total_tokens.to(self.device)
+            else:
+                total_tokens = torch.tensor(total_tokens, device=self.device)
             dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
             dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
             # Ensure all processes finish evaluation
