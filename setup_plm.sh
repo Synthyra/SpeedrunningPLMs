@@ -32,6 +32,64 @@ pip install --force-reinstall torch torchvision --index-url "$PYTORCH_CUDA_URL"
 echo "Installing requirements..."
 pip install -r requirements.txt
 
+# Ensure ninja is available for Triton/Inductor builds
+python - <<'PY' >/dev/null 2>&1 || true
+import importlib
+exit(0 if importlib.util.find_spec('ninja') else 1)
+PY
+if [ "$?" -ne 0 ]; then
+    echo "Installing ninja..."
+    pip install --upgrade ninja
+fi
+
+# Check for system build deps (Python.h, gcc) and optionally install if permitted
+echo "Checking system build dependencies..."
+PY_VER=$(python - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)
+PY_INCLUDE_DIR=$(python - <<'PY'
+import sysconfig
+print(sysconfig.get_paths()["include"]) 
+PY
+)
+
+if ! command -v gcc >/dev/null 2>&1; then
+    echo "Warning: gcc is not installed. torch.compile may fail to build extensions."
+    echo "Install a compiler toolchain (e.g., build-essential on Debian/Ubuntu)."
+fi
+
+if [ ! -f "$PY_INCLUDE_DIR/Python.h" ]; then
+    echo "Warning: Python.h not found at: $PY_INCLUDE_DIR"
+    echo "torch.compile may fail to build small helper extensions."
+    if [ "${INSTALL_SYSTEM_DEPS:-0}" = "1" ]; then
+        echo "Attempting to install Python development headers (requires sudo)..."
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo -n apt-get update || true
+            sudo -n apt-get install -y "python${PY_VER}-dev" python3-dev build-essential || true
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo -n dnf groupinstall -y "Development Tools" || true
+            sudo -n dnf install -y python3-devel || true
+        elif command -v yum >/dev/null 2>&1; then
+            sudo -n yum groupinstall -y "Development Tools" || true
+            sudo -n yum install -y python3-devel || true
+        elif command -v zypper >/dev/null 2>&1; then
+            sudo -n zypper install -y python3-devel gcc gcc-c++ make || true
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo -n pacman -Sy --noconfirm base-devel python || true
+        fi
+    else
+        echo "To install headers:"
+        echo "- Debian/Ubuntu: sudo apt-get install -y python3-dev python${PY_VER}-dev build-essential"
+        echo "- Fedora/RHEL:   sudo dnf install -y python3-devel @development-tools"
+        echo "- CentOS:        sudo yum install -y python3-devel 'Development Tools'"
+        echo "- openSUSE:      sudo zypper install -y python3-devel gcc gcc-c++ make"
+        echo "- Arch:          sudo pacman -Sy --noconfirm base-devel python"
+        echo "Then re-run this script. You can also set INSTALL_SYSTEM_DEPS=1 to let the script attempt installation."
+    fi
+fi
+
 # Detect CUDA toolkit (if present) to help dynamic linker
 CUDA_HOME=""
 if [ -d "/usr/local/cuda" ]; then
@@ -80,17 +138,20 @@ fi
 # Quick diagnostics
 echo -e "\nDiagnostics:"
 python - <<'PY'
-import os, torch
+import os, torch, sysconfig
 print('torch_version:', torch.__version__)
 print('torch_cuda_version:', torch.version.cuda)
 print('cuda_is_available:', torch.cuda.is_available())
 print('torch_lib_dir:', os.path.join(os.path.dirname(torch.__file__), 'lib'))
+inc = sysconfig.get_paths().get('include')
+print('python_include_dir:', inc)
+print('python_h_exists:', os.path.exists(os.path.join(inc or '', 'Python.h')))
 try:
     import triton  # noqa: F401
     print('triton_import: ok')
 except Exception as e:
     print('triton_import: fail ->', e)
-if torch.cuda.is_available():
+if torch.cuda.is_available() and inc and os.path.exists(os.path.join(inc, 'Python.h')):
     try:
         f = torch.compile(lambda t: t + 1)
         x = torch.randn(16, device='cuda')
@@ -99,7 +160,12 @@ if torch.cuda.is_available():
     except Exception as e:
         print('torch.compile_smoke: fail ->', e)
 else:
-    print('torch.compile_smoke: skipped (no CUDA device)')
+    reason = []
+    if not torch.cuda.is_available():
+        reason.append('no CUDA device')
+    if not (inc and os.path.exists(os.path.join(inc, 'Python.h'))):
+        reason.append('no Python.h')
+    print('torch.compile_smoke: skipped (' + ', '.join(reason) + ')')
 PY
 
 # List installed packages for verification
