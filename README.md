@@ -46,8 +46,11 @@ Another limitation of traditional pLM training lies in MLM itself, which results
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
 pip install huggingface_hub
-python data/download_omgprot50.py # Add --num_chunks 100 to download less data for smaller runs
+python data/download_data.py --data_name uniref50 --num_chunks 10
 ```
+
+`--data_name` can be uniref50, omg_prot50, or og_prot90 which have varying amount of chunks. Each chunk is ~100 million ESM2 tokens.
+`--num_chunks 500` will download everything.
 
 ### ARM64 Systems (GH200)
 

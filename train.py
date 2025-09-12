@@ -191,7 +191,7 @@ class Trainer:
 
     def print0(self, s, logonly=False):
         if self.master_process:
-            with self.logfile.open('a', encoding='utf-8') as f:
+            with open(self.logfile, 'a', encoding='utf-8') as f:
                 if not logonly:
                     print(s)
                 print(s, file=f)
@@ -203,7 +203,7 @@ class Trainer:
     def init_training(self):
         self.logfile = None
         if self.master_process:
-            Path('logs').mkdir(exist_ok=True)
+            os.makedirs('logs', exist_ok=True)
             
             # Use provided log_name or generate a random UUID
             if self.args.log_name:
@@ -212,10 +212,10 @@ class Trainer:
                 run_id = uuid.uuid4()
             log_filename = f'{run_id}.txt'
                 
-            self.logfile = Path('logs') / log_filename
+            self.logfile = os.path.join('logs', log_filename)
             print(self.logfile.stem)
             # create the log file
-            with self.logfile.open('w', encoding='utf-8') as f:
+            with open(self.logfile, 'w', encoding='utf-8') as f:
                 # begin the log by printing this file (the Python code)
                 print(code, file=f)
                 print('=' * 100, file=f)
