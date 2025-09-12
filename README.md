@@ -111,8 +111,9 @@ python -m train
 sudo docker build -t speedrun_plm .
 sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
     torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py \
-    --token YOUR_HUGGINGFACE_TOKEN \
-    --wandb_token YOUR_WANDB_TOKEN
+    --token YOUR_HUGGINGFACE_TOKEN \ # a write token is required to save to hugginface hub
+    --wandb_token YOUR_WANDB_TOKEN # optional
+    --yaml_path example_yamls/default.yaml # point to your experimental yaml
 ```
 
 **Note for ARM64 (for example GH200) Systems**:

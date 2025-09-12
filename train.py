@@ -280,7 +280,7 @@ class Trainer:
             try:
                 ensure_hf_file(f"{self.args.data_name}_valid_%06d.bin" % 0, self.args.data_name)
                 ensure_hf_file(f"{self.args.data_name}_test_%06d.bin" % 0, self.args.data_name)
-                for i in range(0, self.args.num_chunks + 1):
+                for i in tqdm(range(0, self.args.num_chunks + 1), desc="Ensuring dataset chunks"):
                     ensure_hf_file(f"{self.args.data_name}_train_%06d.bin" % i, self.args.data_name)
             except Exception as e:
                 self.print0(f"Dataset ensure failed: {e}")
