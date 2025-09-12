@@ -1,5 +1,7 @@
 # Speedrunning Protein Language Model Training
 
+Please reach out to Logan Hallee at `lhallee@udel.edu` with any questions. Feel free to open up a GitHub issue with suggestions, or pull request to contribute!
+
 ## TL;DR (Ubuntu + Docker)
 
 Train pLMs fast with docker-enabled PyTorch compilation, modern architectures, optimizers, and datasets.
