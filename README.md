@@ -2,7 +2,7 @@
 
 ## TL;DR (Ubuntu + Docker)
 
-Train PLMs fast with docker-enabled PyTorch compilation, modern architectures, optimizers, and datasets.
+Train pLMs fast with docker-enabled PyTorch compilation, modern architectures, optimizers, and datasets.
 
 - Clone and build:
 ```bash
@@ -38,7 +38,7 @@ This project aims to democratize protein language model (pLM) training by reduci
 - [ESM Model Evaluation](#esm-model-evaluation)
 - [Technical Details](#technical-details)
 
-![Speedrunning PLM Pretraining](docs/assets/model_costs.png)
+![Speedrunning pLM Pretraining](docs/assets/model_costs.png)
 
 ## Introduction
 
@@ -56,7 +56,7 @@ One training technique that enhances pLM representation quality—improving corr
 
 Recent work suggests this may no longer be a significant limitation. Several studies have shown that the final hidden state of transformer models rarely produces the highest quality embeddings ([1](https://arxiv.org/pdf/2502.02013), [2](https://www.biorxiv.org/content/10.1101/2024.02.05.578959v2)). This makes intuitive sense—significant expansion and compression of hidden states occur at the model's beginning and end, respectively. If we no longer prioritize final hidden state quality (since it's rarely optimal), we may be able to optimize internal representations while avoiding weight tying, maintaining both speed and quality. This approach shows particular promise with the innovative UNet transformer architecture inspired by NanoGPT.
 
-![Speedrunning PLM Pretraining](docs/assets/speedrun_unet.png)
+![Speedrunning pLM Pretraining](docs/assets/speedrun_unet.png)
 
 Additional research directions include direct encoder-decoder architectures to stratify representation learning and generative capabilities, autoencoders, and clever regularization at intermediate transformer layers.
 
