@@ -122,18 +122,33 @@ fi
 # Persist environment exports inside the venv activate script (idempotent)
 ACTIVATE_FILE="$VENV_DIR/bin/activate"
 MARKER="# === PLM_SETUP CUDA/Torch dynamic libs ==="
-if ! grep -q "$MARKER" "$ACTIVATE_FILE"; then
-    {
-        echo "$MARKER"
-        echo "# Add torch's bundled libs to runtime path for torch.compile/triton"
-        echo "export LD_LIBRARY_PATH=\"\$(python - <<'PY'\nimport os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))\nPY\n):\${LD_LIBRARY_PATH:-}\""
-        echo "# Optionally add CUDA toolkit if present"
-        echo "if [ -d /usr/local/cuda ]; then export CUDA_HOME=/usr/local/cuda; fi"
-        echo "if [ -z \"\${CUDA_HOME:-}\" ]; then latest=\$(ls -d /usr/local/cuda-12* 2>/dev/null | sort -V | tail -n1 || true); if [ -n \"\$latest\" ]; then export CUDA_HOME=\"\$latest\"; fi; fi"
-        echo "if [ -n \"\${CUDA_HOME:-}\" ] && [ -d \"\$CUDA_HOME/lib64\" ]; then export LD_LIBRARY_PATH=\"\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH\"; export PATH=\"\$CUDA_HOME/bin:\$PATH\"; fi"
-        echo "# ============================================"
-    } >> "$ACTIVATE_FILE"
+
+# Remove any previously inserted PLM setup block (handles old end marker too)
+if grep -q "$MARKER" "$ACTIVATE_FILE"; then
+    awk -v start="$MARKER" -v end1="# ============================================" -v end2="# === END PLM_SETUP ===" '
+        BEGIN{skip=0}
+        $0 ~ start {skip=1; next}
+        skip==1 && ($0 ~ end1 || $0 ~ end2) {skip=0; next}
+        skip==0 {print}
+    ' "$ACTIVATE_FILE" > "$ACTIVATE_FILE.tmp" && mv "$ACTIVATE_FILE.tmp" "$ACTIVATE_FILE"
 fi
+
+# Append a safe, single-line Python invocation version of the block
+cat >> "$ACTIVATE_FILE" <<'EOF'
+# === PLM_SETUP CUDA/Torch dynamic libs ===
+# Add torch's bundled libs to runtime path for torch.compile/triton
+export LD_LIBRARY_PATH="$(python -c 'import os, torch, sys; sys.stdout.write(os.path.join(os.path.dirname(torch.__file__), "lib"))'):${LD_LIBRARY_PATH:-}"
+# Optionally add CUDA toolkit if present
+if [ -d /usr/local/cuda ]; then export CUDA_HOME=/usr/local/cuda; fi
+if [ -z "${CUDA_HOME:-}" ]; then latest=$(ls -d /usr/local/cuda-12* 2>/dev/null | sort -V | tail -n1 || true); if [ -n "$latest" ]; then export CUDA_HOME="$latest"; fi; fi
+if [ -n "${CUDA_HOME:-}" ] && [ -d "$CUDA_HOME/lib64" ]; then export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"; export PATH="$CUDA_HOME/bin:$PATH"; fi
+# === END PLM_SETUP ===
+EOF
+
+
+# List installed packages for verification
+echo -e "\nInstalled packages:"
+pip list
 
 # Quick diagnostics
 echo -e "\nDiagnostics:"
@@ -167,10 +182,6 @@ else:
         reason.append('no Python.h')
     print('torch.compile_smoke: skipped (' + ', '.join(reason) + ')')
 PY
-
-# List installed packages for verification
-echo -e "\nInstalled packages:"
-pip list
 
 # Instructions for future use
 echo -e "\n======================="
