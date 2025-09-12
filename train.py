@@ -91,9 +91,9 @@ def arg_parser():
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
     
     # Data hyperparams
-    parser.add_argument("--input_bin", type=str, default='data/omg_prot50/omg_prot50_train_*.bin', help="Input training bin files pattern")
-    parser.add_argument("--input_valid_bin", type=str, default='data/omg_prot50/omg_prot50_valid_*.bin', help="Input validation bin files pattern")
-    parser.add_argument("--input_test_bin", type=str, default='data/omg_prot50/omg_prot50_test_*.bin', help="Input test bin files pattern")
+    parser.add_argument("--input_bin", type=str, default='data/omg_prot50/uniref50_train_*.bin', help="Input training bin files pattern")
+    parser.add_argument("--input_valid_bin", type=str, default='data/omg_prot50/uniref50_valid_*.bin', help="Input validation bin files pattern")
+    parser.add_argument("--input_test_bin", type=str, default='data/omg_prot50/uniref50_test_*.bin', help="Input test bin files pattern")
     parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
     parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
     parser.add_argument("--starting_mask_rate", type=float, default=0.1, help="Starting mask rate for masked language modeling")
