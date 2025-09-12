@@ -12,10 +12,15 @@ echo "Setting up Python virtual environment for PLM training..."
 : "${VENV_DIR:=$HOME/plm_venv}"
 : "${PYTORCH_CUDA_URL:=https://download.pytorch.org/whl/cu128}"
 
-# Create virtual environment if missing
-if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv "$VENV_DIR"
+# Nuke any existing venv at target path to ensure a clean setup
+echo "Removing existing venv at $VENV_DIR (if any)..."
+if [ -n "${VIRTUAL_ENV:-}" ] && [ "${VIRTUAL_ENV}" = "${VENV_DIR}" ]; then
+    deactivate || true
 fi
+rm -rf "$VENV_DIR"
+
+# Create a fresh virtual environment
+python3 -m venv "$VENV_DIR"
 
 # Activate virtual environment
 source "$VENV_DIR/bin/activate"
