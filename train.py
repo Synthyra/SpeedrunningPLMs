@@ -21,11 +21,9 @@ from torch.nn.utils import clip_grad_norm_
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
-from pathlib import Path
 from tqdm import tqdm
 
 from model.model import PLM, PLMConfig
-from model.utils import Linear
 from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
 from optimizer import Muon
 from utils import (
@@ -45,6 +43,11 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
 #torch._dynamo.config.suppress_errors = True
@@ -213,7 +216,7 @@ class Trainer:
             log_filename = f'{run_id}.txt'
                 
             self.logfile = os.path.join('logs', log_filename)
-            print(self.logfile.stem)
+            print(os.path.basename(self.logfile))
             # create the log file
             with open(self.logfile, 'w', encoding='utf-8') as f:
                 # begin the log by printing this file (the Python code)
