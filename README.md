@@ -243,8 +243,8 @@ Our optimized trainer and dataloader incorporate prefetching and multiple worker
 |----------|--------|-----------|---------------|
 | 1 × H100 80GB SXM5, 26 vCPUs | Lambda Labs | $3.29 | 275,900 |
 | 1 x H200 142GB NVLink, 16 vCPUs | Nebius | $3.64 | 327,680 |
-| 1 × GH200 96GB ARM64, 64 vCPUs | Lambda Labs | $1.49 | 1,011,800 |
 | 4 × A100 80GB PCIe Gen4, 96 vCPUs | Azure | $18.36 | 340,700 |
+| 1 × GH200 96GB ARM64, 64 vCPUs | Lambda Labs | $1.49 | 1,011,800 |
 | 8 × H100 80GB SXM5, 208 vCPUs | Lambda Labs | $23.92 | 2,149,500 |
 
 ### Cost Analysis
