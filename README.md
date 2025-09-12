@@ -210,18 +210,21 @@ Batch sizes of 8×64×1024 (524,288) or 4×64×1024 (262,144) tokens have demons
 
 Our optimized trainer and dataloader incorporate prefetching and multiple workers per GPU to accelerate data handling, with masking performed at the data loading stage. This results in improved throughput, particularly beneficial for systems with slower disk I/O.
 
-**Training Throughput** (Default model: 133M parameters, 24 blocks, UNet + Value embeddings, 768 hidden size):
+**Training Throughput**
 
-| Hardware | Tokens/Second |
-|----------|---------------|
-| 1×H100 | 275,900 |
-| 1×GH200 | 1,011,800 |
-| 4×A100 80GB PCIe Gen4 | 340,700 |
-| 8×H100 SXM5 | 2,149,500 |
+(Default model: 133M parameters, 24 blocks, UNet + Value embeddings, 768 hidden size):
+
+| Hardware | Vendor | Cost/Hour | Tokens/Second |
+|----------|--------|-----------|---------------|
+| 1 × H100 80GB SXM5, 26 vCPUs | Lambda Labs | $3.29 | 275,900 |
+| 1 x H200 142GB NVLink, 16 vCPUs | Nebius | $3.64 | 327,680 |
+| 1 × GH200 96GB ARM64, 64 vCPUs | Lambda Labs | $1.49 | 1,011,800 |
+| 4 × A100 80GB PCIe Gen4, 96 vCPUs | Azure | $18.36 | 340,700 |
+| 8 × H100 80GB SXM5, 208 vCPUs | Lambda Labs | $23.92 | 2,149,500 |
 
 ### Cost Analysis
 
-Based on current performance metrics, training ESM2-150M equivalent (2M token batch size, 500K steps) would require approximately 129 hours at $3,091 using 8×H100 systems (Lambda pricing as of June 2025). This represents a significant improvement over the estimated $46,000 cost for ESM2-150M training via AWS in 2022.
+Based on current performance metrics, training ESM2-150M equivalent with the old optimizer / architecture (2M token batch size, 500K steps) would require approximately 129 hours at $3,091 using 8×H100 systems (Lambda pricing as of June 2025). This represents a significant improvement over the estimated $46,000 cost for ESM2-150M training via AWS in 2022. Obviously with better achitecture, data, and optimizers, etc. (our improvements) this is dramatically decreased even further.
 
 Memory and disk I/O remain primary bottlenecks on some systems, as evidenced by the GH200's superior performance. Further optimizations to data loading and prefetching may yield additional improvements.
 
