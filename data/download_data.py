@@ -8,6 +8,7 @@ def get(fname, data_name):
     local_dir = os.path.join(os.path.dirname(__file__), data_name)
     if not os.path.exists(os.path.join(local_dir, fname)):
         try:
+            print(f"Downloading {fname} from Synthyra/{data_name}_packed")
             hf_hub_download(repo_id=f"Synthyra/{data_name}_packed", filename=fname, repo_type="dataset", local_dir=local_dir)
         except Exception as e:
             print(f"Error downloading {fname}: {e}")
@@ -17,7 +18,7 @@ def get(fname, data_name):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download data from huggingface")
-    parser.add_argument("-d", "--data_name", type=str, default="uniref50", help="Name of the dataset")
+    parser.add_argument("-d", "--data_name", type=str, default="uniref50", help="Name of the dataset, uniref50, omg_prot50, or og_prot90")
     parser.add_argument("-n", "--num_chunks", type=int, default=100, help="Number of chunks to download")
     # each chunk is 100M tokens
     args = parser.parse_args()

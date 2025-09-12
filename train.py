@@ -21,11 +21,10 @@ from torch.nn.utils import clip_grad_norm_
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
-from pathlib import Path
 from tqdm import tqdm
 
+from data.download_data import get as ensure_hf_file
 from model.model import PLM, PLMConfig
-from model.utils import Linear
 from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
 from optimizer import Muon
 from utils import (
@@ -47,6 +46,11 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+
 #torch._dynamo.config.suppress_errors = True
 inductor_config.max_autotune_gemm_backends = "ATEN,CUTLASS,FBGEMM"
 
@@ -63,6 +67,8 @@ def arg_parser():
     
     # All other arguments with defaults (can be overridden by YAML)
     parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
+    parser.add_argument("--data_name", type=str, default="uniref50", help="Dataset name: uniref50, omg_prot50, or og_prot90")
+    parser.add_argument("--num_chunks", type=int, default=100, help="Number of training chunks to ensure are downloaded")
     
     # Distributed training arguments
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
@@ -88,9 +94,6 @@ def arg_parser():
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
     
     # Data hyperparams
-    parser.add_argument("--input_bin", type=str, default='data/omg_prot50/omg_prot50_train_*.bin', help="Input training bin files pattern")
-    parser.add_argument("--input_valid_bin", type=str, default='data/omg_prot50/omg_prot50_valid_*.bin', help="Input validation bin files pattern")
-    parser.add_argument("--input_test_bin", type=str, default='data/omg_prot50/omg_prot50_test_*.bin', help="Input test bin files pattern")
     parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
     parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
     parser.add_argument("--starting_mask_rate", type=float, default=0.1, help="Starting mask rate for masked language modeling")
@@ -148,6 +151,10 @@ def arg_parser():
                         value = value.lower() in ('true', '1', 'yes', 'on')
                     setattr(args, key, value)
     
+    # Align input patterns to dataset if not already pointing at it
+    args.input_bin = f"data/{args.data_name}/{args.data_name}_train_*.bin"
+    args.input_valid_bin = f"data/{args.data_name}/{args.data_name}_valid_*.bin"
+    args.input_test_bin = f"data/{args.data_name}/{args.data_name}_test_*.bin"
     return args
 
 
@@ -191,7 +198,7 @@ class Trainer:
 
     def print0(self, s, logonly=False):
         if self.master_process:
-            with self.logfile.open('a', encoding='utf-8') as f:
+            with open(self.logfile, 'a', encoding='utf-8') as f:
                 if not logonly:
                     print(s)
                 print(s, file=f)
@@ -203,7 +210,7 @@ class Trainer:
     def init_training(self):
         self.logfile = None
         if self.master_process:
-            Path('logs').mkdir(exist_ok=True)
+            os.makedirs('logs', exist_ok=True)
             
             # Use provided log_name or generate a random UUID
             if self.args.log_name:
@@ -212,10 +219,10 @@ class Trainer:
                 run_id = uuid.uuid4()
             log_filename = f'{run_id}.txt'
                 
-            self.logfile = Path('logs') / log_filename
-            print(self.logfile.stem)
+            self.logfile = os.path.join('logs', log_filename)
+            print(os.path.basename(self.logfile))
             # create the log file
-            with self.logfile.open('w', encoding='utf-8') as f:
+            with open(self.logfile, 'w', encoding='utf-8') as f:
                 # begin the log by printing this file (the Python code)
                 print(code, file=f)
                 print('=' * 100, file=f)
@@ -266,6 +273,19 @@ class Trainer:
 
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.pad_token_id = self.tokenizer.pad_token_id
+
+        # Ensure dataset is available locally (master process only), then sync
+        if self.master_process:
+            self.print0(f"Ensuring dataset '{self.args.data_name}' is available (num_chunks={self.args.num_chunks})...")
+            try:
+                ensure_hf_file(f"{self.args.data_name}_valid_%06d.bin" % 0, self.args.data_name)
+                ensure_hf_file(f"{self.args.data_name}_test_%06d.bin" % 0, self.args.data_name)
+                for i in tqdm(range(0, self.args.num_chunks + 1), desc="Ensuring dataset chunks"):
+                    ensure_hf_file(f"{self.args.data_name}_train_%06d.bin" % i, self.args.data_name)
+            except Exception as e:
+                self.print0(f"Dataset ensure failed: {e}")
+        if self.ddp_world_size > 1:
+            dist.barrier()
 
         self.train_loader = self.init_dataloader(self.args.input_bin, training=True)
         self.valid_loader = self.init_dataloader(self.args.input_valid_bin, training=False)
