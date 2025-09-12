@@ -42,29 +42,72 @@ Another limitation of traditional pLM training lies in MLM itself, which results
 
 ### Quick Start
 
+On many popular HPC platforms will be missing Python headers `Python.h` which break `torch.compile`. To fix this, run the following code:
+
+**Debian/Ubuntu:**
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3.12-dev build-essential
+```
+
+If python3.12-dev is not found: `sudo apt-get install -y python3-dev build-essential`
+
+**Fedora/RHEL:**
+```base
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y python3-devel
+```
+
+**openSUSE:**
+```bash
+sudo zypper install -y python3-devel gcc gcc-c++ make
+```
+
+**Arch:**
+```bash
+sudo pacman -Sy --noconfirm base-devel python
+```
+
 ```bash
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
-pip install huggingface_hub
+```
+
+We offer a `docker` or Python `venv` option for running the code.
+
+#### Python venv
+
+```bash
+chmod +x setup_plm.sh
+./setup_plm.sh
+source ~/plm_venv/bin/activate
+```
+
+**Download data**
+
+```bash
 python data/download_data.py --data_name uniref50 --num_chunks 10
 ```
 
 `--data_name` can be uniref50, omg_prot50, or og_prot90 which have varying amount of chunks. Each chunk is ~100 million ESM2 tokens.
 `--num_chunks 500` will download everything.
 
-### ARM64 Systems (GH200)
+**Train model**
 
 ```bash
-pip install -r requirements.txt -U
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U
 torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py
 ```
 
-### Docker Installation (Non-ARM64 Systems)
+or
 
 ```bash
-git clone https://github.com/Synthyra/SpeedrunningPLMs.git
-cd SpeedrunningPLMs
+python -m train
+```
+
+#### Docker
+
+```bash
 sudo docker build -t speedrun_plm .
 sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
     torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py \
@@ -72,7 +115,9 @@ sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
     --wandb_token YOUR_WANDB_TOKEN
 ```
 
-> **Note for ARM64 (GH200) Systems**: The Docker image currently experiences compatibility issues on ARM64 systems due to Triton version conflicts that break `torch.compile`. If you have a solution for this issue, please open an issue or pull request.
+**Note for ARM64 (for example GH200) Systems**:
+
+The Docker image currently experiences compatibility issues on ARM64 systems due to Triton version conflicts that break `torch.compile`. If you have a solution for this issue, please open an issue or pull request.
 
 ## Running Experiments
 
