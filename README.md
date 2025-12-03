@@ -1,4 +1,5 @@
 # Speedrunning Protein Language Model Training
+<img width="2816" height="1536" alt="Gemini_Generated_Image_9tyuaz9tyuaz9tyu" src="https://github.com/user-attachments/assets/a5ad1595-6da6-41e2-b6f5-a7a2bc9ef1fb" />
 
 Please reach out to Logan Hallee at `lhallee@udel.edu` with any questions. Feel free to open up a GitHub issue with suggestions, or pull request to contribute!
 
