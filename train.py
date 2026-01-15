@@ -50,10 +50,8 @@ from utils import (
 )
 
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
-
+if os.environ['WANDB_AVAILABLE'] == 'true':
+    import wandb
 
 #torch._dynamo.config.suppress_errors = True
 inductor_config.max_autotune_gemm_backends = "ATEN,CUTLASS,FBGEMM"

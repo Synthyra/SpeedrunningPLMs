@@ -2,6 +2,7 @@ import os
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Only error/warning messages
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ['DISABLE_PANDERA_IMPORT_WARNING'] = 'true'
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'
 os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
