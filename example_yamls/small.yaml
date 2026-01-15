@@ -58,7 +58,7 @@ lr_hidden: 0.05
 muon_momentum_warmup_steps: 300
 
 # Evaluation and Logging
-eval_every: 100
+eval_every: 1000
 hf_model_name: "lhallee/speedrun"
 save_every: null  # Set to a number to save checkpoints every N steps
 

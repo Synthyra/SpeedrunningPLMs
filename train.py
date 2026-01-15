@@ -50,14 +50,6 @@ from utils import (
 )
 
 
-global WANDB_AVAILABLE
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-
-
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -308,17 +300,17 @@ class Trainer:
         original = _strip_pad(original)
         filled = _strip_pad(filled)
 
-        decoded_input = self.tokenizer.decode(input_ids.tolist()[:100], skip_special_tokens=False).replace(" ", "")
-        decoded_original = self.tokenizer.decode(original.tolist()[:100], skip_special_tokens=False).replace(" ", "")
-        decoded_filled = self.tokenizer.decode(filled.tolist()[:100], skip_special_tokens=False).replace(" ", "")
+        decoded_input = self.tokenizer.decode(input_ids.tolist()[:128], skip_special_tokens=False).replace(" ", "").replace("<mask>", "-")
+        decoded_original = self.tokenizer.decode(original.tolist()[:128], skip_special_tokens=False).replace(" ", "")
+        decoded_filled = self.tokenizer.decode(filled.tolist()[:128], skip_special_tokens=False).replace(" ", "").replace("<mask>", "-")
 
-        masked_list = masked_positions.tolist()[:100]
+        masked_list = masked_positions.tolist()[:10]
         self.print0("=" * 128, logonly=True)
         self.print0("VALIDATION PREVIEW (single example)", logonly=True)
-        self.print0(f"Masked positions: {masked_list}", logonly=True)
-        self.print0(f"Raw input ids:    {input_ids.tolist()[:100]}", logonly=True)
-        self.print0(f"Raw original ids: {original.tolist()[:100]}", logonly=True)
-        self.print0(f"Raw filled ids:   {filled.tolist()[:100]}", logonly=True)
+        self.print0(f"Masked positions: {masked_list} ...", logonly=True)
+        self.print0(f"Raw input ids:    {input_ids.tolist()[:100]} ...", logonly=True)
+        self.print0(f"Raw original ids: {original.tolist()[:100]} ...", logonly=True)
+        self.print0(f"Raw filled ids:   {filled.tolist()[:100]} ...", logonly=True)
         self.print0("-" * 128, logonly=True)
         self.print0(f"Decoded input:    {decoded_input}", logonly=True)
         self.print0(f"Decoded original: {decoded_original}", logonly=True)
@@ -1009,7 +1001,7 @@ if __name__ == '__main__':
 
     # Initialize wandb before clearing tokens for security
     wandb_initialized = False
-    if args.wandb_token:
+    if args.wandb_token and os.environ['WANDB_AVAILABLE'] == 'true':
         wandb.login(key=args.wandb_token)
         wandb_initialized = True
     
