@@ -291,7 +291,7 @@ class Trainer:
             self.print0("Validation preview: no masked positions in selected batch.")
             return
 
-        preds = logits.argmax(dim=-1)
+        preds = logits.argmax(dim=-1).to(dtype=input_ids.dtype)
         filled = input_ids.clone()
         filled[masked_positions] = preds[masked_positions]
 
