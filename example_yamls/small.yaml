@@ -49,7 +49,7 @@ lr_embed: 0.06
 lr_head: 0.008
 lr_scalar: 0.04
 grad_clip: 0.0
-auto_grad_clip: True
+auto_grad_clip: False
 auto_grad_clip_percentile: 10
 
 # Muon optimizer (for hidden layers)

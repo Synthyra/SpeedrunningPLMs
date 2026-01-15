@@ -277,14 +277,18 @@ class Trainer:
     def _print_val_preview(self, input_ids: torch.Tensor, labels: torch.Tensor, logits: torch.Tensor):
         if not self.master_process:
             return
-        mask_token_id = self.tokenizer.mask_token_id
         pad_token_id = self.pad_token_id
+        assert input_ids.dim() == 1, f"Expected input_ids to be 1D (seq_len,) but got: {input_ids.shape}"
+        assert labels.dim() == 1, f"Expected labels to be 1D (seq_len,) but got: {labels.shape}"
+        assert logits.dim() == 2, f"Expected logits to be 2D (seq_len, vocab_size) but got: {logits.shape}"
+        assert input_ids.shape[0] == labels.shape[0], f"input_ids/labels length mismatch: {input_ids.shape[0]} != {labels.shape[0]}"
+        assert logits.shape[0] == input_ids.shape[0], f"logits/input_ids length mismatch: {logits.shape[0]} != {input_ids.shape[0]}"
         input_ids = input_ids.cpu()
         labels = labels.cpu()
         logits = logits.cpu()
-        masked_positions = (input_ids == mask_token_id).nonzero(as_tuple=True)[0]
+        masked_positions = (labels != -100).nonzero(as_tuple=True)[0]
         if masked_positions.numel() == 0:
-            self.print0("Validation preview: no masked positions in selected batch.", logonly=True)
+            self.print0("Validation preview: no masked positions in selected batch.")
             return
 
         preds = logits.argmax(dim=-1)
@@ -309,17 +313,17 @@ class Trainer:
         decoded_filled = self.tokenizer.decode(filled.tolist(), skip_special_tokens=False)
 
         masked_list = masked_positions.tolist()
-        self.print0("=" * 80, logonly=True)
-        self.print0("VALIDATION PREVIEW (single example)", logonly=True)
-        self.print0(f"Masked positions: {masked_list}", logonly=True)
-        self.print0(f"Raw input ids:    {input_ids.tolist()}", logonly=True)
-        self.print0(f"Raw original ids: {original.tolist()}", logonly=True)
-        self.print0(f"Raw filled ids:   {filled.tolist()}", logonly=True)
-        self.print0("-" * 80, logonly=True)
-        self.print0(f"Decoded input:    {decoded_input}", logonly=True)
-        self.print0(f"Decoded original: {decoded_original}", logonly=True)
-        self.print0(f"Decoded filled:   {decoded_filled}", logonly=True)
-        self.print0("=" * 80, logonly=True)
+        self.print0("=" * 80)
+        self.print0("VALIDATION PREVIEW (single example)")
+        self.print0(f"Masked positions: {masked_list}")
+        self.print0(f"Raw input ids:    {input_ids.tolist()}")
+        self.print0(f"Raw original ids: {original.tolist()}")
+        self.print0(f"Raw filled ids:   {filled.tolist()}")
+        self.print0("-" * 80)
+        self.print0(f"Decoded input:    {decoded_input}")
+        self.print0(f"Decoded original: {decoded_original}")
+        self.print0(f"Decoded filled:   {decoded_filled}")
+        self.print0("=" * 80)
 
     def init_training(self):
         self.logfile = None
@@ -489,8 +493,6 @@ class Trainer:
         if self.ddp_world_size > 1:
             dist.barrier()
         
-        self.print0("Coordinate descent tuning - can take up to 30 minutes")
-        inductor_config.coordinate_descent_tuning = True
         self.print0("Calling torch.compile()")
         # Enable scalar output capture for .item() calls in compiled functions
         #torch._dynamo.config.capture_scalar_outputs = True
@@ -604,7 +606,7 @@ class Trainer:
         input_ids, labels, mask_rate = loader.next_batch()
         
         # Only show progress bar on master process
-        pbar = tqdm(desc=f'{prefix} set', leave=False, disable=not self.master_process)
+        pbar = tqdm(desc=f'{prefix} set', leave=False, disable=not self.master_process, total=len(loader))
         
         while input_ids.numel():
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
@@ -617,7 +619,7 @@ class Trainer:
             all_preds.append(preds.detach())
             all_labels.append(labels.detach())
             if not preview_done:
-                self._print_val_preview(input_ids[0], labels[0], logits[0])
+                self._print_val_preview(input_ids, labels, logits)
                 preview_done = True
             input_ids, labels, mask_rate = loader.next_batch()
             pbar.update(1)
