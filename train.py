@@ -620,9 +620,16 @@ class Trainer:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
 
-        # step the schedulers
-        for sched in self.lr_schedulers:
-            sched.step()
+        # step the schedulers (only after their optimizer has stepped)
+        if self.args.use_muon:
+            # Scheduler order: embed, scalar, muon
+            if should_step_embed:
+                self.lr_schedulers[0].step()
+            self.lr_schedulers[1].step()
+            self.lr_schedulers[2].step()
+        else:
+            for sched in self.lr_schedulers:
+                sched.step()
         
         # Store clip value for logging
         self.last_clip_value = clip_value

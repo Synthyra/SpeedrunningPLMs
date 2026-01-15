@@ -302,20 +302,17 @@ class PLM(PreTrainedModel):
             self.transformer = Transformer(config)
     
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, config.soft_logit_cap)
-        self.tie_embeddings = config.tie_embeddings
+        self.always_tied = config.tie_embeddings
         self.split_embed = False
-        if self.tie_embeddings:
-            self.lm_head.decoder.weight.requires_grad = False
 
         self.mlm = config.mlm
         self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def split_tied_embeddings(self):
-        if not self.tie_embeddings or self.split_embed:
+        if self.always_tied or self.split_embed:
             return
         with torch.no_grad():
             self.lm_head.decoder.weight.copy_(self.embedding.weight)
-        self.lm_head.decoder.weight.requires_grad = True
         self.split_embed = True
 
     def update_yarn(self, old_window: int, new_window: int):
@@ -480,7 +477,8 @@ class PLM(PreTrainedModel):
 
         last_hidden_state = self.get_last_hidden_state(input_ids, window_size_long, window_size_short)
 
-        tied_weight = self.embedding.weight if self.tie_embeddings and not self.split_embed else None
+        use_tied = self.always_tied or not self.split_embed
+        tied_weight = self.embedding.weight if use_tied else None
         lm_logits = self.lm_head(norm(last_hidden_state), tied_weight=tied_weight) # (l, v)
 
         loss = self.ce(
