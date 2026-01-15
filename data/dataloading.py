@@ -32,6 +32,7 @@ class EvalLoader(IterableDataset):
         process_rank: int,
         num_processes: int,
         tokenizer: EsmTokenizer,
+        max_doc_len: int,
     ):
         self.filename_pattern = filename_pattern
         self.seq_len = seq_len
@@ -43,6 +44,7 @@ class EvalLoader(IterableDataset):
         self.pad_token_id = tokenizer.pad_token_id
         self.mask_token_id = tokenizer.mask_token_id
         self.special_tokens = [self.cls_token_id, self.eos_token_id, self.pad_token_id]
+        self.max_doc_len = max_doc_len
         
         # All processes load all files (since we're distributing by sequences, not files)
         self.all_files = sorted(Path.cwd().glob(filename_pattern))
@@ -70,6 +72,11 @@ class EvalLoader(IterableDataset):
                 curr_eos = eos_positions[i]
                 prev_eos_plus_one = 0 if i == 0 else eos_positions[i-1] + 1
                 sample = raw_tokens[prev_eos_plus_one:curr_eos+1]
+
+                if len(sample) > self.max_doc_len:
+                    sample = sample[: self.max_doc_len]
+                    if sample[-1] != self.eos_token_id:
+                        sample[-1] = self.eos_token_id
                 
                 # Handle samples that exceed batch size
                 if len(sample) > self.seq_len:
@@ -170,6 +177,7 @@ class OptimizedEvalLoader:
         process_rank: int,
         num_processes: int,
         tokenizer: EsmTokenizer,
+        max_doc_len: int,
     ):
         self.filename_pattern = filename_pattern
         self.seq_len = seq_len
@@ -183,6 +191,7 @@ class OptimizedEvalLoader:
             process_rank=process_rank,
             num_processes=num_processes,
             tokenizer=tokenizer,
+            max_doc_len=max_doc_len,
         )
         
         # Store file list for compatibility - all processes see all files
@@ -237,6 +246,7 @@ class TrainLoader(IterableDataset):
         num_workers: int = 1,
         mlm: bool = False,
         mask_rate: float = 0.15,
+        max_doc_len: int = 2048,
     ):
         self.filename_pattern = filename_pattern
         self.seq_len = seq_len
@@ -252,6 +262,7 @@ class TrainLoader(IterableDataset):
         self.mask_token_id = tokenizer.mask_token_id
         self.special_tokens = [self.cls_token_id, self.eos_token_id, self.pad_token_id]
         self.mlm = mlm
+        self.max_doc_len = max_doc_len
         # Get all files and distribute across processes (GPUs)
         all_files = sorted(Path.cwd().glob(filename_pattern))
         if not all_files:
@@ -329,6 +340,11 @@ class TrainLoader(IterableDataset):
                 curr_eos = eos_positions[i]
                 prev_eos_plus_one = 0 if i == 0 else eos_positions[i-1] + 1
                 sample = raw_tokens[prev_eos_plus_one:curr_eos+1]
+
+                if len(sample) > self.max_doc_len:
+                    sample = sample[: self.max_doc_len]
+                    if sample[-1] != self.eos_token_id:
+                        sample[-1] = self.eos_token_id
                 
                 # Handle samples that exceed batch size
                 if len(sample) > self.seq_len:
@@ -435,6 +451,7 @@ class OptimizedTrainLoader:
         prefetch_factor: int = 2,
         mlm: bool = False,
         mask_rate: float = 0.15,
+        max_doc_len: int = 2048,
     ):
         self.filename_pattern = filename_pattern
         self.seq_len = seq_len
@@ -452,6 +469,7 @@ class OptimizedTrainLoader:
             num_workers=num_workers,
             mlm=mlm,
             mask_rate=mask_rate,
+            max_doc_len=max_doc_len,
         )
         
         # Store file list for compatibility - only this process's files

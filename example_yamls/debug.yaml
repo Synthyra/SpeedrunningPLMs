@@ -10,7 +10,6 @@ num_hidden_layers: 2
 num_att_tokens: 128
 expansion_ratio: 2.0
 soft_logit_cap: 16.0
-p_attention: false
 tie_embeddings: false
 unet: true
 

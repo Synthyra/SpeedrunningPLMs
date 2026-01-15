@@ -21,7 +21,6 @@ expansion_ratio: 2.6667  # 8/3
 soft_logit_cap: 32.0
 attention_soft_cap: 64.0
 add_att_soft_cap: false
-p_attention: false
 tie_embeddings: false
 unet: true
 token_dropout: false

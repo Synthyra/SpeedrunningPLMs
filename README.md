@@ -191,7 +191,6 @@ This script will automatically:
 | `--soft_logit_cap` | float | 32.0 | Soft logit cap for output logits. |
 | `--attention_soft_cap` | float | 64.0 | Attention softmax cap. |
 | `--add_att_soft_cap` | bool | True | Whether to add attention softmax cap. |
-| `--p_attention` | flag | False | Use P attention variant. |
 | `--tie_embeddings` | flag | False | Tie input and output embeddings. |
 | `--unet` | bool | True | Use UNet architecture. |
 | `--input_bin` | str | "data/omgprot50/omgprot50_train_*.bin" | Input training bin files pattern. |

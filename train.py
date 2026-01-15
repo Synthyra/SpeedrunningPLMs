@@ -26,7 +26,7 @@ from tqdm import tqdm
 from data.download_data import get as ensure_hf_file
 from model.model import PLM, PLMConfig
 from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
-from optimizer import Muon
+from optimizer import NorMuon
 from utils import (
     set_seed,
     load_config_from_yaml,
@@ -87,11 +87,21 @@ def arg_parser():
     parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
     parser.add_argument("--attention_soft_cap", type=float, default=64.0, help="Attention softmax cap")
     parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
-    parser.add_argument("--p_attention", action="store_true", help="Use P attention")
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
     parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
     parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
+    parser.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length for rotary cache")
+    parser.add_argument("--max_doc_len", type=int, default=2048, help="Max document length before truncation")
+    parser.add_argument("--long_window_every", type=int, default=4, help="Use long window on every Nth layer")
+    parser.add_argument("--paired_head_layers", type=str, default="", help="Comma-separated paired head layers")
+    parser.add_argument("--use_flash_attn", type=bool, default=True, help="Use Flash Attention if available")
+    parser.add_argument("--partial_key_offset", type=bool, default=True, help="Enable partial key offset")
+    parser.add_argument("--attn_gate_dim", type=int, default=16, help="Attention gate input dim")
+    parser.add_argument("--value_embed_gate_dim", type=int, default=16, help="Value embed gate input dim")
+    parser.add_argument("--skip_gate_dim", type=int, default=16, help="Skip gate input dim")
+    parser.add_argument("--smear_gate_dim", type=int, default=16, help="Smear gate input dim")
+    parser.add_argument("--backout_frac", type=float, default=2/3, help="Backout layer fraction")
     
     # Data hyperparams
     parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
@@ -114,6 +124,8 @@ def arg_parser():
     parser.add_argument("--lr_embed", type=float, default=0.06, help="Learning rate for embeddings")
     parser.add_argument("--lr_head", type=float, default=0.008, help="Learning rate for head")
     parser.add_argument("--lr_scalar", type=float, default=0.04, help="Learning rate for scalar params")
+    parser.add_argument("--embed_head_update_every", type=int, default=2, help="Steps to accumulate embed/head grads")
+    parser.add_argument("--untie_embed_frac", type=float, default=2/3, help="Fraction of training to untie embed/lm_head")
     
     # Muon optimizer params
     parser.add_argument("--use_muon", type=bool, default=True, help="Use Muon optimizer")
@@ -151,6 +163,16 @@ def arg_parser():
                         value = value.lower() in ('true', '1', 'yes', 'on')
                     setattr(args, key, value)
     
+    if isinstance(args.paired_head_layers, str):
+        if args.paired_head_layers.strip():
+            layer_parts = [p.strip() for p in args.paired_head_layers.split(",")]
+            args.paired_head_layers = [int(p) for p in layer_parts if p]
+        else:
+            args.paired_head_layers = None
+
+    if args.max_seq_len < args.max_length:
+        args.max_seq_len = args.max_length
+
     # Align input patterns to dataset if not already pointing at it
     args.input_bin = f"data/{args.data_name}/{args.data_name}_train_*.bin"
     args.input_valid_bin = f"data/{args.data_name}/{args.data_name}_valid_*.bin"
@@ -174,6 +196,8 @@ class Trainer:
         # Initialize auto gradient clipper
         self.auto_grad_clipper = None
         self.last_clip_value = None
+        self.window_size_long = None
+        self.window_size_short = None
         
         if 'RANK' in os.environ:
             self.ddp_rank = int(os.environ['RANK'])
@@ -335,6 +359,7 @@ class Trainer:
                 prefetch_factor=self.args.prefetch_factor,
                 mlm=self.args.mlm,
                 mask_rate=mask_rate,
+                max_doc_len=self.args.max_doc_len,
             )
         else:
             # Use evaluation dataloader that distributes data by sequences, not files
@@ -344,6 +369,7 @@ class Trainer:
                 process_rank=self.ddp_rank,
                 num_processes=self.ddp_world_size,
                 tokenizer=self.tokenizer,
+                max_doc_len=self.args.max_doc_len,
             )
 
     def init_model(self):
@@ -373,27 +399,40 @@ class Trainer:
     def init_optimizers(self):
         self.print0("Initializing optimizers...")
         if self.args.use_muon:
-            hidden_matrix_params = [
-                p for n, p in self.model.named_parameters() 
-                if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
-            ]
-            embed_params = [
-                p for n, p in self.model.named_parameters() if "embed" in n.lower() and p.requires_grad
-            ]
-            head_params = [
-                p for n, p in self.model.named_parameters() if "lm_head" in n.lower() and p.requires_grad
-            ]
-            scalar_params = [
-                p for n, p in self.model.named_parameters() 
-                if p.ndim < 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
-            ]
-            optimizer1 = torch.optim.Adam([
-                dict(params=embed_params, lr=self.args.lr_embed),
-                dict(params=head_params, lr=self.args.lr_head),
-                dict(params=scalar_params, lr=self.args.lr_scalar)
-            ], betas=(0.8, 0.95), fused=True)
-            optimizer2 = Muon(hidden_matrix_params, lr=self.args.lr_hidden, momentum=0.95)
-            optimizers = [optimizer1, optimizer2]
+            embed_params = []
+            head_params = []
+            scalar_params = []
+            muon_params = []
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                lname = name.lower()
+                if "lm_head" in lname:
+                    head_params.append(param)
+                elif "embedding" in lname or "value_embeds" in lname:
+                    embed_params.append(param)
+                elif "gate" in lname or "lambda" in lname or "skip_weights" in lname or "bias" in lname:
+                    scalar_params.append(param)
+                elif param.ndim < 2:
+                    scalar_params.append(param)
+                else:
+                    muon_params.append(param)
+
+            self.embed_head_optimizer = torch.optim.Adam(
+                [
+                    dict(params=embed_params, lr=self.args.lr_embed),
+                    dict(params=head_params, lr=self.args.lr_head),
+                ],
+                betas=(0.8, 0.95),
+                fused=True,
+            )
+            self.scalar_optimizer = torch.optim.Adam(
+                [dict(params=scalar_params, lr=self.args.lr_scalar)],
+                betas=(0.8, 0.95),
+                fused=True,
+            )
+            self.muon_optimizer = NorMuon(muon_params, lr=self.args.lr_hidden, momentum=0.95, beta2=0.95, weight_decay=1.2)
+            optimizers = [self.embed_head_optimizer, self.scalar_optimizer, self.muon_optimizer]
         else:
             optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.lr)
             optimizers = [optimizer]
@@ -402,22 +441,38 @@ class Trainer:
     def init_schedulers(self):
         self.print0("Initializing schedulers...")
         lr_schedulers = []
-        adam_scheduler = get_scheduler(
-            self.args.scheduler_type,
-            optimizer=self.optimizers[0],
-            num_warmup_steps=self.args.lr_warmup_steps,
-            num_training_steps=self.args.num_steps
-        )
-        lr_schedulers.append(adam_scheduler)
         if self.args.use_muon:
+            embed_scheduler = get_scheduler(
+                self.args.scheduler_type,
+                optimizer=self.embed_head_optimizer,
+                num_warmup_steps=self.args.lr_warmup_steps,
+                num_training_steps=self.args.num_steps,
+            )
+            scalar_scheduler = get_scheduler(
+                self.args.scheduler_type,
+                optimizer=self.scalar_optimizer,
+                num_warmup_steps=self.args.lr_warmup_steps,
+                num_training_steps=self.args.num_steps,
+            )
             muon_scheduler = get_scheduler(
                 self.args.scheduler_type,
-                optimizer=self.optimizers[-1],
-                num_warmup_steps=0, # apparently muon does not need a warmup
-                num_training_steps=self.args.num_steps
+                optimizer=self.muon_optimizer,
+                num_warmup_steps=0,
+                num_training_steps=self.args.num_steps,
             )
-            lr_schedulers.append(muon_scheduler)
-        sliding_window_size_scheduler = LerpTensor(start_val=512, end_val=self.args.max_length, precision=128)
+            lr_schedulers.extend([embed_scheduler, scalar_scheduler, muon_scheduler])
+        else:
+            adam_scheduler = get_scheduler(
+                self.args.scheduler_type,
+                optimizer=self.optimizers[0],
+                num_warmup_steps=self.args.lr_warmup_steps,
+                num_training_steps=self.args.num_steps,
+            )
+            lr_schedulers.append(adam_scheduler)
+
+        sliding_window_size_scheduler = LerpTensor(
+            start_val=512, end_val=self.args.max_length, precision=128
+        )
         if self.args.mask_rate_schedule:
             mask_rate_scheduler = LerpFloat(
                 start_val=self.args.starting_mask_rate, 
@@ -446,7 +501,7 @@ class Trainer:
         while input_ids.numel():
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
             total_tokens += batch_valid_tokens
-            loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size)
+            loss = self.model(input_ids, labels, mask_rate, self.window_size_long, self.window_size_short)
             losses.append(loss.item())
             input_ids, labels, mask_rate = loader.next_batch()
             pbar.update(1)
@@ -521,14 +576,14 @@ class Trainer:
                     if input_ids.numel() == 0:
                         raise RuntimeError("Dataloader returned empty batch even after reset")
                 
-                loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size) / self.args.grad_accum
+                loss = self.model(input_ids, labels, mask_rate, self.window_size_long, self.window_size_short) / self.args.grad_accum
                 loss.backward()
                 accumulated_loss += loss.item()  # Accumulate the scaled loss
 
         # momentum warmup for Muon
         if self.args.use_muon:
             frac = min(step/self.args.muon_momentum_warmup_steps, 1)
-            for group in self.optimizers[-1].param_groups:
+            for group in self.muon_optimizer.param_groups:
                 group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
 
         # Apply gradient clipping if specified
@@ -544,13 +599,24 @@ class Trainer:
                 clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
             clip_value = self.args.grad_clip
 
-        # step the optimizers and schedulers
-        for opt, sched in zip(self.optimizers, self.lr_schedulers):
-            opt.step()
-            sched.step()
+        # step the optimizers
+        if self.args.use_muon:
+            self.muon_optimizer.step()
+            self.scalar_optimizer.step()
+            should_step_embed = (step % self.args.embed_head_update_every) == (self.args.embed_head_update_every - 1)
+            if should_step_embed:
+                self.embed_head_optimizer.step()
+                self.embed_head_optimizer.zero_grad(set_to_none=True)
+            self.muon_optimizer.zero_grad(set_to_none=True)
+            self.scalar_optimizer.zero_grad(set_to_none=True)
+        else:
+            for opt in self.optimizers:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
 
-        # null the gradients
-        self.model.zero_grad(set_to_none=True)
+        # step the schedulers
+        for sched in self.lr_schedulers:
+            sched.step()
         
         # Store clip value for logging
         self.last_clip_value = clip_value
@@ -582,9 +648,18 @@ class Trainer:
 
                 frac_done = step / self.args.num_steps  # training progress
                 if frac_done > 1:
-                    self.sliding_window_size = self.args.max_length
+                    window_size_long = self.args.max_length
                 else:
-                    self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
+                    window_size_long = int(self.sliding_window_size_scheduler(frac_done))
+                window_size_short = max(window_size_long // 2, 1)
+                if self.window_size_long is None:
+                    self.window_size_long = window_size_long
+                    self.window_size_short = window_size_short
+                elif window_size_long != self.window_size_long:
+                    model_for_yarn = self.model.module if self.ddp_world_size > 1 else self.model
+                    model_for_yarn.update_yarn(self.window_size_long, window_size_long)
+                    self.window_size_long = window_size_long
+                    self.window_size_short = window_size_short
                 
                 if self.mask_rate_scheduler:
                     frac_done_mask = step / self.args.mask_rate_steps
@@ -595,6 +670,10 @@ class Trainer:
                     self.current_mask_rate = mask_rate
                     self.train_loader.set_mask_rate(mask_rate)
 
+                if step == int(self.args.untie_embed_frac * self.args.num_steps):
+                    model_for_split = self.model.module if self.ddp_world_size > 1 else self.model
+                    model_for_split.split_tied_embeddings()
+
                 # once in a while evaluate the validation dataset
                 if self.args.eval_every > 0 and step % self.args.eval_every == 0:
                     val_loss, val_perplexity, val_tokens = self._run_eval_loader_timed(self.valid_loader, prefix='Validation')
@@ -602,7 +681,13 @@ class Trainer:
                     step_avg_ms = 1000 * training_time_sec / (timed_steps - 1) if timed_steps > 1 else 0
                     self.print0(f'step:{step}/{self.args.num_steps} step_avg:{step_avg_ms:.2f}ms')
                     self.log_wandb(
-                        {'loss': val_loss, 'perplexity': val_perplexity, 'tokens': val_tokens, 'sliding_window_size': self.sliding_window_size},
+                        {
+                            'loss': val_loss,
+                            'perplexity': val_perplexity,
+                            'tokens': val_tokens,
+                            'window_size_long': self.window_size_long,
+                            'window_size_short': self.window_size_short,
+                        },
                         prefix='val'
                     )
 
@@ -712,7 +797,6 @@ if __name__ == '__main__':
         args.num_att_tokens = 128
         args.expansion_ratio = 2.0
         args.soft_logit_cap = 16.0
-        args.p_attention = True
         args.tie_embeddings = False
         args.unet = True
         args.batch_size = 2048
@@ -737,8 +821,18 @@ if __name__ == '__main__':
         soft_logit_cap=args.soft_logit_cap,
         attention_soft_cap=args.attention_soft_cap,
         add_att_soft_cap=args.add_att_soft_cap,
-        p_attention=args.p_attention,
         tie_embeddings=args.tie_embeddings,
+        max_seq_len=args.max_seq_len,
+        max_doc_len=args.max_doc_len,
+        long_window_every=args.long_window_every,
+        paired_head_layers=args.paired_head_layers,
+        use_flash_attn=args.use_flash_attn,
+        partial_key_offset=args.partial_key_offset,
+        attn_gate_dim=args.attn_gate_dim,
+        value_embed_gate_dim=args.value_embed_gate_dim,
+        skip_gate_dim=args.skip_gate_dim,
+        smear_gate_dim=args.smear_gate_dim,
+        backout_frac=args.backout_frac,
         unet=args.unet,
         mlm=args.mlm,
     )

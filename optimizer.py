@@ -4,34 +4,46 @@ import torch.distributed as dist
 
 
 ### Muon optimizer
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
+def polar_express(G, steps=5, eps=1e-6):
     assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
     if G.size(0) > G.size(1):
         X = X.T
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm() + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
+    X = X / (X.norm() * (1 + 2e-2) + eps)
+    X = X.contiguous()
+    A = torch.empty((X.size(0), X.size(0)), device=X.device, dtype=X.dtype)
+    B = torch.empty_like(A)
+    C = torch.empty_like(X)
+    for a, b, c in polar_express_coeffs[:steps]:
         A = X @ X.T
-        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-
+        B = b * A + c * (A @ A)
+        C = a * X + B @ X
+        X, C = C, X
     if G.size(0) > G.size(1):
         X = X.T
     return X
+
+@torch.compile
+def apply_normuon_variance_reduction(v, second_momentum_buffer, beta2, red_dim):
+    v_mean = v.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = v.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
+    v_norm = v_norm_sq.sqrt_()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
+    return v.mul_(final_scale.type_as(v))
 
 
 class Muon(torch.optim.Optimizer):
@@ -109,7 +121,7 @@ class Muon(torch.optim.Optimizer):
                 buf = state['momentum_buffer']
                 buf.lerp_(g, 1 - momentum)
                 g = g.lerp_(buf, momentum) if nesterov else buf
-                g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                g = polar_express(g, steps=ns_steps).flatten()
                 update_prev()
                 if self.world_size > 1:
                     handle = dist.all_gather(update_buffers, g, async_op=True)
@@ -118,3 +130,48 @@ class Muon(torch.optim.Optimizer):
                     handle = None
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
+
+
+class NorMuon(torch.optim.Optimizer):
+    """
+    NorMuon optimizer with Polar Express orthogonalization and cautious weight decay.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, beta2=0.95, weight_decay=0.01):
+        defaults = dict(lr=lr, momentum=momentum, beta2=beta2, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            beta2 = group["beta2"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(grad)
+                if "second_momentum_buffer" not in state:
+                    red_dim = -1 if p.shape[-2] >= p.shape[-1] else -2
+                    state["second_momentum_buffer"] = (
+                        torch.zeros_like(grad[..., :, :1])
+                        if red_dim == -1
+                        else torch.zeros_like(grad[..., :1, :])
+                    )
+
+                buf = state["momentum_buffer"]
+                buf.lerp_(grad, 1 - momentum)
+                v = grad.lerp_(buf, momentum)
+                v = polar_express(v)
+
+                red_dim = -1 if p.shape[-2] >= p.shape[-1] else -2
+                v = apply_normuon_variance_reduction(v, state["second_momentum_buffer"], beta2, red_dim)
+
+                if weight_decay != 0:
+                    mask = (v * p) >= 0
+                    p.add_(p * mask, alpha=-weight_decay * lr)
+                p.add_(v, alpha=-lr)
