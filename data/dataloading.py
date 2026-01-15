@@ -209,6 +209,9 @@ class OptimizedEvalLoader:
         self._iterator = None
         self._exhausted = False
     
+    def __len__(self):
+        return len(self.dataloader)
+
     def reset(self):
         """Reset the dataloader iterator."""
         self._iterator = iter(self.dataloader)
