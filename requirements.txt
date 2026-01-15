@@ -11,3 +11,5 @@ wandb
 PyYAML
 scikit-learn
 scipy
+hf_transfer
+hf-xet

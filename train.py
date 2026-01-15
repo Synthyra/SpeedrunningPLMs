@@ -1,7 +1,10 @@
+import entrypoint_setup
+
 import os
 import sys
 
 code = open(sys.argv[0]).read()
+code += open('entrypoint_setup.py', 'r', encoding='utf-8').read()
 code += open('optimizer.py', 'r', encoding='utf-8').read()
 code += open('data/dataloading.py', 'r', encoding='utf-8').read()
 code += open('model/utils.py', 'r', encoding='utf-8').read()
