@@ -23,7 +23,6 @@ class PLMConfig(PretrainedConfig):
         hidden_size: int = 512,
         num_attention_heads: int =  8,
         num_hidden_layers: int = 12,
-        num_att_tokens: int = 512,
         vocab_size: int = 33,
         expansion_ratio: float = 2.0,
         attention_soft_cap: float = 64.0,
@@ -51,7 +50,6 @@ class PLMConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
-        self.num_att_tokens = num_att_tokens
         self.vocab_size = vocab_size
         self.expansion_ratio = expansion_ratio
         self.soft_logit_cap = soft_logit_cap

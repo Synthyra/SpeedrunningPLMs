@@ -7,7 +7,6 @@ save_path: "Synthyra/debug_test"
 hidden_size: 128
 num_attention_heads: 2
 num_hidden_layers: 2
-num_att_tokens: 128
 expansion_ratio: 2.0
 soft_logit_cap: 16.0
 tie_embeddings: false

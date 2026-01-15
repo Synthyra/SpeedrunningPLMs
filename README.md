@@ -185,7 +185,6 @@ This script will automatically:
 | `--hidden_size` | int | 768 | Hidden size of the model. |
 | `--num_attention_heads` | int | 6 | Number of attention heads. |
 | `--num_hidden_layers` | int | 24 | Number of hidden layers. |
-| `--num_att_tokens` | int | 512 | Number of attention tokens. |
 | `--vocab_size` | int | 33 | Vocabulary size. |
 | `--expansion_ratio` | float | 2.6667 | Expansion ratio for MLP (e.g., 8/3). |
 | `--soft_logit_cap` | float | 32.0 | Soft logit cap for output logits. |

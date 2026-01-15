@@ -14,8 +14,7 @@ clear_cache_every: 1000
 # Model Architecture
 hidden_size: 768
 num_attention_heads: 6
-num_hidden_layers: 24
-num_att_tokens: 512
+num_hidden_layers: 12
 vocab_size: 33
 expansion_ratio: 2.6667  # 8/3
 soft_logit_cap: 32.0
@@ -27,8 +26,8 @@ token_dropout: false
 bfloat16: true
 
 # Data Configuration
-mlm: false  # Masked Language Modeling
-mask_rate: 0.2
+mlm: True  # Masked Language Modeling
+mask_rate: 0.3
 mask_rate_schedule: true
 starting_mask_rate: 0.1
 mask_rate_steps: 2500
@@ -36,8 +35,8 @@ mask_rate_steps: 2500
 # Training Hyperparameters
 batch_size: 524288  # 8*64*1024 tokens
 grad_accum: 8
-num_steps: 50000
-cooldown_steps: 5000
+num_steps: 10000
+cooldown_steps: 1000
 max_length: 1024
 scheduler_type: "cosine"
 lr_warmup_steps: 1000
@@ -49,7 +48,7 @@ lr_embed: 0.06
 lr_head: 0.008
 lr_scalar: 0.04
 grad_clip: 0.0
-auto_grad_clip: false
+auto_grad_clip: True
 auto_grad_clip_percentile: 10
 
 # Muon optimizer (for hidden layers)

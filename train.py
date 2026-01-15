@@ -84,7 +84,6 @@ def arg_parser():
     parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size of the model")
     parser.add_argument("--num_attention_heads", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers")
-    parser.add_argument("--num_att_tokens", type=int, default=512, help="Number of attention tokens")
     parser.add_argument("--vocab_size", type=int, default=33, help="Vocabulary size")
     parser.add_argument("--expansion_ratio", type=float, default=8/3, help="Expansion ratio for MLP")
     parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
@@ -801,7 +800,6 @@ if __name__ == '__main__':
         args.hidden_size = 128
         args.num_attention_heads = 2
         args.num_hidden_layers = 2
-        args.num_att_tokens = 128
         args.expansion_ratio = 2.0
         args.soft_logit_cap = 16.0
         args.tie_embeddings = False
@@ -822,7 +820,6 @@ if __name__ == '__main__':
         hidden_size=args.hidden_size,
         num_attention_heads=args.num_attention_heads,
         num_hidden_layers=args.num_hidden_layers,
-        num_att_tokens=args.num_att_tokens,
         vocab_size=args.vocab_size,
         expansion_ratio=args.expansion_ratio,
         soft_logit_cap=args.soft_logit_cap,
