@@ -295,6 +295,10 @@ class Trainer:
         self.print0(f'Across {self.ddp_world_size} GPUs')
         self.print0(f'Total batch size: {self.args.batch_size} tokens')
 
+        # Ensure rotary cache can cover the full packed sequence length.
+        if self.model_config.max_seq_len < self.batch_size:
+            self.model_config.max_seq_len = self.batch_size
+
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.pad_token_id = self.tokenizer.pad_token_id
 
