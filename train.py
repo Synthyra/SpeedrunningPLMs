@@ -606,7 +606,7 @@ class Trainer:
         input_ids, labels, mask_rate = loader.next_batch()
         
         # Only show progress bar on master process
-        pbar = tqdm(desc=f'{prefix} set', leave=False, disable=not self.master_process, total=len(loader))
+        pbar = tqdm(desc=f'{prefix} set', leave=False, disable=not self.master_process)
         
         while input_ids.numel():
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
