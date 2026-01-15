@@ -26,7 +26,8 @@ token_dropout: false
 bfloat16: true
 
 # Data Configuration
-mlm: True  # Masked Language Modeling
+mlm: true  # Masked Language Modeling
+masked_diffusion: false
 mask_rate: 0.3
 mask_rate_schedule: true
 starting_mask_rate: 0.1
@@ -57,7 +58,7 @@ lr_hidden: 0.05
 muon_momentum_warmup_steps: 300
 
 # Evaluation and Logging
-eval_every: 1000
+eval_every: 100
 hf_model_name: "lhallee/speedrun"
 save_every: null  # Set to a number to save checkpoints every N steps
 

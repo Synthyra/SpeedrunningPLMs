@@ -122,7 +122,7 @@ Some key arguments for `train.py` include
 
 `--token YOUR_HUGGINGFACE_TOKEN`, a Huggingface write token is required to save your models to Huggingface hub
 `--wandb_token YOUR_WANDB_TOKEN`, is required for Weights and Biases (WANDB) logging
-`--yaml_path YOUR_YAML_FILE`, points to an experimental set up with more settings. See `example_yamls/default.yaml` for inspiration
+`--yaml_path YOUR_YAML_FILE`, points to an experimental set up with more settings. See `example_yamls/normal.yaml` for inspiration
 
 See [Command-line Argument](#command-line-arguments) for the full list of argument.
 

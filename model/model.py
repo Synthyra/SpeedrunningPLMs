@@ -469,6 +469,7 @@ class PLM(PreTrainedModel):
         mask_rate: torch.Tensor,
         window_size_long: Optional[int] = None,
         window_size_short: Optional[int] = None,
+        return_logits: bool = False,
         ) -> torch.Tensor:
         if window_size_long is None:
             window_size_long = self.sliding_window_size
@@ -488,6 +489,8 @@ class PLM(PreTrainedModel):
         #if self.training and not self.mlm:
         #    loss = loss / mask_rate
 
+        if return_logits:
+            return loss, lm_logits
         return loss
 
 

@@ -27,6 +27,7 @@ bfloat16: false
 
 # Data Configuration
 mlm: false  # Masked Language Modeling
+masked_diffusion: false
 mask_rate: 0.2
 mask_rate_schedule: true
 starting_mask_rate: 0.1

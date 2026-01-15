@@ -11,6 +11,8 @@ expansion_ratio: 2.0
 soft_logit_cap: 16.0
 tie_embeddings: false
 unet: true
+mlm: false
+masked_diffusion: false
 
 # Small training configuration
 batch_size: 2048

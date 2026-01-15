@@ -16,6 +16,8 @@ import contextlib
 import subprocess
 import math
 import argparse
+from pathlib import Path
+import numpy as np
 import torch
 import torch.distributed as dist
 #import torch._dynamo
@@ -25,6 +27,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
 from tqdm import tqdm
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    matthews_corrcoef,
+)
 
 from data.download_data import get as ensure_hf_file
 from model.model import PLM, PLMConfig
@@ -107,6 +116,7 @@ def arg_parser():
     
     # Data hyperparams
     parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
+    parser.add_argument("--masked_diffusion", type=bool, default=False, help="Warm up with MLM, then switch to diffusion")
     parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
     parser.add_argument("--starting_mask_rate", type=float, default=0.1, help="Starting mask rate for masked language modeling")
     parser.add_argument("--mask_rate_steps", type=int, default=2500, help="Number of steps to reach mask rate")
@@ -233,6 +243,84 @@ class Trainer:
         if self.master_process and self.wandb_initialized:
             wandb.log({f'{prefix}/{k}': v for k, v in log_dict.items()})
 
+    @staticmethod
+    def _calculate_metrics(preds: torch.Tensor, labels: torch.Tensor):
+        valid_mask = labels != -100
+        if not valid_mask.any():
+            return {
+                "accuracy": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "mcc": 0.0,
+                "num_tokens": 0,
+            }
+        valid_preds = preds[valid_mask].cpu().numpy()
+        valid_labels = labels[valid_mask].cpu().numpy()
+        return {
+            "accuracy": accuracy_score(valid_labels, valid_preds),
+            "precision": precision_score(valid_labels, valid_preds, average="weighted", zero_division=0),
+            "recall": recall_score(valid_labels, valid_preds, average="weighted", zero_division=0),
+            "f1": f1_score(valid_labels, valid_preds, average="weighted", zero_division=0),
+            "mcc": matthews_corrcoef(valid_labels, valid_preds),
+            "num_tokens": int(valid_labels.shape[0]),
+        }
+
+    @staticmethod
+    def _read_bin_num_tokens(path):
+        with open(path, "rb") as f:
+            header = np.fromfile(f, dtype=np.int32, count=3)
+        if header.size < 3:
+            raise ValueError(f"Invalid header in {path}")
+        return int(header[2])
+
+    def _print_val_preview(self, input_ids: torch.Tensor, labels: torch.Tensor, logits: torch.Tensor):
+        if not self.master_process:
+            return
+        mask_token_id = self.tokenizer.mask_token_id
+        pad_token_id = self.pad_token_id
+        input_ids = input_ids.cpu()
+        labels = labels.cpu()
+        logits = logits.cpu()
+        masked_positions = (input_ids == mask_token_id).nonzero(as_tuple=True)[0]
+        if masked_positions.numel() == 0:
+            self.print0("Validation preview: no masked positions in selected batch.", logonly=True)
+            return
+
+        preds = logits.argmax(dim=-1)
+        filled = input_ids.clone()
+        filled[masked_positions] = preds[masked_positions]
+
+        original = input_ids.clone()
+        original[masked_positions] = labels[masked_positions]
+
+        def _strip_pad(ids):
+            if (ids == pad_token_id).any():
+                last_valid = (ids != pad_token_id).nonzero(as_tuple=True)[0][-1].item()
+                return ids[: last_valid + 1]
+            return ids
+
+        input_ids = _strip_pad(input_ids)
+        original = _strip_pad(original)
+        filled = _strip_pad(filled)
+
+        decoded_input = self.tokenizer.decode(input_ids.tolist(), skip_special_tokens=False)
+        decoded_original = self.tokenizer.decode(original.tolist(), skip_special_tokens=False)
+        decoded_filled = self.tokenizer.decode(filled.tolist(), skip_special_tokens=False)
+
+        masked_list = masked_positions.tolist()
+        self.print0("=" * 80, logonly=True)
+        self.print0("VALIDATION PREVIEW (single example)", logonly=True)
+        self.print0(f"Masked positions: {masked_list}", logonly=True)
+        self.print0(f"Raw input ids:    {input_ids.tolist()}", logonly=True)
+        self.print0(f"Raw original ids: {original.tolist()}", logonly=True)
+        self.print0(f"Raw filled ids:   {filled.tolist()}", logonly=True)
+        self.print0("-" * 80, logonly=True)
+        self.print0(f"Decoded input:    {decoded_input}", logonly=True)
+        self.print0(f"Decoded original: {decoded_original}", logonly=True)
+        self.print0(f"Decoded filled:   {decoded_filled}", logonly=True)
+        self.print0("=" * 80, logonly=True)
+
     def init_training(self):
         self.logfile = None
         if self.master_process:
@@ -326,6 +414,17 @@ class Trainer:
         self.print0(f'Testing DataLoader: {len(self.test_loader.files)} files')
         self.print0('='*100, logonly=True)
 
+        if self.master_process:
+            train_files = sorted(Path.cwd().glob(self.args.input_bin))
+            self.total_downloaded_tokens = sum(self._read_bin_num_tokens(f) for f in train_files)
+        else:
+            self.total_downloaded_tokens = 0
+        if self.ddp_world_size > 1:
+            total_tokens_tensor = torch.tensor(self.total_downloaded_tokens, device=self.device)
+            dist.broadcast(total_tokens_tensor, 0)
+            self.total_downloaded_tokens = int(total_tokens_tensor.item())
+        self.epoch_counter = 1
+
         self.model = self.init_model()
         self.print0(summary(self.model))
         
@@ -353,7 +452,7 @@ class Trainer:
             else:
                 # we set to 1.0, which properly scales the masked diffusion random mask rate
                 # we can schedule the mask rate with any float, which is torch.rand(1) * mask_rate
-                mask_rate = 1.0 
+                mask_rate = 1.0
             return OptimizedTrainLoader(
                 filename_pattern=filename_pattern,
                 seq_len=self.batch_size,
@@ -363,7 +462,7 @@ class Trainer:
                 tokenizer=self.tokenizer,
                 num_workers=self.args.num_workers,
                 prefetch_factor=self.args.prefetch_factor,
-                mlm=self.args.mlm,
+                mlm=self.args.mlm or self.args.masked_diffusion,
                 mask_rate=mask_rate,
                 max_doc_len=self.args.max_doc_len,
             )
@@ -499,6 +598,9 @@ class Trainer:
         self.model.eval()
 
         losses, total_tokens = [], 0
+        all_preds = []
+        all_labels = []
+        preview_done = False
         input_ids, labels, mask_rate = loader.next_batch()
         
         # Only show progress bar on master process
@@ -507,13 +609,28 @@ class Trainer:
         while input_ids.numel():
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
             total_tokens += batch_valid_tokens
-            loss = self.model(input_ids, labels, mask_rate, self.window_size_long, self.window_size_short)
+            loss, logits = self.model(
+                input_ids, labels, mask_rate, self.window_size_long, self.window_size_short, return_logits=True
+            )
             losses.append(loss.item())
+            preds = logits.argmax(dim=-1)
+            all_preds.append(preds.detach())
+            all_labels.append(labels.detach())
+            if not preview_done:
+                self._print_val_preview(input_ids[0], labels[0], logits[0])
+                preview_done = True
             input_ids, labels, mask_rate = loader.next_batch()
             pbar.update(1)
         pbar.close()
 
         avg_loss = sum(losses) / len(losses) if losses else 0.0
+
+        if all_preds:
+            all_preds = torch.cat([p.flatten() for p in all_preds])
+            all_labels = torch.cat([l.flatten() for l in all_labels])
+            metrics = self._calculate_metrics(all_preds, all_labels)
+        else:
+            metrics = self._calculate_metrics(torch.empty(0), torch.empty(0))
 
         if self.ddp_world_size > 1:
             # Convert to tensors before all_reduce
@@ -526,9 +643,17 @@ class Trainer:
 
         perplexity = math.e**avg_loss if isinstance(avg_loss, float) else math.e**avg_loss.item()
 
-        self.print0(f'{prefix} set: loss: {avg_loss:.4f} perplexity: {perplexity:.4f} tokens: {total_tokens.item() if hasattr(total_tokens, "item") else total_tokens:,}')
+        self.print0(
+            f'{prefix} set: loss: {avg_loss:.4f} perplexity: {perplexity:.4f} '
+            f'tokens: {total_tokens.item() if hasattr(total_tokens, "item") else total_tokens:,}'
+        )
+        self.print0(
+            f"{prefix} metrics: acc:{metrics['accuracy']:.4f} prec:{metrics['precision']:.4f} "
+            f"rec:{metrics['recall']:.4f} f1:{metrics['f1']:.4f} mcc:{metrics['mcc']:.4f} "
+            f"tokens:{metrics['num_tokens']:,}"
+        )
 
-        return avg_loss, perplexity, total_tokens
+        return avg_loss, perplexity, total_tokens, metrics
 
     def save_checkpoint(self, step):
         # Only master saves, but all processes wait
@@ -682,6 +807,8 @@ class Trainer:
                         mask_rate = self.mask_rate_scheduler(frac_done_mask)
                     self.current_mask_rate = mask_rate
                     self.train_loader.set_mask_rate(mask_rate)
+                    if self.args.masked_diffusion and frac_done_mask > 1 and self.train_loader.mlm:
+                        self.train_loader.set_mlm(False)
 
                 if step == int(self.args.untie_embed_frac * self.args.num_steps):
                     model_for_split = self.model.module if self.ddp_world_size > 1 else self.model
@@ -689,10 +816,22 @@ class Trainer:
 
                 # once in a while evaluate the validation dataset
                 if self.args.eval_every > 0 and step % self.args.eval_every == 0:
-                    val_loss, val_perplexity, val_tokens = self._run_eval_loader_timed(self.valid_loader, prefix='Validation')
+                    val_loss, val_perplexity, val_tokens, val_metrics = self._run_eval_loader_timed(
+                        self.valid_loader, prefix='Validation'
+                    )
                     training_time_sec = self.train_timer.get_time()
                     step_avg_ms = 1000 * training_time_sec / (timed_steps - 1) if timed_steps > 1 else 0
                     self.print0(f'step:{step}/{self.args.num_steps} step_avg:{step_avg_ms:.2f}ms')
+                    tokens_seen = (step + 1) * self.args.batch_size
+                    epoch_progress = tokens_seen / max(self.total_downloaded_tokens, 1)
+                    current_epoch = int(epoch_progress) + 1
+                    if current_epoch != self.epoch_counter:
+                        self.print0(f"(MOVING FROM EPOCH {self.epoch_counter} TO EPOCH {current_epoch})")
+                        self.epoch_counter = current_epoch
+                    self.print0(
+                        f"Epoch progress: {epoch_progress:.4f} "
+                        f"({tokens_seen:,}/{self.total_downloaded_tokens:,} tokens)"
+                    )
                     self.log_wandb(
                         {
                             'loss': val_loss,
@@ -700,6 +839,12 @@ class Trainer:
                             'tokens': val_tokens,
                             'window_size_long': self.window_size_long,
                             'window_size_short': self.window_size_short,
+                            'accuracy': val_metrics['accuracy'],
+                            'precision': val_metrics['precision'],
+                            'recall': val_metrics['recall'],
+                            'f1': val_metrics['f1'],
+                            'mcc': val_metrics['mcc'],
+                            'epoch_progress': epoch_progress,
                         },
                         prefix='val'
                     )
@@ -757,7 +902,9 @@ class Trainer:
             torch.cuda.synchronize()
             set_seed(self.args.seed)
 
-            test_loss, test_perplexity, test_tokens = self._run_eval_loader_timed(self.test_loader, prefix='Test')
+            test_loss, test_perplexity, test_tokens, test_metrics = self._run_eval_loader_timed(
+                self.test_loader, prefix='Test'
+            )
 
             self.print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
         
@@ -767,6 +914,11 @@ class Trainer:
                     "test_loss": test_loss,
                     "test_perplexity": test_perplexity,
                     "test_tokens": test_tokens.item() if hasattr(test_tokens, "item") else test_tokens,
+                    "test_accuracy": test_metrics["accuracy"],
+                    "test_precision": test_metrics["precision"],
+                    "test_recall": test_metrics["recall"],
+                    "test_f1": test_metrics["f1"],
+                    "test_mcc": test_metrics["mcc"],
                     "final_train_time_sec": final_training_time_sec,
                     "final_step_avg_sec": final_training_time_sec/(timed_steps-1) if timed_steps > 1 else 0,
                     "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
@@ -819,6 +971,10 @@ if __name__ == '__main__':
         args.auto_grad_clip = True
         args.grad_clip = 0.0  # Disable regular grad clip for bugfix testing
 
+    # Validate mode arguments
+    if args.mlm and args.masked_diffusion:
+        raise ValueError("Only one of --mlm or --masked_diffusion can be true.")
+
     # Validate gradient clipping arguments
     if args.auto_grad_clip and args.grad_clip > 0:
         raise ValueError("Cannot use both --auto_grad_clip and --grad_clip at the same time. Choose one.")
@@ -846,6 +1002,7 @@ if __name__ == '__main__':
         backout_frac=args.backout_frac,
         unet=args.unet,
         mlm=args.mlm,
+        masked_diffusion=args.masked_diffusion,
     )
 
     # Initialize wandb before clearing tokens for security
