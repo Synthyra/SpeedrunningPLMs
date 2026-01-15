@@ -308,22 +308,22 @@ class Trainer:
         original = _strip_pad(original)
         filled = _strip_pad(filled)
 
-        decoded_input = self.tokenizer.decode(input_ids.tolist(), skip_special_tokens=False)
-        decoded_original = self.tokenizer.decode(original.tolist(), skip_special_tokens=False)
-        decoded_filled = self.tokenizer.decode(filled.tolist(), skip_special_tokens=False)
+        decoded_input = self.tokenizer.decode(input_ids.tolist()[:100], skip_special_tokens=False).replace(" ", "")
+        decoded_original = self.tokenizer.decode(original.tolist()[:100], skip_special_tokens=False).replace(" ", "")
+        decoded_filled = self.tokenizer.decode(filled.tolist()[:100], skip_special_tokens=False).replace(" ", "")
 
-        masked_list = masked_positions.tolist()
-        self.print0("=" * 80)
-        self.print0("VALIDATION PREVIEW (single example)")
-        self.print0(f"Masked positions: {masked_list}")
-        self.print0(f"Raw input ids:    {input_ids.tolist()}")
-        self.print0(f"Raw original ids: {original.tolist()}")
-        self.print0(f"Raw filled ids:   {filled.tolist()}")
-        self.print0("-" * 80)
-        self.print0(f"Decoded input:    {decoded_input}")
-        self.print0(f"Decoded original: {decoded_original}")
-        self.print0(f"Decoded filled:   {decoded_filled}")
-        self.print0("=" * 80)
+        masked_list = masked_positions.tolist()[:100]
+        self.print0("=" * 128, logonly=True)
+        self.print0("VALIDATION PREVIEW (single example)", logonly=True)
+        self.print0(f"Masked positions: {masked_list}", logonly=True)
+        self.print0(f"Raw input ids:    {input_ids.tolist()}", logonly=True)
+        self.print0(f"Raw original ids: {original.tolist()}", logonly=True)
+        self.print0(f"Raw filled ids:   {filled.tolist()}", logonly=True)
+        self.print0("-" * 128, logonly=True)
+        self.print0(f"Decoded input:    {decoded_input}", logonly=True)
+        self.print0(f"Decoded original: {decoded_original}", logonly=True)
+        self.print0(f"Decoded filled:   {decoded_filled}", logonly=True)
+        self.print0("=" * 128, logonly=True)
 
     def init_training(self):
         self.logfile = None
