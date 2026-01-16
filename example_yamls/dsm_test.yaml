@@ -13,7 +13,7 @@ clear_cache_every: 1000
 
 # Model Architecture
 hidden_size: 128
-num_attention_heads: 6
+num_attention_heads: 2
 num_hidden_layers: 6
 vocab_size: 33
 expansion_ratio: 3.0
