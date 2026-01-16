@@ -10,6 +10,24 @@ from torch.nn.attention.flex_attention import flex_attention
 from model.flex_mods import generate_tanh_softcap
 from model.utils import norm, Linear
 
+try:
+    _compiled_flex_attention = torch.compile(flex_attention)
+except Exception:
+    _compiled_flex_attention = flex_attention
+
+
+def _apply_key_offset(k: torch.Tensor, key_offset: bool, shift: int, d_head: int) -> torch.Tensor:
+    if shift <= 0:
+        return k
+    shifted = k.clone()
+    quarter = d_head // 4
+    half = d_head // 2
+    three_quarters = 3 * d_head // 4
+    shifted[:, shift:, :, quarter:half] = k[:, :-shift, :, quarter:half]
+    shifted[:, shift:, :, three_quarters:] = k[:, :-shift, :, three_quarters:]
+    offset_flag = torch.as_tensor(key_offset, device=k.device, dtype=torch.bool)
+    return torch.where(offset_flag, shifted, k)
+
 
 @dataclass
 class AttentionContext:
@@ -164,16 +182,14 @@ class SelfAttention(nn.Module):
         q, k = norm(q), norm(k)
         q, k = self.yarn.rotary(q), self.yarn.rotary(k)
 
-        if key_offset:
-            k[:, 1:, :, self.d_head // 4 : self.d_head // 2] = k[:, :-1, :, self.d_head // 4 : self.d_head // 2]
-            k[:, 1:, :, 3 * self.d_head // 4 :] = k[:, :-1, :, 3 * self.d_head // 4 :]
+        k = _apply_key_offset(k, key_offset, shift=1, d_head=self.d_head)
 
         if vi is not None:
             gate_in = x[..., : self.value_embed_gate.in_features]
             ve_gate_out = 2 * torch.sigmoid(self.value_embed_gate(gate_in)).view(1, l, self.n_heads, 1)
             v = v + ve_gate_out * vi.view_as(v)
 
-        y = flex_attention(
+        y = _compiled_flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
@@ -247,9 +263,7 @@ class PairedHeadSelfAttention(nn.Module):
         q = q.view(1, l * 2, self.n_heads // 2, self.d_head)
         k = k.view(1, l * 2, self.n_heads // 2, self.d_head)
 
-        if key_offset:
-            k[:, 2:, :, self.d_head // 4 : self.d_head // 2] = k[:, :-2, :, self.d_head // 4 : self.d_head // 2]
-            k[:, 2:, :, 3 * self.d_head // 4 :] = k[:, :-2, :, 3 * self.d_head // 4 :]
+        k = _apply_key_offset(k, key_offset, shift=2, d_head=self.d_head)
 
         if vi is not None:
             gate_in = x[..., : self.value_embed_gate.in_features]
@@ -260,7 +274,7 @@ class PairedHeadSelfAttention(nn.Module):
             vi = vi.view(1, l * 2, self.n_heads // 2, self.d_head)
             v = v + ve_gate_out * vi
 
-        y = flex_attention(
+        y = _compiled_flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
