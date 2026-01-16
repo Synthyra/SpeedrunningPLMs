@@ -4,8 +4,8 @@
 # Security note: tokens (--token, --wandb_token) and log_name must be passed via CLI
 
 # Model Configuration
-save_path: "Synthyra/speedrun_dsm_large_test"
-log_name: "dsm_large_test"
+save_path: "Synthyra/speedrun_dsm_24"
+log_name: "dsm_24"
 
 # Distributed Training
 seed: 42
