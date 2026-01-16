@@ -144,7 +144,7 @@ class SelfAttention(nn.Module):
         if config.unet:
             self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
 
-        if config.attention_soft_cap:
+        if config.attention_soft_cap and config.add_att_soft_cap:
             self.soft_cap_mod = generate_tanh_softcap(config.attention_soft_cap, approx=True)
         else:
             self.soft_cap_mod = None
@@ -254,7 +254,7 @@ class PairedHeadSelfAttention(nn.Module):
         self.attn_gate = Linear(self.gate_dim, self.n_heads)
         self.value_embed_gate = Linear(self.value_gate_dim, self.n_heads)
 
-        if config.attention_soft_cap:
+        if config.attention_soft_cap and config.add_att_soft_cap:
             self.soft_cap_mod = generate_tanh_softcap(config.attention_soft_cap, approx=True)
         else:
             self.soft_cap_mod = None
