@@ -2,7 +2,7 @@
 # sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm torchrun --standalone --nproc_per_node=4 train.py
 # docker run --gpus all -v ${PWD}:/workspace speedrun_plm python train.py --bugfix
 # 1️⃣  CUDA / cuDNN base with no Python
-FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
 # 2️⃣  System prerequisites + Python 3.12
 ENV        DEBIAN_FRONTEND=noninteractive \
