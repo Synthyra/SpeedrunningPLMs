@@ -14,7 +14,7 @@ clear_cache_every: 1000
 # Model Architecture
 hidden_size: 768
 num_attention_heads: 6
-num_hidden_layers: 48
+num_hidden_layers: 6
 vocab_size: 33
 expansion_ratio: 3.0
 soft_logit_cap: 32.0
@@ -35,7 +35,7 @@ mask_rate_steps: 500
 
 # Training Hyperparameters
 batch_size: 1048576
-grad_accum: 64
+grad_accum: 1
 num_steps: 1000
 cooldown_steps: 100
 max_length: 1024
