@@ -34,8 +34,10 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN pip install --upgrade pip setuptools && \
-    pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade && \
-    pip install -r requirements.txt -U
+    pip install -r requirements.txt -U && \
+    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U && \
+    pip install numpy==1.26.4
+    
 
 # 5️⃣  Copy the rest of the source
 COPY . .
