@@ -4,8 +4,8 @@
 # Security note: tokens (--token, --wandb_token) and log_name must be passed via CLI
 
 # Model Configuration
-save_path: "Synthyra/speedrun_dsm_large"
-log_name: "dsm_large"
+save_path: "Synthyra/speedrun_dsm_large_test"
+log_name: "dsm_large_test"
 
 # Distributed Training
 seed: 42
@@ -31,16 +31,16 @@ masked_diffusion: true
 mask_rate: 0.5
 mask_rate_schedule: true
 starting_mask_rate: 0.05
-mask_rate_steps: 50000
+mask_rate_steps: 500
 
 # Training Hyperparameters
 batch_size: 1048576
 grad_accum: 4
-num_steps: 100000
-cooldown_steps: 10000
+num_steps: 1000
+cooldown_steps: 100
 max_length: 1024
 scheduler_type: "cosine"
-lr_warmup_steps: 1000
+lr_warmup_steps: 100
 
 # Optimizer Configuration
 # Adam optimizer (for embeddings, head, scalars when using Muon)

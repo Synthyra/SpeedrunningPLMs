@@ -43,6 +43,7 @@ class PLMConfig(PretrainedConfig):
         backout_frac: float = 2 / 3,
         unet: bool = False,
         mlm: bool = False,
+        masked_diffusion: bool = False,
         token_dropout: bool = True,
         **kwargs,
     ):
@@ -70,6 +71,7 @@ class PLMConfig(PretrainedConfig):
         self.backout_frac = backout_frac
         self.unet = unet
         self.mlm = mlm
+        self.masked_diffusion = masked_diffusion
         self.token_dropout = token_dropout
 
 
@@ -306,6 +308,7 @@ class PLM(PreTrainedModel):
         self.split_embed = False
 
         self.mlm = config.mlm
+        self.masked_diffusion = config.masked_diffusion
         self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def split_tied_embeddings(self):
@@ -486,8 +489,8 @@ class PLM(PreTrainedModel):
             lm_logits.view(-1, self.vocab_size),
             labels.view(-1).long()
         )
-        #if self.training and not self.mlm:
-        #    loss = loss / mask_rate
+        if self.training and self.masked_diffusion and not self.mlm:
+            loss = loss / mask_rate
 
         if return_logits:
             return loss, lm_logits

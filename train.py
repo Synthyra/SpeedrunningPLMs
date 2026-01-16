@@ -801,6 +801,8 @@ class Trainer:
                     self.train_loader.set_mask_rate(mask_rate)
                     if self.args.masked_diffusion and frac_done_mask > 1 and self.train_loader.mlm:
                         self.train_loader.set_mlm(False)
+                        model_for_mlm = self.model.module if self.ddp_world_size > 1 else self.model
+                        model_for_mlm.mlm = False
 
                 if step == int(self.args.untie_embed_frac * self.args.num_steps):
                     model_for_split = self.model.module if self.ddp_world_size > 1 else self.model
@@ -993,7 +995,7 @@ if __name__ == '__main__':
         smear_gate_dim=args.smear_gate_dim,
         backout_frac=args.backout_frac,
         unet=args.unet,
-        mlm=args.mlm,
+        mlm=args.mlm or args.masked_diffusion,
         masked_diffusion=args.masked_diffusion,
     )
 
