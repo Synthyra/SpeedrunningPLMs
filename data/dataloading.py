@@ -455,6 +455,8 @@ class OptimizedTrainLoader:
         self.seq_len = seq_len
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.mlm = mlm
+        self.mask_rate = mask_rate
         
         # Create the dataset to get file count
         self._dataset = TrainLoader(
@@ -489,10 +491,12 @@ class OptimizedTrainLoader:
 
     def set_mask_rate(self, mask_rate: float):
         """Set the mask rate for the next batch(es)."""
+        self.mask_rate = mask_rate
         self._dataset.mask_rate = mask_rate
 
     def set_mlm(self, mlm: bool):
         """Set whether to use MLM masking in the dataset."""
+        self.mlm = mlm
         self._dataset.mlm = mlm
 
     def reset(self):
