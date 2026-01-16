@@ -96,7 +96,6 @@ def arg_parser():
     parser.add_argument("--max_doc_len", type=int, default=2048, help="Max document length before truncation")
     parser.add_argument("--long_window_every", type=int, default=4, help="Use long window on every Nth layer")
     parser.add_argument("--paired_head_layers", type=str, default="", help="Comma-separated paired head layers")
-    parser.add_argument("--use_flash_attn", type=bool, default=True, help="Use Flash Attention if available")
     parser.add_argument("--partial_key_offset", type=bool, default=True, help="Enable partial key offset")
     parser.add_argument("--attn_gate_dim", type=int, default=16, help="Attention gate input dim")
     parser.add_argument("--value_embed_gate_dim", type=int, default=16, help="Value embed gate input dim")
@@ -987,7 +986,6 @@ if __name__ == '__main__':
         max_doc_len=args.max_doc_len,
         long_window_every=args.long_window_every,
         paired_head_layers=args.paired_head_layers,
-        use_flash_attn=args.use_flash_attn,
         partial_key_offset=args.partial_key_offset,
         attn_gate_dim=args.attn_gate_dim,
         value_embed_gate_dim=args.value_embed_gate_dim,

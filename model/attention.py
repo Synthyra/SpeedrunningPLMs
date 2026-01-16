@@ -10,22 +10,12 @@ from torch.nn.attention.flex_attention import flex_attention
 from model.flex_mods import generate_tanh_softcap
 from model.utils import norm, Linear
 
-try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func
-    FLASH_ATTN_AVAILABLE = True
-except Exception:
-    flash_attn_varlen_func = None
-    FLASH_ATTN_AVAILABLE = False
-
 
 @dataclass
 class AttentionContext:
     attention_mask: Optional[torch.Tensor]
-    cu_seqlens: Optional[torch.Tensor]
-    max_seqlen: int
     window_size: int
     valid_len: int
-    use_flash: bool
     is_paired: bool
 
 
@@ -183,46 +173,15 @@ class SelfAttention(nn.Module):
             ve_gate_out = 2 * torch.sigmoid(self.value_embed_gate(gate_in)).view(1, l, self.n_heads, 1)
             v = v + ve_gate_out * vi.view_as(v)
 
-        if attention_ctx.use_flash and FLASH_ATTN_AVAILABLE and attention_ctx.cu_seqlens is not None:
-            valid_len = attention_ctx.valid_len
-            q = q[:, :valid_len]
-            k = k[:, :valid_len]
-            v = v[:, :valid_len]
-            q = q[0]
-            k = k[0]
-            v = v[0]
-            y = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=attention_ctx.cu_seqlens,
-                cu_seqlens_k=attention_ctx.cu_seqlens,
-                max_seqlen_q=attention_ctx.max_seqlen,
-                max_seqlen_k=attention_ctx.max_seqlen,
-                causal=False,
-                softmax_scale=self.yarn.attn_scale,
-                window_size=(attention_ctx.window_size, attention_ctx.window_size),
-            )
-            if valid_len < l:
-                pad = torch.zeros(
-                    l - valid_len,
-                    self.n_heads,
-                    self.d_head,
-                    device=y.device,
-                    dtype=y.dtype,
-                )
-                y = torch.cat([y, pad], dim=0)
-            y = y.view(1, l, self.n_heads, self.d_head)
-        else:
-            y = flex_attention(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                score_mod=self.soft_cap_mod,
-                block_mask=attention_ctx.attention_mask,
-                enable_gqa=True,
-            )
-            y = y.transpose(1, 2)
+        y = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            score_mod=self.soft_cap_mod,
+            block_mask=attention_ctx.attention_mask,
+            enable_gqa=True,
+        )
+        y = y.transpose(1, 2)
 
         gate_in = x[..., : self.attn_gate.in_features]
         gate = torch.sigmoid(self.attn_gate(gate_in)).view(1, l, self.n_heads, 1)
@@ -301,46 +260,15 @@ class PairedHeadSelfAttention(nn.Module):
             vi = vi.view(1, l * 2, self.n_heads // 2, self.d_head)
             v = v + ve_gate_out * vi
 
-        if attention_ctx.use_flash and FLASH_ATTN_AVAILABLE and attention_ctx.cu_seqlens is not None:
-            valid_len = attention_ctx.valid_len
-            q = q[:, :valid_len]
-            k = k[:, :valid_len]
-            v = v[:, :valid_len]
-            q = q[0]
-            k = k[0]
-            v = v[0]
-            y = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=attention_ctx.cu_seqlens,
-                cu_seqlens_k=attention_ctx.cu_seqlens,
-                max_seqlen_q=attention_ctx.max_seqlen,
-                max_seqlen_k=attention_ctx.max_seqlen,
-                causal=False,
-                softmax_scale=self.yarn.attn_scale,
-                window_size=(attention_ctx.window_size, attention_ctx.window_size),
-            )
-            if valid_len < l * 2:
-                pad = torch.zeros(
-                    l * 2 - valid_len,
-                    self.n_heads // 2,
-                    self.d_head,
-                    device=y.device,
-                    dtype=y.dtype,
-                )
-                y = torch.cat([y, pad], dim=0)
-            y = y.view(1, l * 2, self.n_heads // 2, self.d_head)
-        else:
-            y = flex_attention(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                score_mod=self.soft_cap_mod,
-                block_mask=attention_ctx.attention_mask,
-                enable_gqa=True,
-            )
-            y = y.transpose(1, 2)
+        y = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            score_mod=self.soft_cap_mod,
+            block_mask=attention_ctx.attention_mask,
+            enable_gqa=True,
+        )
+        y = y.transpose(1, 2)
 
         y = y.view(1, l, self.n_heads, self.d_head)
         gate_in = x[..., : self.attn_gate.in_features]

@@ -11,7 +11,6 @@ from model.attention import (
     SelfAttention,
     PairedHeadSelfAttention,
     AttentionContext,
-    FLASH_ATTN_AVAILABLE,
 )
 from model.utils import norm, MLP, Linear
 
@@ -34,7 +33,6 @@ class PLMConfig(PretrainedConfig):
         max_doc_len: int = 2048,
         long_window_every: int = 4,
         paired_head_layers: Optional[List[int]] = None,
-        use_flash_attn: bool = True,
         partial_key_offset: bool = True,
         attn_gate_dim: int = 16,
         value_embed_gate_dim: int = 16,
@@ -62,7 +60,6 @@ class PLMConfig(PretrainedConfig):
         self.max_doc_len = max_doc_len
         self.long_window_every = long_window_every
         self.paired_head_layers = paired_head_layers
-        self.use_flash_attn = use_flash_attn
         self.partial_key_offset = partial_key_offset
         self.attn_gate_dim = attn_gate_dim
         self.value_embed_gate_dim = value_embed_gate_dim
@@ -325,22 +322,16 @@ class PLM(PreTrainedModel):
     def _build_doc_info(self, input_ids: torch.Tensor):
         eos_positions = (input_ids == self.eos_token_id).nonzero(as_tuple=True)[0]
         if eos_positions.numel() > 0:
-            last_eos = eos_positions[-1].item()
             doc_ends = eos_positions
         else:
-            last_eos = len(input_ids) - 1
-            doc_ends = torch.tensor([last_eos], device=input_ids.device)
+            doc_ends = torch.tensor([len(input_ids) - 1], device=input_ids.device)
 
         doc_starts = torch.cat(
             [torch.zeros(1, device=input_ids.device, dtype=doc_ends.dtype), doc_ends[:-1] + 1]
         )
         doc_lengths = doc_ends - doc_starts + 1
-        cu_seqlens = torch.cat(
-            [torch.zeros(1, device=input_ids.device, dtype=torch.int32), doc_lengths.cumsum(0).to(torch.int32)]
-        )
-        max_seqlen = int(doc_lengths.max().item())
         valid_len = int(doc_ends[-1].item()) + 1
-        return last_eos, doc_lengths, cu_seqlens, max_seqlen, valid_len
+        return doc_lengths, valid_len
 
     def get_last_hidden_state(
         self,
@@ -349,44 +340,22 @@ class PLM(PreTrainedModel):
         window_size_short: int,
     ) -> torch.Tensor:
         docs = (input_ids == self.cls_token_id).cumsum(0)
-        last_eos, doc_lengths, cu_seqlens, max_seqlen, valid_len = self._build_doc_info(input_ids)
+        doc_lengths, valid_len = self._build_doc_info(input_ids)
         paired_doc_lengths = doc_lengths * 2
-        paired_cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, device=input_ids.device, dtype=torch.int32),
-                paired_doc_lengths.cumsum(0).to(torch.int32),
-            ]
-        )
-        paired_max_seqlen = int(paired_doc_lengths.max().item())
         paired_valid_len = valid_len * 2
         paired_docs = docs.repeat_interleave(2)
 
         def attention_ctx_fn(layer_idx: int, is_paired: bool, window_size: int) -> AttentionContext:
             if is_paired:
                 docs_used = paired_docs
-                cu = paired_cu_seqlens
-                max_len = paired_max_seqlen
                 valid = paired_valid_len
                 window = window_size * 2
                 n_heads = self.n_heads // 2
             else:
                 docs_used = docs
-                cu = cu_seqlens
-                max_len = max_seqlen
                 valid = valid_len
                 window = window_size
                 n_heads = self.n_heads
-
-            if self.config.use_flash_attn and FLASH_ATTN_AVAILABLE:
-                return AttentionContext(
-                    attention_mask=None,
-                    cu_seqlens=cu,
-                    max_seqlen=max_len,
-                    window_size=window,
-                    valid_len=valid,
-                    use_flash=True,
-                    is_paired=is_paired,
-                )
 
             def doc_mask_mod(b, h, q_idx, kv_idx):
                 in_window = torch.abs(q_idx - kv_idx) <= window
@@ -404,11 +373,8 @@ class PLM(PreTrainedModel):
             )
             return AttentionContext(
                 attention_mask=attention_mask,
-                cu_seqlens=None,
-                max_seqlen=max_len,
                 window_size=window,
                 valid_len=valid,
-                use_flash=False,
                 is_paired=is_paired,
             )
 
