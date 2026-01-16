@@ -11,6 +11,7 @@ expansion_ratio: 2.0
 soft_logit_cap: 16.0
 tie_embeddings: false
 unet: true
+paired_attention: false
 mlm: false
 masked_diffusion: false
 
