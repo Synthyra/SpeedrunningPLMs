@@ -24,7 +24,6 @@ tie_embeddings: false
 unet: true
 token_dropout: false
 bfloat16: true
-paired_attention: true
 
 # Data Configuration
 mlm: false  # Masked Language Modeling

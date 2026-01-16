@@ -7,11 +7,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 from transformers import EsmTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from model.attention import (
-    SelfAttention,
-    PairedHeadSelfAttention,
-    AttentionContext,
-)
+from model.attention import SelfAttention, AttentionContext
 from model.utils import norm, MLP, Linear
 
 
@@ -32,7 +28,6 @@ class PLMConfig(PretrainedConfig):
         max_seq_len: int = 1024,
         max_doc_len: int = 2048,
         long_window_every: int = 4,
-        paired_head_layers: Optional[List[int]] = None,
         partial_key_offset: bool = True,
         attn_gate_dim: int = 16,
         value_embed_gate_dim: int = 16,
@@ -59,7 +54,6 @@ class PLMConfig(PretrainedConfig):
         self.max_seq_len = max_seq_len
         self.max_doc_len = max_doc_len
         self.long_window_every = long_window_every
-        self.paired_head_layers = paired_head_layers
         self.partial_key_offset = partial_key_offset
         self.attn_gate_dim = attn_gate_dim
         self.value_embed_gate_dim = value_embed_gate_dim
@@ -117,13 +111,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        paired_layers = config.paired_head_layers if config.paired_head_layers is not None else []
-        if layer_idx in paired_layers:
-            self.attn = PairedHeadSelfAttention(config)
-            self.is_paired = True
-        else:
-            self.attn = SelfAttention(config)
-            self.is_paired = False
+        self.attn = SelfAttention(config)
         self.mlp = MLP(config)
         self.unet = config.unet
         if config.unet:
@@ -178,7 +166,7 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             use_long = (i % self.long_window_every == 0)
             window_size = window_size_long if use_long else window_size_short
-            attention_ctx = attention_ctx_fn(i, layer.is_paired, window_size)
+            attention_ctx = attention_ctx_fn(i, window_size)
             key_offset = self.partial_key_offset and use_long
             x = layer(
                 x=x,
@@ -232,7 +220,7 @@ class UnetTransformer(nn.Module):
         for i in range(self.num_encoder_layers):
             use_long = (i % self.long_window_every == 0)
             window_size = window_size_long if use_long else window_size_short
-            attention_ctx = attention_ctx_fn(i, self.layers[i].is_paired, window_size)
+            attention_ctx = attention_ctx_fn(i, window_size)
             key_offset = self.partial_key_offset and use_long
             x = self.layers[i](
                 x=x,
@@ -255,7 +243,7 @@ class UnetTransformer(nn.Module):
             layer_idx = self.num_encoder_layers + i
             use_long = (layer_idx % self.long_window_every == 0)
             window_size = window_size_long if use_long else window_size_short
-            attention_ctx = attention_ctx_fn(layer_idx, self.layers[layer_idx].is_paired, window_size)
+            attention_ctx = attention_ctx_fn(layer_idx, window_size)
             key_offset = self.partial_key_offset and use_long
             x = self.layers[self.num_encoder_layers + i](
                 x=x,
@@ -341,21 +329,11 @@ class PLM(PreTrainedModel):
     ) -> torch.Tensor:
         docs = (input_ids == self.cls_token_id).cumsum(0)
         doc_lengths, valid_len = self._build_doc_info(input_ids)
-        paired_doc_lengths = doc_lengths * 2
-        paired_valid_len = valid_len * 2
-        paired_docs = docs.repeat_interleave(2)
-
-        def attention_ctx_fn(layer_idx: int, is_paired: bool, window_size: int) -> AttentionContext:
-            if is_paired:
-                docs_used = paired_docs
-                valid = paired_valid_len
-                window = window_size * 2
-                n_heads = self.n_heads // 2
-            else:
-                docs_used = docs
-                valid = valid_len
-                window = window_size
-                n_heads = self.n_heads
+        def attention_ctx_fn(layer_idx: int, window_size: int) -> AttentionContext:
+            docs_used = docs
+            valid = valid_len
+            window = window_size
+            n_heads = self.n_heads
 
             def doc_mask_mod(b, h, q_idx, kv_idx):
                 in_window = torch.abs(q_idx - kv_idx) <= window
@@ -375,7 +353,6 @@ class PLM(PreTrainedModel):
                 attention_mask=attention_mask,
                 window_size=window,
                 valid_len=valid,
-                is_paired=is_paired,
             )
 
         x = self.embedding(input_ids)

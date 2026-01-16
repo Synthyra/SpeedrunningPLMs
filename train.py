@@ -95,7 +95,6 @@ def arg_parser():
     parser.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length for rotary cache")
     parser.add_argument("--max_doc_len", type=int, default=2048, help="Max document length before truncation")
     parser.add_argument("--long_window_every", type=int, default=4, help="Use long window on every Nth layer")
-    parser.add_argument("--paired_attention", type=bool, default=False, help="Enable paired attention on every third layer")
     parser.add_argument("--partial_key_offset", type=bool, default=True, help="Enable partial key offset")
     parser.add_argument("--attn_gate_dim", type=int, default=16, help="Attention gate input dim")
     parser.add_argument("--value_embed_gate_dim", type=int, default=16, help="Value embed gate input dim")
@@ -164,11 +163,6 @@ def arg_parser():
                         value = value.lower() in ('true', '1', 'yes', 'on')
                     setattr(args, key, value)
     
-    if args.paired_attention:
-        args.paired_head_layers = list(range(0, args.num_hidden_layers, 3))
-    else:
-        args.paired_head_layers = None
-
     if args.max_seq_len < args.max_length:
         args.max_seq_len = args.max_length
 
@@ -983,7 +977,6 @@ if __name__ == '__main__':
         max_seq_len=args.max_seq_len,
         max_doc_len=args.max_doc_len,
         long_window_every=args.long_window_every,
-        paired_head_layers=args.paired_head_layers,
         partial_key_offset=args.partial_key_offset,
         attn_gate_dim=args.attn_gate_dim,
         value_embed_gate_dim=args.value_embed_gate_dim,
