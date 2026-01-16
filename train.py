@@ -62,7 +62,7 @@ def arg_parser():
     parser.add_argument("--yaml_path", type=str, default=None, help="Path to YAML file")
 
     # CLI-specific arguments (always from CLI for security)
-    parser.add_argument("--token", type=str, default=None, help="Huggingface token")
+    parser.add_argument("--hf_token", type=str, default=None, help="Huggingface token")
     parser.add_argument("--wandb_token", type=str, default=None, help="Weights & Biases API token")
     parser.add_argument("--log_name", type=str, default=None, help="Name of the log file, else will be randomly generated")
     parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
@@ -994,11 +994,11 @@ if __name__ == '__main__':
         wandb.login(key=args.wandb_token)
         wandb_initialized = True
     
-    if args.token:
+    if args.hf_token:
         from huggingface_hub import login
-        login(args.token)
+        login(args.hf_token)
         # Clear tokens for security
-        args.token = None
+        args.hf_token = None
     
     # Clear wandb token for security but keep track that we logged in
     if args.wandb_token:
