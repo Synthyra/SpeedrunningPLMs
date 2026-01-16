@@ -35,7 +35,7 @@ mask_rate_steps: 500
 
 # Training Hyperparameters
 batch_size: 1048576
-grad_accum: 16
+grad_accum: 32
 num_steps: 1000
 cooldown_steps: 100
 max_length: 1024
