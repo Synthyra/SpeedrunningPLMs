@@ -7,7 +7,7 @@ from transformers import EsmTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from model.attention import SelfAttention
-from model.utils import norm, MLP
+from model.utils import norm, MLP, Linear
 
 
 @dataclass
@@ -26,6 +26,7 @@ class PLMConfig(PretrainedConfig):
         tie_embeddings: bool = False,
         unet: bool = False,
         mlm: bool = False,
+        masked_diffusion: bool = False,
         token_dropout: bool = True,
         **kwargs,
     ):
@@ -42,6 +43,7 @@ class PLMConfig(PretrainedConfig):
         self.tie_embeddings = tie_embeddings
         self.unet = unet
         self.mlm = mlm
+        self.masked_diffusion = masked_diffusion
         self.token_dropout = token_dropout
 
 
@@ -69,8 +71,8 @@ class ValueEmbedding(nn.Module):
 class LMHead(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int, soft_logit_cap: float = 30.0):
         super().__init__()
-        self.dense = nn.Linear(hidden_size, hidden_size)
-        self.decoder = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.dense = Linear(hidden_size, hidden_size)
+        self.decoder = Linear(hidden_size, vocab_size)
         self.bias = nn.Parameter(torch.zeros(vocab_size))
         self.soft_logit_cap = soft_logit_cap
         self.act = nn.GELU()
@@ -194,6 +196,8 @@ class PLM(PreTrainedModel):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.pad_token_id = self.tokenizer.pad_token_id
         self.mask_token_id = self.tokenizer.mask_token_id
+        self.mlm = config.mlm
+        self.masked_diffusion = config.masked_diffusion
         self.token_dropout = config.token_dropout
 
         self.vocab_size = config.vocab_size
@@ -212,8 +216,7 @@ class PLM(PreTrainedModel):
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, config.soft_logit_cap)
         if config.tie_embeddings:
             self.lm_head.decoder.weight = self.embedding.weight
-
-        self.mlm = config.mlm
+        
         self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
