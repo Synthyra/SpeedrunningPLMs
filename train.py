@@ -541,7 +541,11 @@ class Trainer:
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
             total_tokens += batch_valid_tokens
             loss, logits = self.model(
-                input_ids, labels, mask_rate, self.window_size_long, self.window_size_short, return_logits=True
+                input_ids=input_ids,
+                labels=labels,
+                mask_rate=mask_rate,
+                sliding_window_size=self.sliding_window_size,
+                return_logits=True,
             )
             losses.append(loss.item())
             preds = logits.argmax(dim=-1)
@@ -638,7 +642,13 @@ class Trainer:
                     if input_ids.numel() == 0:
                         raise RuntimeError("Dataloader returned empty batch even after reset")
                 
-                loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size) / self.args.grad_accum
+                loss = self.model(
+                    input_ids=input_ids,
+                    labels=labels,
+                    mask_rate=mask_rate,
+                    sliding_window_size=self.sliding_window_size,
+                    return_logits=False,
+                ) / self.args.grad_accum
                 loss.backward()
                 accumulated_loss += loss.item()  # Accumulate the scaled loss
 
