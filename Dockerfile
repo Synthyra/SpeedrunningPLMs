@@ -2,7 +2,7 @@
 # sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm torchrun --standalone --nproc_per_node=4 train.py
 # docker run --gpus all -v ${PWD}:/workspace speedrun_plm python train.py --bugfix
 # 1️⃣  CUDA / cuDNN base with no Python
-FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
 # 2️⃣  System prerequisites + Python 3.12
 ENV        DEBIAN_FRONTEND=noninteractive \
@@ -11,7 +11,7 @@ ENV        DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential curl git ca-certificates \
+        build-essential curl git ca-certificates ninja-build \
         libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
         libsqlite3-dev libncursesw5-dev xz-utils tk-dev \
         libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev && \
@@ -34,8 +34,10 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN pip install --upgrade pip setuptools && \
-    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128 && \
-    pip install -r requirements.txt -U
+    pip install -r requirements.txt -U && \
+    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U && \
+    pip install numpy==1.26.4
+    
 
 # 5️⃣  Copy the rest of the source
 COPY . .
