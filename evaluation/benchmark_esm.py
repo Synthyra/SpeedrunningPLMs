@@ -21,7 +21,7 @@ from utils import set_seed
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--token', type=str, default=None)
+    parser.add_argument('--hf_token', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--results_dir', type=str, default='results')
@@ -99,8 +99,8 @@ def main():
     os.makedirs(args.results_dir, exist_ok=True)
 
     # Login once if token is provided
-    if args.token is not None:
-        login(args.token)
+    if args.hf_token is not None:
+        login(args.hf_token)
     
     # Initialize components that don't need to be recreated for each model or dataset
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

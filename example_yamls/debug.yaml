@@ -1,5 +1,5 @@
 # Debug Configuration - Small model for testing
-# Usage: python train.py --yaml_path experiments/debug.yaml --token YOUR_TOKEN --log_name debug_run
+# Usage: python train.py --yaml_path experiments/debug.yaml --hf_token YOUR_TOKEN --log_name debug_run
 
 save_path: "Synthyra/debug_test"
 

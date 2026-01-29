@@ -120,7 +120,7 @@ sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
 
 Some key arguments for `train.py` include
 
-`--token YOUR_HUGGINGFACE_TOKEN`, a Huggingface write token is required to save your models to Huggingface hub
+`--hf_token YOUR_HUGGINGFACE_TOKEN`, a Huggingface write token is required to save your models to Huggingface hub
 `--wandb_token YOUR_WANDB_TOKEN`, is required for Weights and Biases (WANDB) logging
 `--yaml_path YOUR_YAML_FILE`, points to an experimental set up with more settings. See `example_yamls/default.yaml` for inspiration
 
@@ -174,7 +174,7 @@ This script will automatically:
 | `--yaml_path` | str | None | Path to YAML file with experiment configuration. CLI arguments override YAML. |
 | `--data_name` | str | None | Dataset name: uniref50, omg_prot50, or og_prot90 |
 | `--num_chunks` | str | None | Path to YAML file with experiment configuration. CLI arguments override YAML. |
-| `--token` | str | None | HuggingFace token (required for model saving/uploading). Prompted if not provided. |
+| `--hf_token` | str | None | HuggingFace token (required for model saving/uploading). Prompted if not provided. |
 | `--wandb_token` | str | None | Weights & Biases API token (for experiment tracking). Prompted if not provided. |
 | `--log_name` | str | None | Name for the log file and wandb run. If not set, a random UUID is used. |
 | `--bugfix` | flag | False | Use small batch size and max length for debugging. |

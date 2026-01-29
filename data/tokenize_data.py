@@ -184,7 +184,7 @@ parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of
 parser.add_argument("-m", "--max_length", type=int, default=1024, help="Maximum sequence length")
 parser.add_argument("-d", "--data_name", type=str, default="omg_prot50", help="Name of the dataset")
 parser.add_argument("-r", "--upload_repo", type=str, default=None, help="Hugging Face repository ID to upload to (e.g., 'username/repo_name')")
-parser.add_argument("-t", "--token", type=str, default=None, help="Hugging Face token for authentication (or set token environment variable)")
+parser.add_argument("-t", "--hf_token", type=str, default=None, help="Hugging Face token for authentication (or set token environment variable)")
 
 
 if __name__ == "__main__":
@@ -192,9 +192,9 @@ if __name__ == "__main__":
     data_name = args.data_name
     
     # Get HF token from args or environment
-    token = args.token or os.environ.get("token")
+    token = args.hf_token or os.environ.get("token")
     if args.upload_repo and not token:
-        print("Warning: Upload repository specified but no HF token provided. Set --token or token environment variable.")
+        print("Warning: Upload repository specified but no HF token provided. Set --hf_token or token environment variable.")
 
     # create the cache the local directory if it doesn't exist yet
     DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), data_name)

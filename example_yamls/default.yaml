@@ -1,7 +1,7 @@
 # Synthyra Training Configuration
 # This YAML file defines all available training parameters
 # CLI arguments will override these values where provided
-# Security note: tokens (--token, --wandb_token) and log_name must be passed via CLI
+# Security note: tokens (--hf_token, --wandb_token) and log_name must be passed via CLI
 
 # Model Configuration
 save_path: "Synthyra/speedrun_yaml_test"

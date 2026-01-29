@@ -43,7 +43,7 @@ for yaml_file in "$EXPERIMENT_DIR"/*.yaml; do
     "$IMAGE" \
     torchrun --standalone --nproc_per_node="$NUM_GPUS" \
       train.py \
-        --token "$HF_TOKEN" \
+        --hf_token "$HF_TOKEN" \
         --wandb_token "$WANDB_TOKEN" \
         --yaml_path "$yaml_file"
 done

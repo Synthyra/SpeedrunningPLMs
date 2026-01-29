@@ -900,7 +900,7 @@ if __name__ == '__main__':
         wandb.login(key=args.wandb_token)
         wandb_initialized = True
     
-    if args.token:
+    if args.hf_token:
         from huggingface_hub import login
         login(args.hf_token)
         # Clear tokens for security
