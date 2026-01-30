@@ -279,14 +279,14 @@ class Trainer:
         masked_list = masked_positions.tolist()[:10]
         self.print0("=" * 128, logonly=True)
         self.print0("VALIDATION PREVIEW (single example)", logonly=True)
-        self.print0(f"Masked positions: {masked_list} ...", logonly=True)
-        self.print0(f"Raw input ids:    {input_ids.tolist()[:100]} ...", logonly=True)
-        self.print0(f"Raw original ids: {original.tolist()[:100]} ...", logonly=True)
-        self.print0(f"Raw filled ids:   {filled.tolist()[:100]} ...", logonly=True)
+        self.print0(f"Masked positions:\n{masked_list} ...", logonly=True)
+        self.print0(f"Raw input ids:\n{input_ids.tolist()[:10]} ...", logonly=True)
+        self.print0(f"Raw original ids:\n{original.tolist()[:10]} ...", logonly=True)
+        self.print0(f"Raw filled ids:\n{filled.tolist()[:10]} ...", logonly=True)
         self.print0("-" * 128, logonly=True)
-        self.print0(f"Decoded input:    {decoded_input}", logonly=True)
-        self.print0(f"Decoded original: {decoded_original}", logonly=True)
-        self.print0(f"Decoded filled:   {decoded_filled}", logonly=True)
+        self.print0(f"Decoded input:\n{decoded_input}", logonly=True)
+        self.print0(f"Decoded original:\n{decoded_original}", logonly=True)
+        self.print0(f"Decoded filled:\n{decoded_filled}", logonly=True)
         self.print0("=" * 128, logonly=True)
 
     def init_training(self):
