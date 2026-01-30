@@ -437,6 +437,8 @@ class OptimizedTrainLoader:
         self.seq_len = seq_len
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.mlm = mlm
+        self.mask_rate = mask_rate
         
         # Create the dataset to get file count
         self._dataset = TrainLoader(
