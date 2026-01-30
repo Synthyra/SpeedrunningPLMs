@@ -6,6 +6,8 @@
 # Model Configuration
 save_path: "Synthyra/speedrun_yaml_test"
 log_name: "default_speedrun_yaml"
+data_name: "uniref50"
+num_chunks: 100
 
 # Distributed Training
 seed: 42
@@ -15,20 +17,19 @@ clear_cache_every: 1000
 hidden_size: 768
 num_attention_heads: 6
 num_hidden_layers: 24
-num_att_tokens: 512
 vocab_size: 33
 expansion_ratio: 2.6667  # 8/3
 soft_logit_cap: 32.0
 attention_soft_cap: 64.0
-add_att_soft_cap: false
-p_attention: false
+add_att_soft_cap: true
 tie_embeddings: false
 unet: true
-token_dropout: false
+token_dropout: true
 bfloat16: true
 
 # Data Configuration
 mlm: false  # Masked Language Modeling
+masked_diffusion: false
 mask_rate: 0.2
 mask_rate_schedule: true
 starting_mask_rate: 0.1
@@ -51,7 +52,7 @@ lr_head: 0.008
 lr_scalar: 0.04
 grad_clip: 0.0
 auto_grad_clip: false
-auto_grad_clip_percentile: 10
+auto_grad_clip_p: 10.0
 
 # Muon optimizer (for hidden layers)
 use_muon: true

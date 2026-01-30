@@ -171,33 +171,36 @@ This script will automatically:
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--yaml_path` | str | None | Path to YAML file with experiment configuration. CLI arguments override YAML. |
-| `--data_name` | str | None | Dataset name: uniref50, omg_prot50, or og_prot90 |
-| `--num_chunks` | str | None | Path to YAML file with experiment configuration. CLI arguments override YAML. |
 | `--hf_token` | str | None | HuggingFace token (required for model saving/uploading). Prompted if not provided. |
 | `--wandb_token` | str | None | Weights & Biases API token (for experiment tracking). Prompted if not provided. |
 | `--log_name` | str | None | Name for the log file and wandb run. If not set, a random UUID is used. |
 | `--bugfix` | flag | False | Use small batch size and max length for debugging. |
 | `--save_path` | str | "Synthyra/speedrun_test" | Path to save the model and report to wandb. |
+| `--data_name` | str | "uniref50" | Dataset name: uniref50, omg_prot50, or og_prot90 |
+| `--num_chunks` | int | 100 | Number of training chunks to ensure are downloaded. |
 | `--seed` | int | 42 | Random seed for reproducibility. |
 | `--clear_cache_every` | int | 1000 | Clear CUDA cache every N steps. |
 | `--grad_clip` | float | 0.0 | Gradient clipping value (0 to disable). |
+| `--auto_grad_clip` | flag | False | Enable auto gradient clipping. |
+| `--auto_grad_clip_p` | float | 10.0 | Percentile for auto gradient clipping. |
 | `--hidden_size` | int | 768 | Hidden size of the model. |
 | `--num_attention_heads` | int | 6 | Number of attention heads. |
 | `--num_hidden_layers` | int | 24 | Number of hidden layers. |
-| `--num_att_tokens` | int | 512 | Number of attention tokens. |
 | `--vocab_size` | int | 33 | Vocabulary size. |
-| `--expansion_ratio` | float | 2.6667 | Expansion ratio for MLP (e.g., 8/3). |
+| `--expansion_ratio` | float | 2.6667 | Expansion ratio for MLP (8/3). |
 | `--soft_logit_cap` | float | 32.0 | Soft logit cap for output logits. |
 | `--attention_soft_cap` | float | 64.0 | Attention softmax cap. |
 | `--add_att_soft_cap` | bool | True | Whether to add attention softmax cap. |
-| `--p_attention` | flag | False | Use P attention variant. |
 | `--tie_embeddings` | flag | False | Tie input and output embeddings. |
 | `--unet` | bool | True | Use UNet architecture. |
-| `--input_bin` | str | "data/omgprot50/omgprot50_train_*.bin" | Input training bin files pattern. |
-| `--input_valid_bin` | str | "data/omgprot50/omgprot50_valid_*.bin" | Input validation bin files pattern. |
-| `--input_test_bin` | str | "data/omgprot50/omgprot50_test_*.bin" | Input test bin files pattern. |
+| `--token_dropout` | bool | True | Use token dropout. |
+| `--bfloat16` | flag | False | Use bfloat16 precision. |
 | `--mlm` | bool | False | Use masked language modeling objective. |
+| `--masked_diffusion` | bool | False | Use masked diffusion objective. |
 | `--mask_rate` | float | 0.2 | Mask rate for masked language modeling. |
+| `--starting_mask_rate` | float | 0.1 | Starting mask rate for MLM schedule. |
+| `--mask_rate_steps` | int | 2500 | Number of steps to reach target mask rate. |
+| `--mask_rate_schedule` | bool | True | Use mask rate schedule. |
 | `--batch_size` | int | 524288 | Total batch size in tokens (default: 8×64×1024). |
 | `--grad_accum` | int | 1 | Gradient accumulation steps. |
 | `--num_steps` | int | 50000 | Number of training steps. |
@@ -213,7 +216,7 @@ This script will automatically:
 | `--lr_hidden` | float | 0.05 | Learning rate for hidden layers (Muon). |
 | `--muon_momentum_warmup_steps` | int | 300 | Steps for Muon momentum warmup (0.85 → 0.95). |
 | `--eval_every` | int | 1000 | Evaluate on validation set every N steps. |
-| `--hf_model_name` | str | "Synthyra/speedrun" | HuggingFace model name for saving. |
+| `--hf_model_name` | str | "lhallee/speedrun" | HuggingFace model name for saving. |
 | `--save_every` | int | None | Save checkpoint every N steps (if set). |
 | `--num_workers` | int | 4 | Number of workers for optimized dataloader. |
 | `--prefetch_factor` | int | 2 | Prefetch factor for optimized dataloader. |

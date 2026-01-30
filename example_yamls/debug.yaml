@@ -2,17 +2,19 @@
 # Usage: python train.py --yaml_path experiments/debug.yaml --hf_token YOUR_TOKEN --log_name debug_run
 
 save_path: "Synthyra/debug_test"
+data_name: "uniref50"
+num_chunks: 10
 
 # Small model architecture for fast testing
 hidden_size: 128
 num_attention_heads: 2
 num_hidden_layers: 2
-num_att_tokens: 128
 expansion_ratio: 2.0
 soft_logit_cap: 16.0
-p_attention: false
 tie_embeddings: false
 unet: true
+add_att_soft_cap: true
+token_dropout: true
 
 # Small training configuration
 batch_size: 2048
@@ -35,4 +37,4 @@ eval_every: 50
 
 # Simple dataloader
 num_workers: 2
-prefetch_factor: 1 
+prefetch_factor: 1
