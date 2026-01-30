@@ -6,8 +6,8 @@ from torch.nn.attention.flex_attention import create_block_mask
 from transformers import EsmTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from model.attention import SelfAttention, MultiHeadPAttention
-from model.utils import norm, MLP
+from model.attention import SelfAttention
+from model.utils import norm, MLP, Linear
 
 
 @dataclass
@@ -17,17 +17,16 @@ class PLMConfig(PretrainedConfig):
         hidden_size: int = 512,
         num_attention_heads: int =  8,
         num_hidden_layers: int = 12,
-        num_att_tokens: int = 512,
         vocab_size: int = 33,
         expansion_ratio: float = 2.0,
         attention_soft_cap: float = 64.0,
         add_att_soft_cap: bool = True,
         soft_logit_cap: float = 16.0,
         sliding_window_size: int = 2048,
-        p_attention: bool = False,
         tie_embeddings: bool = False,
         unet: bool = False,
         mlm: bool = False,
+        masked_diffusion: bool = False,
         token_dropout: bool = True,
         **kwargs,
     ):
@@ -35,17 +34,16 @@ class PLMConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
-        self.num_att_tokens = num_att_tokens
         self.vocab_size = vocab_size
         self.expansion_ratio = expansion_ratio
         self.soft_logit_cap = soft_logit_cap
         self.attention_soft_cap = attention_soft_cap
         self.add_att_soft_cap = add_att_soft_cap
         self.sliding_window_size = sliding_window_size
-        self.p_attention = p_attention
         self.tie_embeddings = tie_embeddings
         self.unet = unet
         self.mlm = mlm
+        self.masked_diffusion = masked_diffusion
         self.token_dropout = token_dropout
 
 
@@ -73,8 +71,8 @@ class ValueEmbedding(nn.Module):
 class LMHead(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int, soft_logit_cap: float = 30.0):
         super().__init__()
-        self.dense = nn.Linear(hidden_size, hidden_size)
-        self.decoder = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.dense = Linear(hidden_size, hidden_size)
+        self.decoder = Linear(hidden_size, vocab_size)
         self.bias = nn.Parameter(torch.zeros(vocab_size))
         self.soft_logit_cap = soft_logit_cap
         self.act = nn.GELU()
@@ -90,10 +88,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: PLMConfig):
         super().__init__()
         self.config = config
-        if config.p_attention:
-            self.attn = MultiHeadPAttention(config)
-        else:
-            self.attn = SelfAttention(config)
+        self.attn = SelfAttention(config)
         self.mlp = MLP(config)
         self.unet = config.unet
         if config.unet:
@@ -201,6 +196,8 @@ class PLM(PreTrainedModel):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.pad_token_id = self.tokenizer.pad_token_id
         self.mask_token_id = self.tokenizer.mask_token_id
+        self.mlm = config.mlm
+        self.masked_diffusion = config.masked_diffusion
         self.token_dropout = config.token_dropout
 
         self.vocab_size = config.vocab_size
@@ -219,8 +216,7 @@ class PLM(PreTrainedModel):
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, config.soft_logit_cap)
         if config.tie_embeddings:
             self.lm_head.decoder.weight = self.embedding.weight
-
-        self.mlm = config.mlm
+        
         self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
@@ -297,6 +293,7 @@ class PLM(PreTrainedModel):
         labels: torch.Tensor,
         mask_rate: torch.Tensor,
         sliding_window_size: Optional[int] = None,
+        return_logits: bool = False,
         ) -> torch.Tensor:
         if sliding_window_size is None:
             sliding_window_size = self.sliding_window_size
@@ -309,9 +306,11 @@ class PLM(PreTrainedModel):
             lm_logits.view(-1, self.vocab_size),
             labels.view(-1).long()
         )
-        #if self.training and not self.mlm:
-        #    loss = loss / mask_rate
+        if self.training and self.masked_diffusion and not self.mlm:
+            loss = loss / mask_rate
 
+        if return_logits:
+            return loss, lm_logits
         return loss
 
 

@@ -2,13 +2,13 @@ import argparse
 from datasets import load_dataset, DatasetDict, concatenate_datasets
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--token', type=str, default=None)
+parser.add_argument('--hf_token', type=str, default=None)
 
 args = parser.parse_args()
 
-if args.token:
+if args.hf_token:
     import huggingface_hub
-    huggingface_hub.login(token=args.token)
+    huggingface_hub.login(token=args.hf_token)
 
 data = load_dataset('agemagician/uniref50_09012025').remove_columns('id').remove_columns('name').shuffle(seed=11)
 data = data.rename_column('text', 'sequence')
