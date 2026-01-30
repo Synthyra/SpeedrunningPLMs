@@ -298,7 +298,7 @@ class Trainer:
             if self.args.log_name:
                 run_id = self.args.log_name
             else:
-                run_id = uuid.uuid4()
+                run_id = str(uuid.uuid4())
             log_filename = f'{run_id}.txt'
                 
             self.logfile = os.path.join('logs', log_filename)
