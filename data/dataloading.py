@@ -394,11 +394,10 @@ class TrainLoader(IterableDataset):
         sequence = sequence.to(dtype=torch.int32)
         
         # Pick mask rate
-        eps = 1e-3
-
         if self.mlm:
             mask_rate = torch.full((1,), self.mask_rate)
         else:
+            eps = 1e-3
             mask_rate = torch.rand(1)
             mask_rate = (1 - eps) * mask_rate + eps
         

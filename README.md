@@ -10,7 +10,6 @@ Train pLMs fast with docker-enabled PyTorch compilation, modern architectures, o
 - Clone and build:
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3.12-dev build-essential
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
 sudo docker build -t speedrun_plm .
