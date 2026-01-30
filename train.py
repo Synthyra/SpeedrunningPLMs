@@ -83,7 +83,7 @@ def arg_parser():
     parser.add_argument("--num_attention_heads", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers")
     parser.add_argument("--vocab_size", type=int, default=33, help="Vocabulary size")
-    parser.add_argument("--expansion_ratio", type=float, default=8/3, help="Expansion ratio for MLP")
+    parser.add_argument("--expansion_ratio", type=float, default=2.0, help="Expansion ratio for MLP")
     parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
     parser.add_argument("--attention_soft_cap", type=float, default=64.0, help="Attention softmax cap")
     parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
@@ -93,31 +93,31 @@ def arg_parser():
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
     
     # Data hyperparams
-    parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
-    parser.add_argument("--masked_diffusion", type=bool, default=False, help="Use masked diffusion")
+    parser.add_argument("--mlm", action="store_true", help="Use masked language modeling")
+    parser.add_argument("--masked_diffusion", action="store_true", help="Use masked diffusion")
     parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
     parser.add_argument("--starting_mask_rate", type=float, default=0.1, help="Starting mask rate for masked language modeling")
     parser.add_argument("--mask_rate_steps", type=int, default=2500, help="Number of steps to reach mask rate")
-    parser.add_argument("--mask_rate_schedule", type=bool, default=True, help="Use mask rate schedule")
+    parser.add_argument("--mask_rate_schedule", action="store_true", help="Use mask rate schedule")
     
     # Optimization hyperparams
     parser.add_argument("--batch_size", type=int, default=8*64*1024, help="Total batch size in tokens")
     parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--num_steps", type=int, default=50000, help="Number of training steps")
     parser.add_argument("--cooldown_steps", type=int, default=5000, help="Number of cooldown steps")
-    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
+    parser.add_argument("--max_length", type=int, default=2048, help="Maximum sequence length")
     parser.add_argument("--scheduler_type", type=str, default='cosine', help="Scheduler type")
     parser.add_argument("--lr_warmup_steps", type=int, default=1000, help="Number of warmup steps")
 
     # Adam optimizer params
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for Adam optimizer when not using Muon")
-    parser.add_argument("--lr_embed", type=float, default=0.06, help="Learning rate for embeddings")
-    parser.add_argument("--lr_head", type=float, default=0.008, help="Learning rate for head")
-    parser.add_argument("--lr_scalar", type=float, default=0.04, help="Learning rate for scalar params")
+    parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate for Adam optimizer when not using Muon")
+    parser.add_argument("--lr_embed", type=float, default=0.001, help="Learning rate for embeddings")
+    parser.add_argument("--lr_head", type=float, default=0.001, help="Learning rate for head")
+    parser.add_argument("--lr_scalar", type=float, default=0.001, help="Learning rate for scalar params")
     
     # Muon optimizer params
-    parser.add_argument("--use_muon", type=bool, default=True, help="Use Muon optimizer")
-    parser.add_argument("--lr_hidden", type=float, default=0.05, help="Learning rate for hidden layers (Muon)")
+    parser.add_argument("--use_muon", action="store_true", help="Use Muon optimizer")
+    parser.add_argument("--lr_hidden", type=float, default=0.001, help="Learning rate for hidden layers (Muon)")
     parser.add_argument("--muon_momentum_warmup_steps", type=int, default=300, help="Steps for warmup momentum (0.85 -> 0.95)")
     
     # Evaluation and logging hyperparams
@@ -127,7 +127,7 @@ def arg_parser():
     
     # Dataloader params
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for optimized dataloader")
-    parser.add_argument("--prefetch_factor", type=int, default=2, help="Prefetch factor for optimized dataloader")
+    parser.add_argument("--prefetch_factor", type=int, default=8, help="Prefetch factor for optimized dataloader")
     
     # Parse CLI args first
     args = parser.parse_args()
@@ -137,7 +137,7 @@ def arg_parser():
         yaml_config = load_config_from_yaml(args.yaml_path)
         
         # Security: Never load tokens from YAML files
-        cli_only_params = {'token', 'wandb_token', 'yaml_path'}
+        cli_only_params = {'hf_token', 'wandb_token', 'yaml_path'}
         
         # Override defaults with YAML values, but preserve CLI overrides
         for key, value in yaml_config.items():
