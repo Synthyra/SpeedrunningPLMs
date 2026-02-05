@@ -374,12 +374,16 @@ def precompute_multiresolution_masks(
     B, L = input_ids.shape
 
     # Compute document IDs from CLS token positions (CLS marks start of each document)
-    doc_ids = (input_ids == cls_token_id).cumsum(dim=1)  # (B, L)
+    # .contiguous() is critical: tensors captured by mask_mod closures MUST have
+    # FixedLayout for torch.compile's Inductor backend. Without it, .max().values
+    # and similar ops produce FlexibleLayout tensors that cause LoweringException
+    # in flex_attention_backward.
+    doc_ids = (input_ids == cls_token_id).cumsum(dim=1).contiguous()  # (B, L)
 
     # Find last real (non-pad) token position per batch element
     is_real = (input_ids != pad_token_id)
     positions = torch.arange(L, device=device).expand(B, L)
-    last_real = torch.where(is_real, positions, torch.zeros_like(positions)).max(dim=1).values  # (B,)
+    last_real = torch.where(is_real, positions, torch.zeros_like(positions)).max(dim=1).values.contiguous()  # (B,)
 
     masks = []
     current_doc_ids = doc_ids
@@ -414,7 +418,7 @@ def precompute_multiresolution_masks(
 
         # Downsample doc_ids and last_real for next level
         if current_L > 1:
-            current_doc_ids = current_doc_ids.view(B, current_L // 2, 2).max(dim=-1).values
+            current_doc_ids = current_doc_ids.view(B, current_L // 2, 2).max(dim=-1).values.contiguous()
             current_last_real = current_last_real // 2
             current_L = current_L // 2
 
