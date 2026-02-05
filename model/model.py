@@ -32,6 +32,7 @@ class PLMConfig(PretrainedConfig):
         mlm: bool = False,
         masked_diffusion: bool = False,
         token_dropout: bool = True,
+        compile_flex_attention: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -51,6 +52,7 @@ class PLMConfig(PretrainedConfig):
         self.mlm = mlm
         self.masked_diffusion = masked_diffusion
         self.token_dropout = token_dropout
+        self.compile_flex_attention = compile_flex_attention
 
 
 @dataclass

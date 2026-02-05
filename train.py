@@ -26,14 +26,6 @@ from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
 from tqdm import tqdm
 from pathlib import Path
-from sklearn.metrics import (
-    precision_score,
-    recall_score,
-    f1_score,
-    accuracy_score,
-    matthews_corrcoef
-)
-
 from data.download_data import get as ensure_hf_file
 from model.model import PLM, PLMConfig
 from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
@@ -92,6 +84,9 @@ def arg_parser():
     parser.add_argument("--conv_unet", action="store_true", help="Use Conv1D UNet with downsampling")
     parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
+    parser.add_argument("--compile_model", type=bool, default=True, help="Use torch.compile on the full model")
+    parser.add_argument("--compile_flex_attention", type=bool, default=True, help="Compile flex_attention for fused attention")
+    parser.add_argument("--dynamo_recompile_limit", type=int, default=32, help="Dynamo recompile limit for torch.compile")
     
     # Data hyperparams
     parser.add_argument("--mlm", action="store_true", help="Use masked language modeling")
@@ -209,9 +204,21 @@ class Trainer:
             wandb.log({f'{prefix}/{k}': v for k, v in log_dict.items()})
 
     @staticmethod
-    def _calculate_metrics(preds: torch.Tensor, labels: torch.Tensor):
+    def _update_confusion(confusion: torch.Tensor, preds: torch.Tensor, labels: torch.Tensor):
         valid_mask = labels != -100
         if not valid_mask.any():
+            return
+        valid_preds = preds[valid_mask].view(-1).to(dtype=torch.int64, device='cpu')
+        valid_labels = labels[valid_mask].view(-1).to(dtype=torch.int64, device='cpu')
+        num_classes = confusion.shape[0]
+        indices = valid_labels * num_classes + valid_preds
+        counts = torch.bincount(indices, minlength=num_classes * num_classes)
+        confusion += counts.view(num_classes, num_classes)
+
+    @staticmethod
+    def _calculate_metrics_from_confusion(confusion: torch.Tensor):
+        total = int(confusion.sum().item())
+        if total == 0:
             return {
                 "accuracy": 0.0,
                 "precision": 0.0,
@@ -220,15 +227,35 @@ class Trainer:
                 "mcc": 0.0,
                 "num_tokens": 0,
             }
-        valid_preds = preds[valid_mask].cpu().numpy()
-        valid_labels = labels[valid_mask].cpu().numpy()
+        confusion_f = confusion.to(dtype=torch.float64)
+        tp = torch.diag(confusion_f)
+        actual = confusion_f.sum(dim=1)
+        predicted = confusion_f.sum(dim=0)
+        precision = torch.where(predicted > 0, tp / predicted, torch.zeros_like(tp))
+        recall = torch.where(actual > 0, tp / actual, torch.zeros_like(tp))
+        f1 = torch.where(
+            precision + recall > 0,
+            2.0 * precision * recall / (precision + recall),
+            torch.zeros_like(tp),
+        )
+        weighted_precision = (precision * actual).sum().item() / total
+        weighted_recall = (recall * actual).sum().item() / total
+        weighted_f1 = (f1 * actual).sum().item() / total
+        correct = tp.sum().item()
+        numerator = correct * total - (predicted * actual).sum().item()
+        denom_left = total * total - (predicted * predicted).sum().item()
+        denom_right = total * total - (actual * actual).sum().item()
+        if denom_left <= 0 or denom_right <= 0:
+            mcc = 0.0
+        else:
+            mcc = numerator / math.sqrt(denom_left * denom_right)
         return {
-            "accuracy": accuracy_score(valid_labels, valid_preds),
-            "precision": precision_score(valid_labels, valid_preds, average="weighted", zero_division=0),
-            "recall": recall_score(valid_labels, valid_preds, average="weighted", zero_division=0),
-            "f1": f1_score(valid_labels, valid_preds, average="weighted", zero_division=0),
-            "mcc": matthews_corrcoef(valid_labels, valid_preds),
-            "num_tokens": int(valid_labels.shape[0]),
+            "accuracy": correct / total,
+            "precision": weighted_precision,
+            "recall": weighted_recall,
+            "f1": weighted_f1,
+            "mcc": mcc,
+            "num_tokens": total,
         }
 
     @staticmethod
@@ -453,10 +480,14 @@ class Trainer:
         if self.ddp_world_size > 1:
             dist.barrier()
 
-        self.print0("Calling torch.compile()")
-        # Enable scalar output capture for .item() calls in compiled functions
-        #torch._dynamo.config.capture_scalar_outputs = True
-        model = torch.compile(model)
+        if self.args.compile_model:
+            self.print0("Calling torch.compile()")
+            torch._dynamo.config.recompile_limit = self.args.dynamo_recompile_limit
+            # Enable scalar output capture for .item() calls in compiled functions
+            #torch._dynamo.config.capture_scalar_outputs = True
+            model = torch.compile(model)
+        else:
+            self.print0("Skipping torch.compile()")
         
         if self.ddp_world_size > 1:
             # Use static graph if model architecture doesn't change
@@ -531,7 +562,7 @@ class Trainer:
         self.model.eval()
 
         losses, total_tokens = [], 0
-        all_preds, all_labels = [], []
+        confusion = torch.zeros((self.args.vocab_size, self.args.vocab_size), dtype=torch.int64)
         preview_done = False
         input_ids, labels, mask_rate = loader.next_batch()
         
@@ -550,8 +581,7 @@ class Trainer:
             )
             losses.append(loss.item())
             preds = logits.argmax(dim=-1)
-            all_preds.append(preds.detach())
-            all_labels.append(labels.detach())
+            self._update_confusion(confusion, preds.detach(), labels.detach())
             if not preview_done:
                 self._print_val_preview(input_ids, labels, logits)
                 preview_done = True
@@ -561,12 +591,7 @@ class Trainer:
 
         avg_loss = sum(losses) / len(losses) if losses else 0.0
 
-        if all_preds:
-            all_preds = torch.cat([p.flatten() for p in all_preds])
-            all_labels = torch.cat([l.flatten() for l in all_labels])
-            metrics = self._calculate_metrics(all_preds, all_labels)
-        else:
-            metrics = self._calculate_metrics(torch.empty(0), torch.empty(0))
+        metrics = self._calculate_metrics_from_confusion(confusion)
 
         if self.ddp_world_size > 1:
             # Convert to tensors before all_reduce
@@ -906,6 +931,7 @@ if __name__ == '__main__':
         mlm=args.mlm or args.masked_diffusion,
         masked_diffusion=args.masked_diffusion,
         token_dropout=args.token_dropout,
+        compile_flex_attention=args.compile_flex_attention,
     )
 
     # Initialize wandb before clearing tokens for security

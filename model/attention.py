@@ -52,6 +52,9 @@ class SelfAttention(nn.Module):
             self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
 
         self.unet = config.unet
+        self.flex_attention = flex_attention
+        if config.compile_flex_attention:
+            self.flex_attention = torch.compile(flex_attention)
 
     def forward(
             self,
@@ -73,8 +76,10 @@ class SelfAttention(nn.Module):
         
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
+        if attention_mask is None:
+            assert l <= 1, "attention_mask is required for seq_len > 1 to avoid dense attention"
         
-        y = flex_attention(
+        y = self.flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
