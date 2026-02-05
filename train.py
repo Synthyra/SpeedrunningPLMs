@@ -545,6 +545,13 @@ class Trainer:
         self.optimizers = self.init_optimizers()
         self.lr_schedulers, self.sliding_window_size_scheduler, self.mask_rate_scheduler = self.init_schedulers()
         self.print0(f"Ready for training!")
+
+        # Push code + config to HF Hub once so the repo is ready for inference
+        if self.master_process and self.args.hf_model_name:
+            self.print0(f"Pushing code and config to {self.args.hf_model_name}...")
+            model_ref = self.model.module if self.ddp_world_size > 1 else self.model
+            model_ref.push_code_and_config_to_hub(self.args.hf_model_name)
+            self.print0("Code and config pushed to hub.")
         
         # Create decorated versions of methods that should be excluded from timing
         self._run_eval_loader_timed = exclude_from_timer(self.train_timer)(self.run_eval_loader)
@@ -787,16 +794,12 @@ class Trainer:
             else:
                 model = self.model
 
+            # Always save locally
             log = dict(step=step, model=model.state_dict(), optimizers=[opt.state_dict() for opt in self.optimizers])
-            if self.args.hf_model_name:
-                try:
-                    model.push_to_hub(self.args.hf_model_name, subfolder='step%06d' % step)
-                except Exception as e:
-                    self.print0(e)
-                    self.print0(f'Pushing failed, defaulting to local save')
-                    torch.save(log, 'logs/state_step%06d.pt' % step)
-            else:
-                torch.save(log, 'logs/state_step%06d.pt' % step)
+            os.makedirs('logs', exist_ok=True)
+            torch.save(log, 'logs/state_step%06d.pt' % step)
+            model.save_weights_local('checkpoints', step)
+            self.print0(f'Checkpoint saved locally at step {step}')
         
         # Synchronize after saving
         if self.ddp_world_size > 1:
@@ -1015,8 +1018,14 @@ class Trainer:
             self.print0(f'Train Time: {final_training_time_sec:.0f}s | Step Avg: {final_training_time_sec/timed_steps:.2f}s')
             self.print0(f'Total train time (min): {final_training_time_sec / 60:.2f}')
             self.print0(f'Total train time (hours): {final_training_time_sec / 3600:.2f}')
-            # save the model to huggingface
+            # Save final checkpoint locally
             self._save_checkpoint_timed(self.args.num_steps)
+            # Push final weights to HF Hub
+            if self.master_process and self.args.hf_model_name:
+                self.print0(f"Pushing final weights to {self.args.hf_model_name}...")
+                model_ref = self.model.module if self.ddp_world_size > 1 else self.model
+                model_ref.push_weights_to_hub(self.args.hf_model_name)
+                self.print0("Final weights pushed to hub.")
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize()

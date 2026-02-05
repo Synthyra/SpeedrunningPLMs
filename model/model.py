@@ -924,15 +924,20 @@ class PLM(PreTrainedModel):
                 # Mean pool per document
                 return self.get_vector_embeddings(input_ids, sliding_window_size)
 
-    def push_to_hub(self, repo_id: str, **kwargs):
-        """Push model to HuggingFace Hub with source code for trust_remote_code."""
+    def push_code_and_config_to_hub(self, repo_id: str):
+        """Push source code and model config to HuggingFace Hub (no weights).
+
+        Call once at the start of training so the repo is ready for
+        trust_remote_code=True loading as soon as weights are uploaded later.
+        """
         import shutil
         import tempfile
         from pathlib import Path
+        from huggingface_hub import HfApi
 
-        # Save model + config to a temporary directory
         with tempfile.TemporaryDirectory() as tmpdir:
-            self.save_pretrained(tmpdir)
+            # Save only the config (this also writes config.json)
+            self.config.save_pretrained(tmpdir)
 
             # Copy source files needed for trust_remote_code
             model_dir = Path(__file__).parent
@@ -941,14 +946,33 @@ class PLM(PreTrainedModel):
                 if src_path.exists():
                     shutil.copy2(src_path, Path(tmpdir) / src_file)
 
-            # Upload using HfApi
-            from huggingface_hub import HfApi
             api = HfApi()
             api.upload_folder(
                 folder_path=tmpdir,
                 repo_id=repo_id,
                 repo_type="model",
-                **kwargs,
+            )
+
+    def save_weights_local(self, save_dir: str, step: int):
+        """Save model weights and optimizer-resumable checkpoint locally."""
+        from pathlib import Path
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        self.save_pretrained(save_path / f"step_{step:06d}")
+
+    def push_weights_to_hub(self, repo_id: str):
+        """Push model weights to HuggingFace Hub (code + config already there)."""
+        import tempfile
+        from huggingface_hub import HfApi
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.save_pretrained(tmpdir)
+
+            api = HfApi()
+            api.upload_folder(
+                folder_path=tmpdir,
+                repo_id=repo_id,
+                repo_type="model",
             )
 
 
