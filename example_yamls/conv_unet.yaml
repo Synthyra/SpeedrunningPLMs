@@ -50,8 +50,8 @@ mask_rate_schedule: true
 # Optimization & Schedule
 batch_size: 1048576     # Total tokens across all GPUs
 grad_accum: 8
-num_steps: 25000
-cooldown_steps: 5000
+num_steps: 50000
+cooldown_steps: 10000
 max_length: 2048       # Must be power of 2 for patch merging
 scheduler_type: "cosine"
 lr_warmup_steps: 1000
