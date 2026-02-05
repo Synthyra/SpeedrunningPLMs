@@ -881,3 +881,103 @@ class ChunkedEvalLoader:
         except StopIteration:
             self._exhausted = True
             return torch.empty(0, dtype=torch.int32)
+
+
+def apply_masking_gpu(
+    input_ids: torch.Tensor,
+    special_tokens: torch.Tensor,
+    mask_token_id: int,
+    mask_rate: float,
+    mlm: bool = False,
+):
+    """Apply masking on GPU -- much faster than CPU, no worker sync issues.
+
+    Args:
+        input_ids: (B, L) or (L,) raw token IDs on GPU
+        special_tokens: 1D tensor of token IDs to never mask (CLS, EOS, PAD)
+        mask_token_id: Token ID to replace masked positions with
+        mask_rate: Maximum mask rate (for MLM, used directly; for MD, sampled uniformly)
+        mlm: If True, use fixed mask_rate. If False, sample uniform rate (masked diffusion).
+
+    Returns:
+        noisy: input_ids with masked positions replaced by mask_token_id
+        labels: original token IDs at masked positions, -100 elsewhere
+        rate: scalar tensor of the actual mask rate used
+    """
+    if mlm:
+        rate = torch.tensor(mask_rate, device=input_ids.device, dtype=torch.float32)
+    else:
+        eps = 1e-3
+        rate = torch.rand(1, device=input_ids.device) * (1 - eps) + eps
+
+    mask_probs = torch.rand_like(input_ids, dtype=torch.float32)
+    mask_indices = mask_probs < rate
+
+    # Don't mask special tokens
+    special_mask = torch.isin(input_ids, special_tokens)
+    mask_indices = mask_indices & ~special_mask
+
+    labels = input_ids.clone()
+    labels[~mask_indices] = -100
+    noisy = torch.where(mask_indices, mask_token_id, input_ids)
+    return noisy, labels, rate
+
+
+class AsyncBatchPipeline:
+    """Double-buffered CUDA stream pipeline for overlapping H2D transfer with compute.
+
+    Wraps a data loader that yields CPU tensors. Uses a background CUDA stream
+    to transfer the next batch while the current batch is being processed on
+    the default stream.
+    """
+
+    def __init__(self, loader):
+        """
+        Args:
+            loader: A data loader with .next_batch() returning CPU tensors
+                    and ._exhausted attribute.
+        """
+        self.loader = loader
+        self.files = loader.files
+        self.transfer_stream = torch.cuda.Stream()
+        self._next_batch = None
+        self._exhausted = False
+
+    def reset(self):
+        """Reset the underlying loader and pre-fetch the first batch."""
+        self.loader.reset()
+        self._exhausted = False
+        self._next_batch = None
+        self._prefetch()
+
+    def _prefetch(self):
+        """Transfer the next batch to GPU on the background stream."""
+        raw = self.loader.next_batch()
+        if raw.numel() == 0:
+            self._exhausted = True
+            self._next_batch = None
+            return
+        with torch.cuda.stream(self.transfer_stream):
+            self._next_batch = raw.cuda(non_blocking=True)
+
+    def next_batch(self) -> torch.Tensor:
+        """Return the pre-staged GPU batch and start transferring the next one.
+
+        Returns:
+            input_ids on GPU (B, max_length) int32, or empty tensor if exhausted.
+        """
+        if self._next_batch is None:
+            if self._exhausted:
+                return torch.empty(0, dtype=torch.int32, device='cuda')
+            self._prefetch()
+            if self._next_batch is None:
+                return torch.empty(0, dtype=torch.int32, device='cuda')
+
+        # Wait for the transfer to complete
+        torch.cuda.current_stream().wait_stream(self.transfer_stream)
+        batch = self._next_batch
+
+        # Start prefetching the next batch
+        self._prefetch()
+
+        return batch

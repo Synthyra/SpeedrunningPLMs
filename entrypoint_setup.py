@@ -33,12 +33,15 @@ try:
     # Deterministic operations off for speed (set True if reproducibility needed)
     torch.backends.cudnn.deterministic = False
 
-    # Reduce graph breaks from scalar extraction (e.g., Tensor.item()).
+
+    import torch._inductor.config as inductor_config
+    inductor_config.max_autotune_gemm_backends = "ATEN,CUTLASS,FBGEMM"
+
     try:
         import torch._dynamo as dynamo
         dynamo.config.capture_scalar_outputs = True
     except Exception:
-        pass
+        print("Failed to import torch._dynamo")
 
     # Ensure DDP process groups are destroyed on exit to avoid NCCL warnings.
     try:
@@ -49,6 +52,8 @@ try:
         atexit.register(_cleanup_ddp)
     except Exception:
         pass
+
+
     
 except ImportError:
     pass
