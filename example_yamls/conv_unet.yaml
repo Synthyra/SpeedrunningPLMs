@@ -5,6 +5,7 @@
 # Security note: tokens (--hf_token, --wandb_token) must be passed via CLI
 
 # General Configuration
+bugfix: false
 save_path: "Synthyra/speedrun_conv_unet"
 data_name: "uniref50"
 num_chunks: 197
@@ -14,7 +15,7 @@ log_name: null
 seed: 42
 clear_cache_every: 1000
 grad_clip: 0.0
-auto_grad_clip: true
+auto_grad_clip: false
 auto_grad_clip_p: 10.0
 
 # Model Architecture
@@ -36,20 +37,21 @@ token_dropout: false
 bfloat16: true
 compile_model: true
 compile_flex_attention: true
+dynamo_recompile_limit: 32
 
 # Data & MLM Configuration
 mlm: true
 masked_diffusion: false
 mask_rate: 0.2
 starting_mask_rate: 0.5
-mask_rate_steps: 10000
+mask_rate_steps: 5000
 mask_rate_schedule: true
 
 # Optimization & Schedule
 batch_size: 1048576     # Total tokens across all GPUs
 grad_accum: 8
-num_steps: 50000
-cooldown_steps: 10000
+num_steps: 25000
+cooldown_steps: 5000
 max_length: 2048       # Must be power of 2 for patch merging
 scheduler_type: "cosine"
 lr_warmup_steps: 1000
@@ -63,7 +65,7 @@ lr_scalar: 0.005
 # Muon Optimizer Parameters
 use_muon: true
 lr_hidden: 0.005
-muon_momentum_warmup_steps: 300
+muon_momentum_warmup_steps: 100
 
 # Evaluation & Logging
 eval_every: 1000

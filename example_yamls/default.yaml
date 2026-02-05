@@ -4,6 +4,7 @@
 # Security note: tokens (--hf_token, --wandb_token) must be passed via CLI
 
 # General Configuration
+bugfix: false
 save_path: "Synthyra/speedrun_test"
 data_name: "uniref50"
 num_chunks: 197
@@ -30,6 +31,9 @@ unet: true
 conv_unet: false # Use Conv1D UNet with downsampling
 token_dropout: false
 bfloat16: true
+compile_model: true
+compile_flex_attention: true
+dynamo_recompile_limit: 32
 
 # Data & MLM Configuration
 mlm: true

@@ -3,6 +3,7 @@
 # CLI arguments will override these values where provided
 
 # General Configuration
+bugfix: true
 save_path: "Synthyra/debug_conv_unet"
 data_name: "uniref50"
 num_chunks: 10
@@ -31,6 +32,7 @@ token_dropout: false
 bfloat16: true
 compile_model: false   # Faster startup for debugging
 compile_flex_attention: true
+dynamo_recompile_limit: 32
 
 # Data & MLM Configuration
 mlm: true

@@ -4,6 +4,7 @@
 # Security note: tokens (--hf_token, --wandb_token) must be passed via CLI
 
 # General Configuration
+bugfix: true
 save_path: "Synthyra/debug_test"
 data_name: "uniref50"
 num_chunks: 10
@@ -30,6 +31,9 @@ unet: true
 conv_unet: false
 token_dropout: true
 bfloat16: true
+compile_model: false
+compile_flex_attention: true
+dynamo_recompile_limit: 32
 
 # Data & MLM Configuration
 mlm: false
