@@ -28,7 +28,7 @@ from tqdm import tqdm
 from pathlib import Path
 from data.download_data import get as ensure_hf_file
 from model.model import PLM, PLMConfig
-from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
+from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader, ChunkedTrainLoader, ChunkedEvalLoader
 from optimizer import Muon
 from utils import (
     set_seed,
@@ -46,6 +46,106 @@ if os.environ['WANDB_AVAILABLE'] == 'true':
 
 
 inductor_config.max_autotune_gemm_backends = "ATEN,CUTLASS,FBGEMM"
+
+
+def apply_masking_gpu(
+    input_ids: torch.Tensor,
+    special_tokens: torch.Tensor,
+    mask_token_id: int,
+    mask_rate: float,
+    mlm: bool = False,
+):
+    """Apply masking on GPU -- much faster than CPU, no worker sync issues.
+
+    Args:
+        input_ids: (B, L) or (L,) raw token IDs on GPU
+        special_tokens: 1D tensor of token IDs to never mask (CLS, EOS, PAD)
+        mask_token_id: Token ID to replace masked positions with
+        mask_rate: Maximum mask rate (for MLM, used directly; for MD, sampled uniformly)
+        mlm: If True, use fixed mask_rate. If False, sample uniform rate (masked diffusion).
+
+    Returns:
+        noisy: input_ids with masked positions replaced by mask_token_id
+        labels: original token IDs at masked positions, -100 elsewhere
+        rate: scalar tensor of the actual mask rate used
+    """
+    if mlm:
+        rate = torch.tensor(mask_rate, device=input_ids.device, dtype=torch.float32)
+    else:
+        eps = 1e-3
+        rate = torch.rand(1, device=input_ids.device) * (1 - eps) + eps
+
+    mask_probs = torch.rand_like(input_ids, dtype=torch.float32)
+    mask_indices = mask_probs < rate
+
+    # Don't mask special tokens
+    special_mask = torch.isin(input_ids, special_tokens)
+    mask_indices = mask_indices & ~special_mask
+
+    labels = input_ids.clone()
+    labels[~mask_indices] = -100
+    noisy = torch.where(mask_indices, mask_token_id, input_ids)
+    return noisy, labels, rate
+
+
+class AsyncBatchPipeline:
+    """Double-buffered CUDA stream pipeline for overlapping H2D transfer with compute.
+
+    Wraps a data loader that yields CPU tensors. Uses a background CUDA stream
+    to transfer the next batch while the current batch is being processed on
+    the default stream.
+    """
+
+    def __init__(self, loader):
+        """
+        Args:
+            loader: A data loader with .next_batch() returning CPU tensors
+                    and ._exhausted attribute.
+        """
+        self.loader = loader
+        self.files = loader.files
+        self.transfer_stream = torch.cuda.Stream()
+        self._next_batch = None
+        self._exhausted = False
+
+    def reset(self):
+        """Reset the underlying loader and pre-fetch the first batch."""
+        self.loader.reset()
+        self._exhausted = False
+        self._next_batch = None
+        self._prefetch()
+
+    def _prefetch(self):
+        """Transfer the next batch to GPU on the background stream."""
+        raw = self.loader.next_batch()
+        if raw.numel() == 0:
+            self._exhausted = True
+            self._next_batch = None
+            return
+        with torch.cuda.stream(self.transfer_stream):
+            self._next_batch = raw.cuda(non_blocking=True)
+
+    def next_batch(self) -> torch.Tensor:
+        """Return the pre-staged GPU batch and start transferring the next one.
+
+        Returns:
+            input_ids on GPU (B, max_length) int32, or empty tensor if exhausted.
+        """
+        if self._next_batch is None:
+            if self._exhausted:
+                return torch.empty(0, dtype=torch.int32, device='cuda')
+            self._prefetch()
+            if self._next_batch is None:
+                return torch.empty(0, dtype=torch.int32, device='cuda')
+
+        # Wait for the transfer to complete
+        torch.cuda.current_stream().wait_stream(self.transfer_stream)
+        batch = self._next_batch
+
+        # Start prefetching the next batch
+        self._prefetch()
+
+        return batch
 
 
 def arg_parser():
@@ -164,8 +264,8 @@ class Trainer:
         # Initialize global timer
         self.train_timer = GlobalTimer()
         
-        # Initialize mask rate tracking
-        self.current_mask_rate = 0.0
+        # Initialize mask rate tracking (used directly for conv_unet GPU-side masking)
+        self.current_mask_rate = args.mask_rate if args.mlm else 1.0
         
         # Initialize auto gradient clipper
         self.auto_grad_clipper = None
@@ -270,6 +370,13 @@ class Trainer:
         if not self.master_process:
             return
         pad_token_id = self.pad_token_id
+        # Flatten batched tensors to 1D for preview
+        if input_ids.dim() == 2:
+            input_ids = input_ids.view(-1)
+        if labels.dim() == 2:
+            labels = labels.view(-1)
+        if logits.dim() == 3:
+            logits = logits.view(-1, logits.shape[-1])
         assert input_ids.dim() == 1, f"Expected input_ids to be 1D (seq_len,) but got: {input_ids.shape}"
         assert labels.dim() == 1, f"Expected labels to be 1D (seq_len,) but got: {labels.shape}"
         assert logits.dim() == 2, f"Expected logits to be 2D (seq_len, vocab_size) but got: {logits.shape}"
@@ -383,6 +490,12 @@ class Trainer:
 
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.pad_token_id = self.tokenizer.pad_token_id
+        self.mask_token_id = self.tokenizer.mask_token_id
+        # Special tokens tensor for GPU-side masking (moved to GPU lazily)
+        self._special_tokens_cpu = torch.tensor(
+            [self.tokenizer.cls_token_id, self.tokenizer.eos_token_id, self.pad_token_id],
+            dtype=torch.int32,
+        )
 
         # Ensure dataset is available locally (master process only), then sync
         if self.master_process:
@@ -438,35 +551,58 @@ class Trainer:
         self._save_checkpoint_timed = exclude_from_timer(self.train_timer)(self.save_checkpoint)
 
     def init_dataloader(self, filename_pattern, training=True):
-        if training:
-            if self.args.mlm:
-                mask_rate = self.args.mask_rate
+        if self.args.conv_unet:
+            # Chunked loader for batched UNet: yields (B, max_length) raw input_ids
+            if training:
+                loader = ChunkedTrainLoader(
+                    filename_pattern=filename_pattern,
+                    max_length=self.args.max_length,
+                    micro_batch_tokens=self.batch_size,
+                    process_rank=self.ddp_rank,
+                    num_processes=self.ddp_world_size,
+                    max_epochs=1,
+                    tokenizer=self.tokenizer,
+                    num_workers=self.args.num_workers,
+                    prefetch_factor=self.args.prefetch_factor,
+                )
+                return AsyncBatchPipeline(loader)
             else:
-                # we set to 1.0, which properly scales the masked diffusion random mask rate
-                # we can schedule the mask rate with any float, which is torch.rand(1) * mask_rate
-                mask_rate = 1.0
-
-            return OptimizedTrainLoader(
-                filename_pattern=filename_pattern,
-                seq_len=self.batch_size,
-                process_rank=self.ddp_rank,
-                num_processes=self.ddp_world_size,
-                max_epochs=1,
-                tokenizer=self.tokenizer,
-                num_workers=self.args.num_workers,
-                prefetch_factor=self.args.prefetch_factor,
-                mlm=self.args.mlm or self.args.masked_diffusion,
-                mask_rate=mask_rate,
-            )
+                loader = ChunkedEvalLoader(
+                    filename_pattern=filename_pattern,
+                    max_length=self.args.max_length,
+                    micro_batch_tokens=self.batch_size,
+                    process_rank=self.ddp_rank,
+                    num_processes=self.ddp_world_size,
+                    tokenizer=self.tokenizer,
+                )
+                return AsyncBatchPipeline(loader)
         else:
-            # Use evaluation dataloader that distributes data by sequences, not files
-            return OptimizedEvalLoader(
-                filename_pattern=filename_pattern,
-                seq_len=self.batch_size,
-                process_rank=self.ddp_rank,
-                num_processes=self.ddp_world_size,
-                tokenizer=self.tokenizer,
-            )
+            # Legacy loader for standard/unet: yields (input_ids, labels, mask_rate)
+            if training:
+                if self.args.mlm:
+                    mask_rate = self.args.mask_rate
+                else:
+                    mask_rate = 1.0
+                return OptimizedTrainLoader(
+                    filename_pattern=filename_pattern,
+                    seq_len=self.batch_size,
+                    process_rank=self.ddp_rank,
+                    num_processes=self.ddp_world_size,
+                    max_epochs=1,
+                    tokenizer=self.tokenizer,
+                    num_workers=self.args.num_workers,
+                    prefetch_factor=self.args.prefetch_factor,
+                    mlm=self.args.mlm or self.args.masked_diffusion,
+                    mask_rate=mask_rate,
+                )
+            else:
+                return OptimizedEvalLoader(
+                    filename_pattern=filename_pattern,
+                    seq_len=self.batch_size,
+                    process_rank=self.ddp_rank,
+                    num_processes=self.ddp_world_size,
+                    tokenizer=self.tokenizer,
+                )
 
     def init_model(self):
         self.print0("Initializing model...")
@@ -566,15 +702,30 @@ class Trainer:
         loader.reset()
         self.model.eval()
 
+        # Move special tokens to GPU once
+        special_tokens_gpu = self._special_tokens_cpu.to(self.device)
+
         losses, total_tokens = [], 0
         confusion = torch.zeros((self.args.vocab_size, self.args.vocab_size), dtype=torch.int64)
         preview_done = False
-        input_ids, labels, mask_rate = loader.next_batch()
+
+        if self.args.conv_unet:
+            # Chunked loader: yields (B, max_length) raw input_ids on GPU
+            raw_ids = loader.next_batch()
+        else:
+            # Legacy loader: yields (input_ids, labels, mask_rate) on GPU
+            input_ids, labels, mask_rate = loader.next_batch()
+            raw_ids = input_ids  # Use input_ids for the loop condition
         
         # Only show progress bar on master process
         pbar = tqdm(desc=f'{prefix} set', leave=False, disable=not self.master_process)
         
-        while input_ids.numel():
+        while raw_ids.numel():
+            if self.args.conv_unet:
+                # Apply masking on GPU with fixed eval mask rate
+                input_ids, labels, mask_rate = apply_masking_gpu(
+                    raw_ids, special_tokens_gpu, self.mask_token_id, mask_rate=0.15, mlm=True,
+                )
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
             total_tokens += batch_valid_tokens
             loss, logits = self.model(
@@ -590,7 +741,12 @@ class Trainer:
             if not preview_done:
                 self._print_val_preview(input_ids, labels, logits)
                 preview_done = True
-            input_ids, labels, mask_rate = loader.next_batch()
+
+            if self.args.conv_unet:
+                raw_ids = loader.next_batch()
+            else:
+                input_ids, labels, mask_rate = loader.next_batch()
+                raw_ids = input_ids
             pbar.update(1)
         pbar.close()
 
@@ -653,6 +809,10 @@ class Trainer:
         if step % self.args.clear_cache_every == 0:
             torch.cuda.empty_cache()
         
+        # Move special tokens to GPU once (cached after first call)
+        if not hasattr(self, '_special_tokens_gpu'):
+            self._special_tokens_gpu = self._special_tokens_cpu.to(self.device)
+        
         # Accumulate losses for proper averaging
         accumulated_loss = 0.0
         
@@ -662,16 +822,28 @@ class Trainer:
                 if self.ddp_world_size > 1 and i < self.args.grad_accum - 1:
                     stack.enter_context(self.model.no_sync())
                 
-                input_ids, labels, mask_rate = self.train_loader.next_batch()
-                
-                # Check if dataloader is exhausted (returns empty tensors)
-                if input_ids.numel() == 0:
-                    # Reset the dataloader and get a fresh batch
-                    self.train_loader.reset()
+                if self.args.conv_unet:
+                    # Chunked pipeline: yields raw (B, max_length) on GPU
+                    raw_ids = self.train_loader.next_batch()
+                    if raw_ids.numel() == 0:
+                        self.train_loader.reset()
+                        raw_ids = self.train_loader.next_batch()
+                        assert raw_ids.numel() > 0, "Dataloader returned empty batch even after reset"
+                    # Apply masking on GPU
+                    input_ids, labels, mask_rate = apply_masking_gpu(
+                        raw_ids,
+                        self._special_tokens_gpu,
+                        self.mask_token_id,
+                        mask_rate=self.current_mask_rate,
+                        mlm=self.args.mlm or (self.args.masked_diffusion and self.current_mask_rate < 1.0),
+                    )
+                else:
+                    # Legacy pipeline: yields (input_ids, labels, mask_rate) on GPU
                     input_ids, labels, mask_rate = self.train_loader.next_batch()
-                    # Double-check we have valid data after reset
                     if input_ids.numel() == 0:
-                        raise RuntimeError("Dataloader returned empty batch even after reset")
+                        self.train_loader.reset()
+                        input_ids, labels, mask_rate = self.train_loader.next_batch()
+                        assert input_ids.numel() > 0, "Dataloader returned empty batch even after reset"
                 
                 loss = self.model(
                     input_ids=input_ids,
@@ -751,11 +923,18 @@ class Trainer:
                     else:
                         mask_rate = self.mask_rate_scheduler(frac_done_mask)
                     self.current_mask_rate = mask_rate
-                    self.train_loader.set_mask_rate(mask_rate)
-                    if self.args.masked_diffusion and frac_done_mask > 1 and self.train_loader.mlm:
-                        self.train_loader.set_mlm(False)
-                        model_for_mlm = self.model.module if self.ddp_world_size > 1 else self.model
-                        model_for_mlm.mlm = False
+                    if self.args.conv_unet:
+                        # For conv_unet, mask_rate is applied in train_step via apply_masking_gpu
+                        if self.args.masked_diffusion and frac_done_mask > 1:
+                            model_for_mlm = self.model.module if self.ddp_world_size > 1 else self.model
+                            model_for_mlm.mlm = False
+                    else:
+                        # Legacy path: push mask_rate to data loader workers
+                        self.train_loader.set_mask_rate(mask_rate)
+                        if self.args.masked_diffusion and frac_done_mask > 1 and self.train_loader.mlm:
+                            self.train_loader.set_mlm(False)
+                            model_for_mlm = self.model.module if self.ddp_world_size > 1 else self.model
+                            model_for_mlm.mlm = False
                 # once in a while evaluate the validation dataset
                 if self.args.eval_every > 0 and step % self.args.eval_every == 0:
                     val_loss, val_perplexity, val_tokens, val_metrics = self._run_eval_loader_timed(

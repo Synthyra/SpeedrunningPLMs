@@ -3,7 +3,7 @@ import random
 import torch.utils.data as data
 from pathlib import Path
 from transformers import EsmTokenizer
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from torch.utils.data import DataLoader, IterableDataset
 
 
@@ -501,3 +501,383 @@ class OptimizedTrainLoader:
             self._exhausted = True
             # Return empty tensors to signal end of data
             return torch.empty(0, device='cuda'), torch.empty(0, device='cuda'), torch.empty(0, device='cuda')
+
+
+# ========================================================================================
+# Chunk-aligned data loaders (new for batched UNet + GPU-side masking)
+# ========================================================================================
+
+
+class ChunkedTrainDataset(IterableDataset):
+    """Chunk-aligned IterableDataset that packs documents into fixed-length chunks.
+
+    Each chunk is exactly max_length tokens with documents packed end-to-end.
+    No document spans a chunk boundary. If a document doesn't fit in the current
+    chunk, the remainder is padded and a new chunk starts. Documents exceeding
+    max_length are truncated to their own chunk.
+
+    Yields batches of (B, max_length) int32 tensors containing raw input_ids
+    (no masking applied -- masking is done on GPU in the training loop).
+    """
+
+    def __init__(
+        self,
+        filename_pattern: str,
+        max_length: int,
+        batch_size: int,
+        process_rank: int,
+        num_processes: int,
+        max_epochs: int,
+        tokenizer: EsmTokenizer,
+        num_workers: int = 1,
+    ):
+        self.filename_pattern = filename_pattern
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.max_epochs = max_epochs
+        self.num_workers = num_workers
+        self.cls_token_id = tokenizer.cls_token_id
+        self.eos_token_id = tokenizer.eos_token_id
+        self.pad_token_id = tokenizer.pad_token_id
+
+        all_files = sorted(Path.cwd().glob(filename_pattern))
+        assert len(all_files) > 0, f"No files found matching pattern: {filename_pattern}"
+
+        # Distribute files across processes (GPUs)
+        files_per_process = len(all_files) // num_processes
+        extra = len(all_files) % num_processes
+        start = process_rank * files_per_process + min(process_rank, extra)
+        end = start + files_per_process + (1 if process_rank < extra else 0)
+        self.process_files = all_files[start:end]
+
+    def _pack_chunks(self, raw_tokens: torch.Tensor):
+        """Pack raw tokens into max_length-aligned chunks.
+
+        Documents are delineated by EOS tokens. Each chunk contains one or more
+        complete documents, padded at the end if needed.
+
+        Yields individual (max_length,) uint8 chunks.
+        """
+        eos_positions = (raw_tokens == self.eos_token_id).nonzero(as_tuple=True)[0]
+        if len(eos_positions) == 0:
+            return
+
+        chunk_parts: List[torch.Tensor] = []
+        chunk_len = 0
+
+        prev_start = 0
+        for i in range(len(eos_positions)):
+            curr_eos = eos_positions[i].item()
+            doc = raw_tokens[prev_start:curr_eos + 1]
+            prev_start = curr_eos + 1
+            doc_len = len(doc)
+
+            if doc_len > self.max_length:
+                # Flush current chunk if it has data
+                if chunk_len > 0:
+                    padding = torch.full((self.max_length - chunk_len,), self.pad_token_id, dtype=torch.uint8)
+                    yield torch.cat(chunk_parts + [padding])
+                    chunk_parts = []
+                    chunk_len = 0
+                # Truncate oversized document to its own chunk
+                yield doc[:self.max_length].clone()
+                continue
+
+            if doc_len + chunk_len > self.max_length:
+                # Doc doesn't fit: pad and yield current chunk
+                padding = torch.full((self.max_length - chunk_len,), self.pad_token_id, dtype=torch.uint8)
+                yield torch.cat(chunk_parts + [padding])
+                chunk_parts = []
+                chunk_len = 0
+
+            chunk_parts.append(doc)
+            chunk_len += doc_len
+
+            if chunk_len == self.max_length:
+                yield torch.cat(chunk_parts)
+                chunk_parts = []
+                chunk_len = 0
+
+        # Yield remaining chunk if any
+        if chunk_len > 0:
+            padding = torch.full((self.max_length - chunk_len,), self.pad_token_id, dtype=torch.uint8)
+            yield torch.cat(chunk_parts + [padding])
+
+    def __iter__(self):
+        worker_info = data.get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        # Distribute this process's files across workers
+        files_per_worker = len(self.process_files) // num_workers
+        extra = len(self.process_files) % num_workers
+        start = worker_id * files_per_worker + min(worker_id, extra)
+        end = start + files_per_worker + (1 if worker_id < extra else 0)
+        worker_files = list(self.process_files[start:end])
+
+        epoch = 0
+        leftover_tokens = torch.empty(0, dtype=torch.uint8)
+        batch_chunks: List[torch.Tensor] = []
+
+        while epoch < self.max_epochs:
+            file_idx = 0
+
+            if epoch > 0:
+                random.seed(epoch + self.process_rank * 10000 + worker_id * 1000)
+                random.shuffle(worker_files)
+
+            while file_idx < len(worker_files):
+                raw_tokens = _load_data_shard(worker_files[file_idx])
+                raw_tokens = torch.cat([leftover_tokens, raw_tokens])
+                file_idx += 1
+
+                # Find last complete document
+                eos_positions = (raw_tokens == self.eos_token_id).nonzero(as_tuple=True)[0]
+                if len(eos_positions) == 0:
+                    leftover_tokens = raw_tokens
+                    continue
+
+                last_eos_pos = eos_positions[-1].item()
+                leftover_tokens = raw_tokens[last_eos_pos + 1:]
+                complete_tokens = raw_tokens[:last_eos_pos + 1]
+
+                for chunk in self._pack_chunks(complete_tokens):
+                    batch_chunks.append(chunk.to(torch.int32))
+                    if len(batch_chunks) == self.batch_size:
+                        yield torch.stack(batch_chunks)  # (B, max_length)
+                        batch_chunks = []
+
+            # End of epoch: drop incomplete batch, reset
+            leftover_tokens = torch.empty(0, dtype=torch.uint8)
+            batch_chunks = []
+            epoch += 1
+
+
+class ChunkedTrainLoader:
+    """Chunk-aligned training data loader.
+
+    Yields (B, max_length) int32 tensors of raw input_ids on CPU (pinned memory).
+    No masking applied -- masking is handled on GPU in the training loop.
+    """
+
+    def __init__(
+        self,
+        filename_pattern: str,
+        max_length: int,
+        micro_batch_tokens: int,
+        process_rank: int,
+        num_processes: int,
+        max_epochs: int,
+        tokenizer: EsmTokenizer,
+        num_workers: int = 4,
+        prefetch_factor: int = 2,
+    ):
+        self.max_length = max_length
+        batch_size = micro_batch_tokens // max_length
+        assert batch_size >= 1, f"micro_batch_tokens ({micro_batch_tokens}) must be >= max_length ({max_length})"
+
+        self._dataset = ChunkedTrainDataset(
+            filename_pattern=filename_pattern,
+            max_length=max_length,
+            batch_size=batch_size,
+            process_rank=process_rank,
+            num_processes=num_processes,
+            max_epochs=max_epochs,
+            tokenizer=tokenizer,
+            num_workers=num_workers,
+        )
+        self.files = self._dataset.process_files
+
+        self.dataloader = DataLoader(
+            self._dataset,
+            batch_size=None,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=True if num_workers > 0 else False,
+        )
+        self._iterator = None
+        self._exhausted = False
+
+    def reset(self):
+        """Reset the dataloader iterator."""
+        self._iterator = iter(self.dataloader)
+        self._exhausted = False
+
+    def next_batch(self) -> torch.Tensor:
+        """Get next batch of raw input_ids (B, max_length) on CPU (pinned memory)."""
+        if self._iterator is None:
+            self.reset()
+
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            self._exhausted = True
+            return torch.empty(0, dtype=torch.int32)
+
+
+class ChunkedEvalDataset(IterableDataset):
+    """Chunk-aligned evaluation dataset. Same packing as training but:
+    - All processes see all files (distributes by sequence, not file)
+    - Single epoch only
+    - Yields (B, max_length) int32 raw input_ids
+    """
+
+    def __init__(
+        self,
+        filename_pattern: str,
+        max_length: int,
+        batch_size: int,
+        process_rank: int,
+        num_processes: int,
+        tokenizer: EsmTokenizer,
+    ):
+        self.filename_pattern = filename_pattern
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.eos_token_id = tokenizer.eos_token_id
+        self.pad_token_id = tokenizer.pad_token_id
+
+        self.all_files = sorted(Path.cwd().glob(filename_pattern))
+        assert len(self.all_files) > 0, f"No files found matching pattern: {filename_pattern}"
+
+    def __iter__(self):
+        """Generate batches, with each process taking every num_processes-th batch."""
+        batch_count = 0
+        batch_chunks: List[torch.Tensor] = []
+
+        for file in self.all_files:
+            raw_tokens = _load_data_shard(file)
+
+            eos_positions = (raw_tokens == self.eos_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) == 0:
+                continue
+
+            chunk_parts: List[torch.Tensor] = []
+            chunk_len = 0
+            prev_start = 0
+
+            for i in range(len(eos_positions)):
+                curr_eos = eos_positions[i].item()
+                doc = raw_tokens[prev_start:curr_eos + 1]
+                prev_start = curr_eos + 1
+                doc_len = len(doc)
+
+                if doc_len > self.max_length:
+                    if chunk_len > 0:
+                        padding = torch.full((self.max_length - chunk_len,), self.pad_token_id, dtype=torch.uint8)
+                        batch_chunks.append(torch.cat(chunk_parts + [padding]).to(torch.int32))
+                        chunk_parts = []
+                        chunk_len = 0
+                        if len(batch_chunks) == self.batch_size:
+                            if batch_count % self.num_processes == self.process_rank:
+                                yield torch.stack(batch_chunks)
+                            batch_count += 1
+                            batch_chunks = []
+                    batch_chunks.append(doc[:self.max_length].clone().to(torch.int32))
+                    if len(batch_chunks) == self.batch_size:
+                        if batch_count % self.num_processes == self.process_rank:
+                            yield torch.stack(batch_chunks)
+                        batch_count += 1
+                        batch_chunks = []
+                    continue
+
+                if doc_len + chunk_len > self.max_length:
+                    padding = torch.full((self.max_length - chunk_len,), self.pad_token_id, dtype=torch.uint8)
+                    batch_chunks.append(torch.cat(chunk_parts + [padding]).to(torch.int32))
+                    chunk_parts = []
+                    chunk_len = 0
+                    if len(batch_chunks) == self.batch_size:
+                        if batch_count % self.num_processes == self.process_rank:
+                            yield torch.stack(batch_chunks)
+                        batch_count += 1
+                        batch_chunks = []
+
+                chunk_parts.append(doc)
+                chunk_len += doc_len
+
+                if chunk_len == self.max_length:
+                    batch_chunks.append(torch.cat(chunk_parts).to(torch.int32))
+                    chunk_parts = []
+                    chunk_len = 0
+                    if len(batch_chunks) == self.batch_size:
+                        if batch_count % self.num_processes == self.process_rank:
+                            yield torch.stack(batch_chunks)
+                        batch_count += 1
+                        batch_chunks = []
+
+            # Flush remaining chunk from this file
+            if chunk_len > 0:
+                padding = torch.full((self.max_length - chunk_len,), self.pad_token_id, dtype=torch.uint8)
+                batch_chunks.append(torch.cat(chunk_parts + [padding]).to(torch.int32))
+                if len(batch_chunks) == self.batch_size:
+                    if batch_count % self.num_processes == self.process_rank:
+                        yield torch.stack(batch_chunks)
+                    batch_count += 1
+                    batch_chunks = []
+
+        # Drop partial batches to maintain fixed (B, max_length) shape
+
+
+class ChunkedEvalLoader:
+    """Chunk-aligned evaluation loader.
+
+    Yields (B, max_length) int32 tensors of raw input_ids on CPU.
+    Distributes data by sequence across processes.
+    """
+
+    def __init__(
+        self,
+        filename_pattern: str,
+        max_length: int,
+        micro_batch_tokens: int,
+        process_rank: int,
+        num_processes: int,
+        tokenizer: EsmTokenizer,
+    ):
+        self.max_length = max_length
+        batch_size = micro_batch_tokens // max_length
+        assert batch_size >= 1, f"micro_batch_tokens ({micro_batch_tokens}) must be >= max_length ({max_length})"
+
+        self._dataset = ChunkedEvalDataset(
+            filename_pattern=filename_pattern,
+            max_length=max_length,
+            batch_size=batch_size,
+            process_rank=process_rank,
+            num_processes=num_processes,
+            tokenizer=tokenizer,
+        )
+        self.files = self._dataset.all_files
+
+        self.dataloader = DataLoader(
+            self._dataset,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=True,
+        )
+        self._iterator = None
+        self._exhausted = False
+
+    def reset(self):
+        """Reset the dataloader iterator."""
+        self._iterator = iter(self.dataloader)
+        self._exhausted = False
+
+    def next_batch(self) -> torch.Tensor:
+        """Get next batch of raw input_ids (B, max_length) on CPU."""
+        if self._iterator is None:
+            self.reset()
+
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            self._exhausted = True
+            return torch.empty(0, dtype=torch.int32)

@@ -63,15 +63,22 @@ class SelfAttention(nn.Module):
             vi: Optional[torch.Tensor] = None,
             **kwargs,
         ) -> torch.Tensor:
-        l, d = x.size() # batch size must be 1 for FlexAttention
+        # Support both (L, D) legacy format and (B, L, D) batched format
+        squeeze_out = False
+        if x.dim() == 2:
+            x = x.unsqueeze(0)  # (L, D) -> (1, L, D)
+            squeeze_out = True
+            if vi is not None:
+                vi = vi.unsqueeze(0)
+
+        B, l, d = x.size()
         q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
 
-        q = q.view(1, l, self.n_heads, self.d_head)
-        k = k.view(1, l, self.n_heads, self.d_head)
-        v = v.view(1, l, self.n_heads, self.d_head)
+        q = q.view(B, l, self.n_heads, self.d_head)
+        k = k.view(B, l, self.n_heads, self.d_head)
+        v = v.view(B, l, self.n_heads, self.d_head)
 
         if self.unet and vi is not None:
-            # Reshape vi from (l, d) to (1, l, n_heads, d_head) to match v's shape
             v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v)
         
         q, k = norm(q), norm(k)
@@ -87,6 +94,9 @@ class SelfAttention(nn.Module):
             block_mask=attention_mask,
             enable_gqa=True,
         )
-        y = y.transpose(1, 2).contiguous().view_as(x)
+        y = y.transpose(1, 2).contiguous().view(B, l, d)
         y = self.Wo(y)
+
+        if squeeze_out:
+            y = y.squeeze(0)
         return y

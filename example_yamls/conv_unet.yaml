@@ -1,0 +1,72 @@
+# Synthyra Conv UNet Configuration
+# Uses batched UNet transformer with Swin-style patch merging/expanding
+# max_length must be a power of 2 for the UNet downsampling to work
+# CLI arguments will override these values where provided
+# Security note: tokens (--hf_token, --wandb_token) must be passed via CLI
+
+# General Configuration
+save_path: "Synthyra/speedrun_conv_unet"
+data_name: "uniref50"
+num_chunks: 197
+log_name: null
+
+# Distributed Training & Reproducibility
+seed: 42
+clear_cache_every: 1000
+grad_clip: 0.0
+auto_grad_clip: true
+auto_grad_clip_p: 10.0
+
+# Model Architecture
+hidden_size: 768
+num_attention_heads: 6
+num_hidden_layers: 0  # Not used for conv_unet
+num_unet_layers: 12   # 6 encoder + 6 decoder
+num_extra_layers: 2    # Extra full-resolution transformer layers after UNet
+vocab_size: 33
+expansion_ratio: 2.0
+soft_logit_cap: 32.0
+tie_embeddings: false
+unet: false            # Standard UNet off
+conv_unet: true        # Batched Conv UNet on
+token_dropout: false
+bfloat16: true
+compile_model: true
+compile_flex_attention: true
+
+# Data & MLM Configuration
+mlm: true
+masked_diffusion: false
+mask_rate: 0.3
+starting_mask_rate: 0.1
+mask_rate_steps: 10000
+mask_rate_schedule: true
+
+# Optimization & Schedule
+batch_size: 524288     # Total tokens across all GPUs
+grad_accum: 8
+num_steps: 50000
+cooldown_steps: 10000
+max_length: 1024       # Must be power of 2 for patch merging
+scheduler_type: "cosine"
+lr_warmup_steps: 1000
+
+# Adam Optimizer Parameters
+lr: 0.0001
+lr_embed: 0.001
+lr_head: 0.001
+lr_scalar: 0.001
+
+# Muon Optimizer Parameters
+use_muon: true
+lr_hidden: 0.001
+muon_momentum_warmup_steps: 300
+
+# Evaluation & Logging
+eval_every: 1000
+hf_model_name: "lhallee/speedrun_conv_unet"
+save_every: null
+
+# Dataloader Parameters
+num_workers: 4
+prefetch_factor: 8
