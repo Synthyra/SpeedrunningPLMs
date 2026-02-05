@@ -348,6 +348,7 @@ class BatchedValueEmbedding(nn.Module):
         return encoder_ve, decoder_ve
 
 
+@torch.compiler.disable
 def precompute_multiresolution_masks(
     input_ids: torch.Tensor,
     cls_token_id: int,
@@ -358,6 +359,11 @@ def precompute_multiresolution_masks(
     device: torch.device,
 ) -> List[Optional[object]]:
     """Pre-compute flex attention block masks at each UNet resolution level.
+
+    This function is excluded from torch.compile via @torch.compiler.disable because
+    create_block_mask is designed to run outside compiled regions, and tensors captured
+    by mask_mod closures must be real (eager) tensors -- not Inductor ComputedBuffers
+    with FlexibleLayout, which cause LoweringException in flex_attention_backward.
 
     Args:
         input_ids: (B, L) token IDs
@@ -374,16 +380,12 @@ def precompute_multiresolution_masks(
     B, L = input_ids.shape
 
     # Compute document IDs from CLS token positions (CLS marks start of each document)
-    # .contiguous() is critical: tensors captured by mask_mod closures MUST have
-    # FixedLayout for torch.compile's Inductor backend. Without it, .max().values
-    # and similar ops produce FlexibleLayout tensors that cause LoweringException
-    # in flex_attention_backward.
-    doc_ids = (input_ids == cls_token_id).cumsum(dim=1).contiguous()  # (B, L)
+    doc_ids = (input_ids == cls_token_id).cumsum(dim=1)  # (B, L)
 
     # Find last real (non-pad) token position per batch element
     is_real = (input_ids != pad_token_id)
     positions = torch.arange(L, device=device).expand(B, L)
-    last_real = torch.where(is_real, positions, torch.zeros_like(positions)).max(dim=1).values.contiguous()  # (B,)
+    last_real = torch.where(is_real, positions, torch.zeros_like(positions)).max(dim=1).values  # (B,)
 
     masks = []
     current_doc_ids = doc_ids
@@ -418,7 +420,7 @@ def precompute_multiresolution_masks(
 
         # Downsample doc_ids and last_real for next level
         if current_L > 1:
-            current_doc_ids = current_doc_ids.view(B, current_L // 2, 2).max(dim=-1).values.contiguous()
+            current_doc_ids = current_doc_ids.view(B, current_L // 2, 2).max(dim=-1).values
             current_last_real = current_last_real // 2
             current_L = current_L // 2
 
