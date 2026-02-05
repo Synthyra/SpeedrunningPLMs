@@ -189,8 +189,6 @@ This script will automatically:
 | `--vocab_size` | int | 33 | Vocabulary size. |
 | `--expansion_ratio` | float | 2.6667 | Expansion ratio for MLP (8/3). |
 | `--soft_logit_cap` | float | 32.0 | Soft logit cap for output logits. |
-| `--attention_soft_cap` | float | 64.0 | Attention softmax cap. |
-| `--add_att_soft_cap` | bool | True | Whether to add attention softmax cap. |
 | `--tie_embeddings` | flag | False | Tie input and output embeddings. |
 | `--unet` | bool | True | Use UNet architecture. |
 | `--token_dropout` | bool | True | Use token dropout. |

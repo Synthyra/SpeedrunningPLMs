@@ -5,7 +5,6 @@ import math
 from typing import Optional
 from torch.nn.attention.flex_attention import flex_attention
 
-from model.flex_mods import generate_tanh_softcap
 from model.utils import norm, Linear
 
 
@@ -52,10 +51,6 @@ class SelfAttention(nn.Module):
         if config.unet:
             self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
 
-        if config.attention_soft_cap:
-            self.soft_cap_mod = generate_tanh_softcap(config.attention_soft_cap, approx=True)
-        else:
-            self.soft_cap_mod = None
         self.unet = config.unet
 
     def forward(
@@ -83,7 +78,7 @@ class SelfAttention(nn.Module):
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
-            score_mod=self.soft_cap_mod,
+            score_mod=None,
             block_mask=attention_mask,
             enable_gqa=True,
         )

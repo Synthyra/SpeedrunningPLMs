@@ -81,14 +81,15 @@ def arg_parser():
     # Model hyperparams
     parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size of the model")
     parser.add_argument("--num_attention_heads", type=int, default=6, help="Number of attention heads")
-    parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers")
+    parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers (for non-unet)")
+    parser.add_argument("--num_unet_layers", type=int, default=0, help="Number of Conv1D UNet layers (encoder + decoder)")
+    parser.add_argument("--num_extra_layers", type=int, default=0, help="Number of extra transformer layers after UNet")
     parser.add_argument("--vocab_size", type=int, default=33, help="Vocabulary size")
     parser.add_argument("--expansion_ratio", type=float, default=2.0, help="Expansion ratio for MLP")
     parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
-    parser.add_argument("--attention_soft_cap", type=float, default=64.0, help="Attention softmax cap")
-    parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
-    parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
+    parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture (skip connections only)")
+    parser.add_argument("--conv_unet", action="store_true", help="Use Conv1D UNet with downsampling")
     parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
     
@@ -509,7 +510,7 @@ class Trainer:
                 num_training_steps=self.args.num_steps
             )
             lr_schedulers.append(muon_scheduler)
-        sliding_window_size_scheduler = LerpTensor(start_val=512, end_val=self.args.max_length, precision=128)
+        sliding_window_size_scheduler = LerpTensor(start_val=1024, end_val=self.args.max_length, precision=128)
         if self.args.mask_rate_schedule:
             mask_rate_scheduler = LerpFloat(
                 start_val=self.args.starting_mask_rate, 
@@ -893,15 +894,18 @@ if __name__ == '__main__':
         hidden_size=args.hidden_size,
         num_attention_heads=args.num_attention_heads,
         num_hidden_layers=args.num_hidden_layers,
+        num_unet_layers=args.num_unet_layers,
+        num_extra_layers=args.num_extra_layers,
+        max_length=args.max_length,
         vocab_size=args.vocab_size,
         expansion_ratio=args.expansion_ratio,
         soft_logit_cap=args.soft_logit_cap,
-        attention_soft_cap=args.attention_soft_cap,
-        add_att_soft_cap=args.add_att_soft_cap,
         tie_embeddings=args.tie_embeddings,
         unet=args.unet,
+        conv_unet=args.conv_unet,
         mlm=args.mlm or args.masked_diffusion,
         masked_diffusion=args.masked_diffusion,
+        token_dropout=args.token_dropout,
     )
 
     # Initialize wandb before clearing tokens for security
