@@ -7,14 +7,14 @@
 bugfix: false
 save_path: "Synthyra/speedrun_test"
 data_name: "uniref50"
-num_chunks: 197
+num_chunks: 100
 log_name: null # If null, a random UUID will be generated
 
 # Distributed Training & Reproducibility
 seed: 42
 clear_cache_every: 1000
 grad_clip: 0.0
-auto_grad_clip: true
+auto_grad_clip: false
 auto_grad_clip_p: 10.0
 
 # Model Architecture
@@ -29,8 +29,8 @@ soft_logit_cap: 32.0
 tie_embeddings: false
 unet: true
 conv_unet: false # Use Conv1D UNet with downsampling
-token_dropout: false
-bfloat16: true
+token_dropout: true
+bfloat16: false
 compile_model: true
 compile_flex_attention: true
 dynamo_recompile_limit: 32
@@ -38,16 +38,16 @@ dynamo_recompile_limit: 32
 # Data & MLM Configuration
 mlm: true
 masked_diffusion: false
-mask_rate: 0.3
+mask_rate: 0.2
 starting_mask_rate: 0.1
-mask_rate_steps: 10000
-mask_rate_schedule: true
+mask_rate_steps: 2500
+mask_rate_schedule: false
 
 # Optimization & Schedule
 batch_size: 524288 # Total tokens across all GPUs
-grad_accum: 8
+grad_accum: 1
 num_steps: 50000
-cooldown_steps: 10000
+cooldown_steps: 5000
 max_length: 2048
 scheduler_type: "cosine"
 lr_warmup_steps: 1000
@@ -59,7 +59,7 @@ lr_head: 0.001
 lr_scalar: 0.001
 
 # Muon Optimizer Parameters
-use_muon: true
+use_muon: false
 lr_hidden: 0.001
 muon_momentum_warmup_steps: 300
 

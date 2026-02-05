@@ -64,7 +64,7 @@ muon_momentum_warmup_steps: 10
 
 # Evaluation & Logging
 eval_every: 50
-hf_model_name: null
+hf_model_name: "Synthyra/debug_conv_unet"
 save_every: null
 
 # Dataloader Parameters
