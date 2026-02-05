@@ -18,8 +18,11 @@ auto_grad_clip: true
 auto_grad_clip_p: 10.0
 
 # Model Architecture
+# NOTE: More heads allow greater hidden dim growth in the UNet (Swin-style).
+# With 12 heads and hidden=768: head_dim=64 at base, grows to 128 at deepest.
+# With only 6 heads: hidden dimension is capped to keep head_dim <= 128.
 hidden_size: 768
-num_attention_heads: 6
+num_attention_heads: 12
 num_hidden_layers: 0  # Not used for conv_unet
 num_unet_layers: 12   # 6 encoder + 6 decoder
 num_extra_layers: 2    # Extra full-resolution transformer layers after UNet

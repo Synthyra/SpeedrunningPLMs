@@ -67,26 +67,37 @@ class ESMOutput(ModelOutput):
     last_hidden_state: Optional[torch.Tensor] = None
 
 
-def get_hidden_sizes(hidden_size: int, num_encoder_layers: int, num_attention_heads: int = 1) -> List[int]:
+def get_hidden_sizes(hidden_size: int, num_encoder_layers: int, num_attention_heads: int = 1, max_head_dim: int = 128) -> List[int]:
     """Returns hidden size for each encoder layer, rounded to multiples of 64 and num_attention_heads.
-    Scales from hidden_size to hidden_size * 2 at the bottleneck.
-    
+    Scales from hidden_size toward hidden_size * 2 at the bottleneck, capped so that
+    head_dim (hidden / num_heads) never exceeds max_head_dim.
+
+    This cap prevents Triton shared memory overflow in flex_attention kernels.
+    For more hidden dimension growth, increase num_attention_heads (Swin Transformer style).
+
     Args:
         hidden_size: Base hidden size
         num_encoder_layers: Number of encoder layers
         num_attention_heads: Number of attention heads (hidden size must be divisible by this)
+        max_head_dim: Maximum per-head dimension (default 128, safe for Triton SRAM)
     """
-    # Find LCM of 64 and num_attention_heads for GPU efficiency and head divisibility
     from math import gcd
+    # Find LCM of 64 and num_attention_heads for GPU efficiency and head divisibility
     alignment = (64 * num_attention_heads) // gcd(64, num_attention_heads)
-    
+    # Maximum hidden size enforced by head_dim constraint
+    max_hidden = num_attention_heads * max_head_dim
+    # Round max_hidden down to alignment
+    max_hidden = (max_hidden // alignment) * alignment
+
     sizes = []
     for i in range(num_encoder_layers):
         # Linear interpolation from 1.0 to 2.0
         scale = 1.0 + (i / max(num_encoder_layers - 1, 1))
         raw_size = hidden_size * scale
-        # Round to nearest multiple of alignment for GPU efficiency and head divisibility
+        # Round up to nearest alignment
         rounded = int(((raw_size + alignment - 1) // alignment) * alignment)
+        # Clamp to max_hidden to prevent head_dim overflow
+        rounded = min(rounded, max_hidden)
         sizes.append(rounded)
     return sizes
 
