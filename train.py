@@ -499,7 +499,8 @@ class Trainer:
         if self.args.use_muon:
             hidden_matrix_params = [
                 p for n, p in self.model.named_parameters() 
-                if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
+                if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower()
+                and "x0_projection" not in n.lower() and p.requires_grad
             ]
             embed_params = [
                 p for n, p in self.model.named_parameters() if "embed" in n.lower() and p.requires_grad
@@ -511,10 +512,14 @@ class Trainer:
                 p for n, p in self.model.named_parameters() 
                 if p.ndim < 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
             ]
+            projection_params = [
+                p for n, p in self.model.named_parameters() if "x0_projection" in n.lower() and p.requires_grad
+            ]
             optimizer1 = torch.optim.Adam([
                 dict(params=embed_params, lr=self.args.lr_embed),
                 dict(params=head_params, lr=self.args.lr_head),
-                dict(params=scalar_params, lr=self.args.lr_scalar)
+                dict(params=scalar_params, lr=self.args.lr_scalar),
+                dict(params=projection_params, lr=self.args.lr_hidden),
             ], betas=(0.8, 0.95), fused=True)
             optimizer2 = Muon(hidden_matrix_params, lr=self.args.lr_hidden, momentum=0.95)
             optimizers = [optimizer1, optimizer2]
