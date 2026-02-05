@@ -21,7 +21,7 @@ class PLMConfig(PretrainedConfig):
         num_hidden_layers: int = 12,
         num_unet_layers: int = 0,
         num_extra_layers: int = 0,
-        max_length: int = 1024,
+        max_sequence_length: int = 1024,
         vocab_size: int = 33,
         expansion_ratio: float = 2.0,
         soft_logit_cap: float = 16.0,
@@ -41,7 +41,7 @@ class PLMConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_unet_layers = num_unet_layers
         self.num_extra_layers = num_extra_layers
-        self.max_length = max_length
+        self.max_sequence_length = max_sequence_length
         self.vocab_size = vocab_size
         self.expansion_ratio = expansion_ratio
         self.soft_logit_cap = soft_logit_cap
@@ -442,16 +442,16 @@ class BatchedUnetTransformer(nn.Module):
     def __init__(self, config: PLMConfig):
         super().__init__()
         assert config.num_unet_layers % 2 == 0, "num_unet_layers must be even"
-        assert config.max_length > 0 and (config.max_length & (config.max_length - 1)) == 0, \
-            f"max_length must be a power of 2 for PatchMerge, got {config.max_length}"
+        assert config.max_sequence_length > 0 and (config.max_sequence_length & (config.max_sequence_length - 1)) == 0, \
+            f"max_sequence_length must be a power of 2 for PatchMerge, got {config.max_sequence_length}"
 
         self.num_encoder_layers = config.num_unet_layers // 2
         self.num_decoder_layers = config.num_unet_layers // 2
         self.base_hidden_size = config.hidden_size
-        self.max_length = config.max_length
+        self.max_sequence_length = config.max_sequence_length
 
         # Vector depth: after this many downsamplings, seq_len=1
-        self.vector_depth = int(math.log2(config.max_length))
+        self.vector_depth = int(math.log2(config.max_sequence_length))
 
         # Hidden sizes for each encoder layer depth
         self.hidden_sizes = get_hidden_sizes(config.hidden_size, self.num_encoder_layers, config.num_attention_heads)
@@ -995,6 +995,7 @@ if __name__ == "__main__":
         num_hidden_layers=24,
         expansion_ratio=8/3,
         unet=True,
+        max_sequence_length=1024,
     )
     model = PLM(config).cuda()
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -1020,7 +1021,7 @@ if __name__ == "__main__":
         num_attention_heads=6,
         num_unet_layers=8,  # 4 encoder + 4 decoder
         num_extra_layers=2,
-        max_length=max_length,
+        max_sequence_length=max_length,
         expansion_ratio=8/3,
         conv_unet=True,
     )
@@ -1057,7 +1058,7 @@ if __name__ == "__main__":
         num_attention_heads=6,
         num_unet_layers=20,  # 10 encoder + 10 decoder (some will be MLPs)
         num_extra_layers=1,
-        max_length=128,  # log2(128)=7, so layers 7+ become MLPs
+        max_sequence_length=128,  # log2(128)=7, so layers 7+ become MLPs
         expansion_ratio=8/3,
         conv_unet=True,
     )

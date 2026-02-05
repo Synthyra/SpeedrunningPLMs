@@ -1114,7 +1114,7 @@ if __name__ == '__main__':
         num_hidden_layers=args.num_hidden_layers,
         num_unet_layers=args.num_unet_layers,
         num_extra_layers=args.num_extra_layers,
-        max_length=args.max_length,
+        max_sequence_length=args.max_length,
         vocab_size=args.vocab_size,
         expansion_ratio=args.expansion_ratio,
         soft_logit_cap=args.soft_logit_cap,
