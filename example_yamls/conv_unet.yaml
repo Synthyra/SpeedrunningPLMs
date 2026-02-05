@@ -26,7 +26,7 @@ hidden_size: 768
 num_attention_heads: 12
 num_hidden_layers: 0  # Not used for conv_unet
 num_unet_layers: 12   # 6 encoder + 6 decoder
-num_extra_layers: 2    # Extra full-resolution transformer layers after UNet
+num_extra_layers: 4    # Extra full-resolution transformer layers after UNet
 vocab_size: 33
 expansion_ratio: 2.0
 soft_logit_cap: 32.0
@@ -43,8 +43,8 @@ dynamo_recompile_limit: 32
 mlm: true
 masked_diffusion: false
 mask_rate: 0.2
-starting_mask_rate: 0.5
-mask_rate_steps: 5000
+starting_mask_rate: 0.1
+mask_rate_steps: 2500
 mask_rate_schedule: true
 
 # Optimization & Schedule
@@ -65,7 +65,7 @@ lr_scalar: 0.005
 # Muon Optimizer Parameters
 use_muon: true
 lr_hidden: 0.005
-muon_momentum_warmup_steps: 100
+muon_momentum_warmup_steps: 300
 
 # Evaluation & Logging
 eval_every: 1000
