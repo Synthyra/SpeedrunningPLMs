@@ -947,6 +947,7 @@ class PLM(PreTrainedModel):
                     shutil.copy2(src_path, Path(tmpdir) / src_file)
 
             api = HfApi()
+            api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
             api.upload_folder(
                 folder_path=tmpdir,
                 repo_id=repo_id,
@@ -969,6 +970,7 @@ class PLM(PreTrainedModel):
             self.save_pretrained(tmpdir)
 
             api = HfApi()
+            api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
             api.upload_folder(
                 folder_path=tmpdir,
                 repo_id=repo_id,
