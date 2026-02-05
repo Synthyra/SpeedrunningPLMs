@@ -490,6 +490,7 @@ class FlexTransformerBlock(nn.Module):
         num_attention_heads: int,
         expansion_ratio: float, 
         base_hidden_size: int = None,
+        compile_flex_attention: bool = True,
     ):
         super().__init__()
         # Create a minimal config-like object for SelfAttention
@@ -498,6 +499,7 @@ class FlexTransformerBlock(nn.Module):
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             unet=True,  # Enable value embedding mixing
+            compile_flex_attention=compile_flex_attention,
         )
         self.attn = SelfAttention(config)
         
@@ -628,6 +630,7 @@ class ConvUnetTransformer(nn.Module):
                         num_attention_heads=config.num_attention_heads,
                         expansion_ratio=config.expansion_ratio,
                         base_hidden_size=self.base_hidden_size,
+                        compile_flex_attention=config.compile_flex_attention,
                     )
                 )
             
@@ -675,6 +678,7 @@ class ConvUnetTransformer(nn.Module):
                         num_attention_heads=config.num_attention_heads,
                         expansion_ratio=config.expansion_ratio,
                         base_hidden_size=self.base_hidden_size,
+                        compile_flex_attention=config.compile_flex_attention,
                     )
                 )
         
