@@ -43,9 +43,9 @@ dynamo_recompile_limit: 32
 mlm: true
 masked_diffusion: false
 mask_rate: 0.2
-starting_mask_rate: 0.1
+starting_mask_rate: 0.2
 mask_rate_steps: 2500
-mask_rate_schedule: true
+mask_rate_schedule: false
 
 # Optimization & Schedule
 batch_size: 1048576     # Total tokens across all GPUs
