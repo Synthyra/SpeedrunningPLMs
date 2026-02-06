@@ -1,5 +1,5 @@
 # Speedrunning Protein Language Model Training
-<img width="2816" height="1536" alt="Gemini_Generated_Image_9tyuaz9tyuaz9tyu" src="https://github.com/user-attachments/assets/a5ad1595-6da6-41e2-b6f5-a7a2bc9ef1fb" />
+<img width="1000", alt="Repo Image" src="assets/speedrun_image.png">
 
 Please reach out to Logan Hallee at `lhallee@udel.edu` with any questions. Feel free to open up a GitHub issue with suggestions, or pull request to contribute!
 
@@ -189,8 +189,6 @@ This script will automatically:
 | `--vocab_size` | int | 33 | Vocabulary size. |
 | `--expansion_ratio` | float | 2.6667 | Expansion ratio for MLP (8/3). |
 | `--soft_logit_cap` | float | 32.0 | Soft logit cap for output logits. |
-| `--attention_soft_cap` | float | 64.0 | Attention softmax cap. |
-| `--add_att_soft_cap` | bool | True | Whether to add attention softmax cap. |
 | `--tie_embeddings` | flag | False | Tie input and output embeddings. |
 | `--unet` | bool | True | Use UNet architecture. |
 | `--token_dropout` | bool | True | Use token dropout. |

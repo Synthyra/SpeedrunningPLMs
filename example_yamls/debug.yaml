@@ -4,6 +4,7 @@
 # Security note: tokens (--hf_token, --wandb_token) must be passed via CLI
 
 # General Configuration
+bugfix: true
 save_path: "Synthyra/debug_test"
 data_name: "uniref50"
 num_chunks: 10
@@ -20,15 +21,19 @@ auto_grad_clip_p: 10.0
 hidden_size: 128
 num_attention_heads: 2
 num_hidden_layers: 2
+num_unet_layers: 0
+num_extra_layers: 0
 vocab_size: 33
 expansion_ratio: 2.0
 soft_logit_cap: 16.0
-attention_soft_cap: 64.0
-add_att_soft_cap: false
 tie_embeddings: false
 unet: true
+conv_unet: false
 token_dropout: true
 bfloat16: true
+compile_model: false
+compile_flex_attention: true
+dynamo_recompile_limit: 32
 
 # Data & MLM Configuration
 mlm: false

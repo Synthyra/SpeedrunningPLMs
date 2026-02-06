@@ -19,24 +19,24 @@ import argparse
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch._inductor.config as inductor_config
+
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
 from tqdm import tqdm
 from pathlib import Path
-from sklearn.metrics import (
-    precision_score,
-    recall_score,
-    f1_score,
-    accuracy_score,
-    matthews_corrcoef
-)
 
 from data.download_data import get as ensure_hf_file
 from model.model import PLM, PLMConfig
-from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
+from data.dataloading import (
+    OptimizedTrainLoader,
+    OptimizedEvalLoader,
+    ChunkedTrainLoader,
+    ChunkedEvalLoader,
+    AsyncBatchPipeline,
+    apply_masking_gpu,
+)
 from optimizer import Muon
 from utils import (
     set_seed,
@@ -51,9 +51,6 @@ from utils import (
 
 if os.environ['WANDB_AVAILABLE'] == 'true':
     import wandb
-
-
-inductor_config.max_autotune_gemm_backends = "ATEN,CUTLASS,FBGEMM"
 
 
 def arg_parser():
@@ -81,16 +78,20 @@ def arg_parser():
     # Model hyperparams
     parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size of the model")
     parser.add_argument("--num_attention_heads", type=int, default=6, help="Number of attention heads")
-    parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers")
+    parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers (for non-unet)")
+    parser.add_argument("--num_unet_layers", type=int, default=0, help="Number of Conv1D UNet layers (encoder + decoder)")
+    parser.add_argument("--num_extra_layers", type=int, default=0, help="Number of extra transformer layers after UNet")
     parser.add_argument("--vocab_size", type=int, default=33, help="Vocabulary size")
     parser.add_argument("--expansion_ratio", type=float, default=2.0, help="Expansion ratio for MLP")
     parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
-    parser.add_argument("--attention_soft_cap", type=float, default=64.0, help="Attention softmax cap")
-    parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
-    parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
+    parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture (skip connections only)")
+    parser.add_argument("--conv_unet", action="store_true", help="Use Conv1D UNet with downsampling")
     parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
+    parser.add_argument("--compile_model", type=bool, default=True, help="Use torch.compile on the full model")
+    parser.add_argument("--compile_flex_attention", type=bool, default=True, help="Compile flex_attention for fused attention")
+    parser.add_argument("--dynamo_recompile_limit", type=int, default=32, help="Dynamo recompile limit for torch.compile")
     
     # Data hyperparams
     parser.add_argument("--mlm", action="store_true", help="Use masked language modeling")
@@ -168,8 +169,8 @@ class Trainer:
         # Initialize global timer
         self.train_timer = GlobalTimer()
         
-        # Initialize mask rate tracking
-        self.current_mask_rate = 0.0
+        # Initialize mask rate tracking (used directly for conv_unet GPU-side masking)
+        self.current_mask_rate = args.mask_rate if args.mlm else 1.0
         
         # Initialize auto gradient clipper
         self.auto_grad_clipper = None
@@ -208,9 +209,21 @@ class Trainer:
             wandb.log({f'{prefix}/{k}': v for k, v in log_dict.items()})
 
     @staticmethod
-    def _calculate_metrics(preds: torch.Tensor, labels: torch.Tensor):
+    def _update_confusion(confusion: torch.Tensor, preds: torch.Tensor, labels: torch.Tensor):
         valid_mask = labels != -100
         if not valid_mask.any():
+            return
+        valid_preds = preds[valid_mask].view(-1).to(dtype=torch.int64, device='cpu')
+        valid_labels = labels[valid_mask].view(-1).to(dtype=torch.int64, device='cpu')
+        num_classes = confusion.shape[0]
+        indices = valid_labels * num_classes + valid_preds
+        counts = torch.bincount(indices, minlength=num_classes * num_classes)
+        confusion += counts.view(num_classes, num_classes)
+
+    @staticmethod
+    def _calculate_metrics_from_confusion(confusion: torch.Tensor):
+        total = int(confusion.sum().item())
+        if total == 0:
             return {
                 "accuracy": 0.0,
                 "precision": 0.0,
@@ -219,15 +232,35 @@ class Trainer:
                 "mcc": 0.0,
                 "num_tokens": 0,
             }
-        valid_preds = preds[valid_mask].cpu().numpy()
-        valid_labels = labels[valid_mask].cpu().numpy()
+        confusion_f = confusion.to(dtype=torch.float64)
+        tp = torch.diag(confusion_f)
+        actual = confusion_f.sum(dim=1)
+        predicted = confusion_f.sum(dim=0)
+        precision = torch.where(predicted > 0, tp / predicted, torch.zeros_like(tp))
+        recall = torch.where(actual > 0, tp / actual, torch.zeros_like(tp))
+        f1 = torch.where(
+            precision + recall > 0,
+            2.0 * precision * recall / (precision + recall),
+            torch.zeros_like(tp),
+        )
+        weighted_precision = (precision * actual).sum().item() / total
+        weighted_recall = (recall * actual).sum().item() / total
+        weighted_f1 = (f1 * actual).sum().item() / total
+        correct = tp.sum().item()
+        numerator = correct * total - (predicted * actual).sum().item()
+        denom_left = total * total - (predicted * predicted).sum().item()
+        denom_right = total * total - (actual * actual).sum().item()
+        if denom_left <= 0 or denom_right <= 0:
+            mcc = 0.0
+        else:
+            mcc = numerator / math.sqrt(denom_left * denom_right)
         return {
-            "accuracy": accuracy_score(valid_labels, valid_preds),
-            "precision": precision_score(valid_labels, valid_preds, average="weighted", zero_division=0),
-            "recall": recall_score(valid_labels, valid_preds, average="weighted", zero_division=0),
-            "f1": f1_score(valid_labels, valid_preds, average="weighted", zero_division=0),
-            "mcc": matthews_corrcoef(valid_labels, valid_preds),
-            "num_tokens": int(valid_labels.shape[0]),
+            "accuracy": correct / total,
+            "precision": weighted_precision,
+            "recall": weighted_recall,
+            "f1": weighted_f1,
+            "mcc": mcc,
+            "num_tokens": total,
         }
 
     @staticmethod
@@ -242,6 +275,13 @@ class Trainer:
         if not self.master_process:
             return
         pad_token_id = self.pad_token_id
+        # Flatten batched tensors to 1D for preview
+        if input_ids.dim() == 2:
+            input_ids = input_ids.view(-1)
+        if labels.dim() == 2:
+            labels = labels.view(-1)
+        if logits.dim() == 3:
+            logits = logits.view(-1, logits.shape[-1])
         assert input_ids.dim() == 1, f"Expected input_ids to be 1D (seq_len,) but got: {input_ids.shape}"
         assert labels.dim() == 1, f"Expected labels to be 1D (seq_len,) but got: {labels.shape}"
         assert logits.dim() == 2, f"Expected logits to be 2D (seq_len, vocab_size) but got: {logits.shape}"
@@ -355,6 +395,12 @@ class Trainer:
 
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.pad_token_id = self.tokenizer.pad_token_id
+        self.mask_token_id = self.tokenizer.mask_token_id
+        # Special tokens tensor for GPU-side masking (moved to GPU lazily)
+        self._special_tokens_cpu = torch.tensor(
+            [self.tokenizer.cls_token_id, self.tokenizer.eos_token_id, self.pad_token_id],
+            dtype=torch.int32,
+        )
 
         # Ensure dataset is available locally (master process only), then sync
         if self.master_process:
@@ -404,41 +450,71 @@ class Trainer:
         self.optimizers = self.init_optimizers()
         self.lr_schedulers, self.sliding_window_size_scheduler, self.mask_rate_scheduler = self.init_schedulers()
         self.print0(f"Ready for training!")
+
+        # Push code + config to HF Hub once so the repo is ready for inference
+        if self.master_process and self.args.hf_model_name:
+            self.print0(f"Pushing code and config to {self.args.hf_model_name}...")
+            model_ref = self.model.module if self.ddp_world_size > 1 else self.model
+            model_ref.push_code_and_config_to_hub(self.args.hf_model_name)
+            self.print0("Code and config pushed to hub.")
         
         # Create decorated versions of methods that should be excluded from timing
         self._run_eval_loader_timed = exclude_from_timer(self.train_timer)(self.run_eval_loader)
         self._save_checkpoint_timed = exclude_from_timer(self.train_timer)(self.save_checkpoint)
 
     def init_dataloader(self, filename_pattern, training=True):
-        if training:
-            if self.args.mlm:
-                mask_rate = self.args.mask_rate
+        if self.args.conv_unet:
+            # Chunked loader for batched UNet: yields (B, max_length) raw input_ids
+            if training:
+                loader = ChunkedTrainLoader(
+                    filename_pattern=filename_pattern,
+                    max_length=self.args.max_length,
+                    micro_batch_tokens=self.batch_size,
+                    process_rank=self.ddp_rank,
+                    num_processes=self.ddp_world_size,
+                    max_epochs=1,
+                    tokenizer=self.tokenizer,
+                    num_workers=self.args.num_workers,
+                    prefetch_factor=self.args.prefetch_factor,
+                )
+                return AsyncBatchPipeline(loader)
             else:
-                # we set to 1.0, which properly scales the masked diffusion random mask rate
-                # we can schedule the mask rate with any float, which is torch.rand(1) * mask_rate
-                mask_rate = 1.0
-
-            return OptimizedTrainLoader(
-                filename_pattern=filename_pattern,
-                seq_len=self.batch_size,
-                process_rank=self.ddp_rank,
-                num_processes=self.ddp_world_size,
-                max_epochs=1,
-                tokenizer=self.tokenizer,
-                num_workers=self.args.num_workers,
-                prefetch_factor=self.args.prefetch_factor,
-                mlm=self.args.mlm or self.args.masked_diffusion,
-                mask_rate=mask_rate,
-            )
+                loader = ChunkedEvalLoader(
+                    filename_pattern=filename_pattern,
+                    max_length=self.args.max_length,
+                    micro_batch_tokens=self.batch_size,
+                    process_rank=self.ddp_rank,
+                    num_processes=self.ddp_world_size,
+                    tokenizer=self.tokenizer,
+                )
+                return AsyncBatchPipeline(loader)
         else:
-            # Use evaluation dataloader that distributes data by sequences, not files
-            return OptimizedEvalLoader(
-                filename_pattern=filename_pattern,
-                seq_len=self.batch_size,
-                process_rank=self.ddp_rank,
-                num_processes=self.ddp_world_size,
-                tokenizer=self.tokenizer,
-            )
+            # Legacy loader for standard/unet: yields (input_ids, labels, mask_rate)
+            if training:
+                if self.args.mlm:
+                    mask_rate = self.args.mask_rate
+                else:
+                    mask_rate = 1.0
+                return OptimizedTrainLoader(
+                    filename_pattern=filename_pattern,
+                    seq_len=self.batch_size,
+                    process_rank=self.ddp_rank,
+                    num_processes=self.ddp_world_size,
+                    max_epochs=1,
+                    tokenizer=self.tokenizer,
+                    num_workers=self.args.num_workers,
+                    prefetch_factor=self.args.prefetch_factor,
+                    mlm=self.args.mlm or self.args.masked_diffusion,
+                    mask_rate=mask_rate,
+                )
+            else:
+                return OptimizedEvalLoader(
+                    filename_pattern=filename_pattern,
+                    seq_len=self.batch_size,
+                    process_rank=self.ddp_rank,
+                    num_processes=self.ddp_world_size,
+                    tokenizer=self.tokenizer,
+                )
 
     def init_model(self):
         self.print0("Initializing model...")
@@ -452,10 +528,12 @@ class Trainer:
         if self.ddp_world_size > 1:
             dist.barrier()
 
-        self.print0("Calling torch.compile()")
-        # Enable scalar output capture for .item() calls in compiled functions
-        #torch._dynamo.config.capture_scalar_outputs = True
-        model = torch.compile(model)
+        if self.args.compile_model:
+            self.print0("Calling torch.compile()")
+            torch._dynamo.config.recompile_limit = self.args.dynamo_recompile_limit
+            model = torch.compile(model)
+        else:
+            self.print0("Skipping torch.compile()")
         
         if self.ddp_world_size > 1:
             # Use static graph if model architecture doesn't change
@@ -467,7 +545,8 @@ class Trainer:
         if self.args.use_muon:
             hidden_matrix_params = [
                 p for n, p in self.model.named_parameters() 
-                if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
+                if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower()
+                and "x0_projection" not in n.lower() and p.requires_grad
             ]
             embed_params = [
                 p for n, p in self.model.named_parameters() if "embed" in n.lower() and p.requires_grad
@@ -479,10 +558,14 @@ class Trainer:
                 p for n, p in self.model.named_parameters() 
                 if p.ndim < 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
             ]
+            projection_params = [
+                p for n, p in self.model.named_parameters() if "x0_projection" in n.lower() and p.requires_grad
+            ]
             optimizer1 = torch.optim.Adam([
                 dict(params=embed_params, lr=self.args.lr_embed),
                 dict(params=head_params, lr=self.args.lr_head),
-                dict(params=scalar_params, lr=self.args.lr_scalar)
+                dict(params=scalar_params, lr=self.args.lr_scalar),
+                dict(params=projection_params, lr=self.args.lr_hidden),
             ], betas=(0.8, 0.95), fused=True)
             optimizer2 = Muon(hidden_matrix_params, lr=self.args.lr_hidden, momentum=0.95)
             optimizers = [optimizer1, optimizer2]
@@ -509,7 +592,7 @@ class Trainer:
                 num_training_steps=self.args.num_steps
             )
             lr_schedulers.append(muon_scheduler)
-        sliding_window_size_scheduler = LerpTensor(start_val=512, end_val=self.args.max_length, precision=128)
+        sliding_window_size_scheduler = LerpTensor(start_val=1024, end_val=self.args.max_length, precision=128)
         if self.args.mask_rate_schedule:
             mask_rate_scheduler = LerpFloat(
                 start_val=self.args.starting_mask_rate, 
@@ -529,15 +612,30 @@ class Trainer:
         loader.reset()
         self.model.eval()
 
+        # Move special tokens to GPU once
+        special_tokens_gpu = self._special_tokens_cpu.to(self.device)
+
         losses, total_tokens = [], 0
-        all_preds, all_labels = [], []
+        confusion = torch.zeros((self.args.vocab_size, self.args.vocab_size), dtype=torch.int64)
         preview_done = False
-        input_ids, labels, mask_rate = loader.next_batch()
+
+        if self.args.conv_unet:
+            # Chunked loader: yields (B, max_length) raw input_ids on GPU
+            raw_ids = loader.next_batch()
+        else:
+            # Legacy loader: yields (input_ids, labels, mask_rate) on GPU
+            input_ids, labels, mask_rate = loader.next_batch()
+            raw_ids = input_ids  # Use input_ids for the loop condition
         
         # Only show progress bar on master process
         pbar = tqdm(desc=f'{prefix} set', leave=False, disable=not self.master_process)
         
-        while input_ids.numel():
+        while raw_ids.numel():
+            if self.args.conv_unet:
+                # Apply masking on GPU with fixed eval mask rate
+                input_ids, labels, mask_rate = apply_masking_gpu(
+                    raw_ids, special_tokens_gpu, self.mask_token_id, mask_rate=0.15, mlm=True,
+                )
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
             total_tokens += batch_valid_tokens
             loss, logits = self.model(
@@ -549,23 +647,22 @@ class Trainer:
             )
             losses.append(loss.item())
             preds = logits.argmax(dim=-1)
-            all_preds.append(preds.detach())
-            all_labels.append(labels.detach())
+            self._update_confusion(confusion, preds.detach(), labels.detach())
             if not preview_done:
                 self._print_val_preview(input_ids, labels, logits)
                 preview_done = True
-            input_ids, labels, mask_rate = loader.next_batch()
+
+            if self.args.conv_unet:
+                raw_ids = loader.next_batch()
+            else:
+                input_ids, labels, mask_rate = loader.next_batch()
+                raw_ids = input_ids
             pbar.update(1)
         pbar.close()
 
         avg_loss = sum(losses) / len(losses) if losses else 0.0
 
-        if all_preds:
-            all_preds = torch.cat([p.flatten() for p in all_preds])
-            all_labels = torch.cat([l.flatten() for l in all_labels])
-            metrics = self._calculate_metrics(all_preds, all_labels)
-        else:
-            metrics = self._calculate_metrics(torch.empty(0), torch.empty(0))
+        metrics = self._calculate_metrics_from_confusion(confusion)
 
         if self.ddp_world_size > 1:
             # Convert to tensors before all_reduce
@@ -600,16 +697,12 @@ class Trainer:
             else:
                 model = self.model
 
+            # Always save locally
             log = dict(step=step, model=model.state_dict(), optimizers=[opt.state_dict() for opt in self.optimizers])
-            if self.args.hf_model_name:
-                try:
-                    model.push_to_hub(self.args.hf_model_name, subfolder='step%06d' % step)
-                except Exception as e:
-                    self.print0(e)
-                    self.print0(f'Pushing failed, defaulting to local save')
-                    torch.save(log, 'logs/state_step%06d.pt' % step)
-            else:
-                torch.save(log, 'logs/state_step%06d.pt' % step)
+            os.makedirs('logs', exist_ok=True)
+            torch.save(log, 'logs/state_step%06d.pt' % step)
+            model.save_weights_local('checkpoints', step)
+            self.print0(f'Checkpoint saved locally at step {step}')
         
         # Synchronize after saving
         if self.ddp_world_size > 1:
@@ -622,6 +715,10 @@ class Trainer:
         if step % self.args.clear_cache_every == 0:
             torch.cuda.empty_cache()
         
+        # Move special tokens to GPU once (cached after first call)
+        if not hasattr(self, '_special_tokens_gpu'):
+            self._special_tokens_gpu = self._special_tokens_cpu.to(self.device)
+        
         # Accumulate losses for proper averaging
         accumulated_loss = 0.0
         
@@ -631,16 +728,28 @@ class Trainer:
                 if self.ddp_world_size > 1 and i < self.args.grad_accum - 1:
                     stack.enter_context(self.model.no_sync())
                 
-                input_ids, labels, mask_rate = self.train_loader.next_batch()
-                
-                # Check if dataloader is exhausted (returns empty tensors)
-                if input_ids.numel() == 0:
-                    # Reset the dataloader and get a fresh batch
-                    self.train_loader.reset()
+                if self.args.conv_unet:
+                    # Chunked pipeline: yields raw (B, max_length) on GPU
+                    raw_ids = self.train_loader.next_batch()
+                    if raw_ids.numel() == 0:
+                        self.train_loader.reset()
+                        raw_ids = self.train_loader.next_batch()
+                        assert raw_ids.numel() > 0, "Dataloader returned empty batch even after reset"
+                    # Apply masking on GPU
+                    input_ids, labels, mask_rate = apply_masking_gpu(
+                        raw_ids,
+                        self._special_tokens_gpu,
+                        self.mask_token_id,
+                        mask_rate=self.current_mask_rate,
+                        mlm=self.args.mlm or (self.args.masked_diffusion and self.current_mask_rate < 1.0),
+                    )
+                else:
+                    # Legacy pipeline: yields (input_ids, labels, mask_rate) on GPU
                     input_ids, labels, mask_rate = self.train_loader.next_batch()
-                    # Double-check we have valid data after reset
                     if input_ids.numel() == 0:
-                        raise RuntimeError("Dataloader returned empty batch even after reset")
+                        self.train_loader.reset()
+                        input_ids, labels, mask_rate = self.train_loader.next_batch()
+                        assert input_ids.numel() > 0, "Dataloader returned empty batch even after reset"
                 
                 loss = self.model(
                     input_ids=input_ids,
@@ -720,11 +829,18 @@ class Trainer:
                     else:
                         mask_rate = self.mask_rate_scheduler(frac_done_mask)
                     self.current_mask_rate = mask_rate
-                    self.train_loader.set_mask_rate(mask_rate)
-                    if self.args.masked_diffusion and frac_done_mask > 1 and self.train_loader.mlm:
-                        self.train_loader.set_mlm(False)
-                        model_for_mlm = self.model.module if self.ddp_world_size > 1 else self.model
-                        model_for_mlm.mlm = False
+                    if self.args.conv_unet:
+                        # For conv_unet, mask_rate is applied in train_step via apply_masking_gpu
+                        if self.args.masked_diffusion and frac_done_mask > 1:
+                            model_for_mlm = self.model.module if self.ddp_world_size > 1 else self.model
+                            model_for_mlm.mlm = False
+                    else:
+                        # Legacy path: push mask_rate to data loader workers
+                        self.train_loader.set_mask_rate(mask_rate)
+                        if self.args.masked_diffusion and frac_done_mask > 1 and self.train_loader.mlm:
+                            self.train_loader.set_mlm(False)
+                            model_for_mlm = self.model.module if self.ddp_world_size > 1 else self.model
+                            model_for_mlm.mlm = False
                 # once in a while evaluate the validation dataset
                 if self.args.eval_every > 0 and step % self.args.eval_every == 0:
                     val_loss, val_perplexity, val_tokens, val_metrics = self._run_eval_loader_timed(
@@ -805,8 +921,14 @@ class Trainer:
             self.print0(f'Train Time: {final_training_time_sec:.0f}s | Step Avg: {final_training_time_sec/timed_steps:.2f}s')
             self.print0(f'Total train time (min): {final_training_time_sec / 60:.2f}')
             self.print0(f'Total train time (hours): {final_training_time_sec / 3600:.2f}')
-            # save the model to huggingface
+            # Save final checkpoint locally
             self._save_checkpoint_timed(self.args.num_steps)
+            # Push final weights to HF Hub
+            if self.master_process and self.args.hf_model_name:
+                self.print0(f"Pushing final weights to {self.args.hf_model_name}...")
+                model_ref = self.model.module if self.ddp_world_size > 1 else self.model
+                model_ref.push_weights_to_hub(self.args.hf_model_name)
+                self.print0("Final weights pushed to hub.")
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -881,7 +1003,6 @@ if __name__ == '__main__':
         args.auto_grad_clip = True
         args.grad_clip = 0.0  # Disable regular grad clip for bugfix testing
 
-
     # Validate mode arguments
     if args.mlm and args.masked_diffusion:
         raise ValueError("Only one of --mlm or --masked_diffusion can be true.")
@@ -893,15 +1014,19 @@ if __name__ == '__main__':
         hidden_size=args.hidden_size,
         num_attention_heads=args.num_attention_heads,
         num_hidden_layers=args.num_hidden_layers,
+        num_unet_layers=args.num_unet_layers,
+        num_extra_layers=args.num_extra_layers,
+        max_sequence_length=args.max_length,
         vocab_size=args.vocab_size,
         expansion_ratio=args.expansion_ratio,
         soft_logit_cap=args.soft_logit_cap,
-        attention_soft_cap=args.attention_soft_cap,
-        add_att_soft_cap=args.add_att_soft_cap,
         tie_embeddings=args.tie_embeddings,
         unet=args.unet,
+        conv_unet=args.conv_unet,
         mlm=args.mlm or args.masked_diffusion,
         masked_diffusion=args.masked_diffusion,
+        token_dropout=args.token_dropout,
+        compile_flex_attention=args.compile_flex_attention,
     )
 
     # Initialize wandb before clearing tokens for security

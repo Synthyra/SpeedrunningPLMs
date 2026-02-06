@@ -5,7 +5,6 @@ import math
 from typing import Optional
 from torch.nn.attention.flex_attention import flex_attention
 
-from model.flex_mods import generate_tanh_softcap
 from model.utils import norm, Linear
 
 
@@ -52,11 +51,10 @@ class SelfAttention(nn.Module):
         if config.unet:
             self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
 
-        if config.attention_soft_cap:
-            self.soft_cap_mod = generate_tanh_softcap(config.attention_soft_cap, approx=True)
-        else:
-            self.soft_cap_mod = None
         self.unet = config.unet
+        self.flex_attention = flex_attention
+        if config.compile_flex_attention:
+            self.flex_attention = torch.compile(flex_attention)
 
     def forward(
             self,
@@ -65,28 +63,40 @@ class SelfAttention(nn.Module):
             vi: Optional[torch.Tensor] = None,
             **kwargs,
         ) -> torch.Tensor:
-        l, d = x.size() # batch size must be 1 for FlexAttention
+        # Support both (L, D) legacy format and (B, L, D) batched format
+        squeeze_out = False
+        if x.dim() == 2:
+            x = x.unsqueeze(0)  # (L, D) -> (1, L, D)
+            squeeze_out = True
+            if vi is not None:
+                vi = vi.unsqueeze(0)
+
+        B, l, d = x.size()
         q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
 
-        q = q.view(1, l, self.n_heads, self.d_head)
-        k = k.view(1, l, self.n_heads, self.d_head)
-        v = v.view(1, l, self.n_heads, self.d_head)
+        q = q.view(B, l, self.n_heads, self.d_head)
+        k = k.view(B, l, self.n_heads, self.d_head)
+        v = v.view(B, l, self.n_heads, self.d_head)
 
         if self.unet and vi is not None:
-            # Reshape vi from (l, d) to (1, l, n_heads, d_head) to match v's shape
             v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v)
         
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
+        if attention_mask is None:
+            assert l <= 1, "attention_mask is required for seq_len > 1 to avoid dense attention"
         
-        y = flex_attention(
+        y = self.flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
-            score_mod=self.soft_cap_mod,
+            score_mod=None,
             block_mask=attention_mask,
             enable_gqa=True,
         )
-        y = y.transpose(1, 2).contiguous().view_as(x)
+        y = y.transpose(1, 2).contiguous().view(B, l, d)
         y = self.Wo(y)
+
+        if squeeze_out:
+            y = y.squeeze(0)
         return y

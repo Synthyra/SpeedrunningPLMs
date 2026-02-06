@@ -1,0 +1,72 @@
+# Synthyra Conv UNet Debug Configuration
+# Small model for quick testing of the batched UNet pipeline
+# CLI arguments will override these values where provided
+
+# General Configuration
+bugfix: true
+save_path: "Synthyra/debug_conv_unet"
+data_name: "uniref50"
+num_chunks: 10
+log_name: "debug_conv_unet"
+
+# Distributed Training & Reproducibility
+seed: 42
+clear_cache_every: 100
+grad_clip: 0.0
+auto_grad_clip: true
+auto_grad_clip_p: 10.0
+
+# Model Architecture
+hidden_size: 128
+num_attention_heads: 2
+num_hidden_layers: 0
+num_unet_layers: 4    # 2 encoder + 2 decoder
+num_extra_layers: 1
+vocab_size: 33
+expansion_ratio: 2.0
+soft_logit_cap: 16.0
+tie_embeddings: false
+unet: false
+conv_unet: true
+token_dropout: false
+bfloat16: true
+compile_model: false   # Faster startup for debugging
+compile_flex_attention: true
+dynamo_recompile_limit: 32
+
+# Data & MLM Configuration
+mlm: true
+masked_diffusion: false
+mask_rate: 0.15
+starting_mask_rate: 0.1
+mask_rate_steps: 100
+mask_rate_schedule: false
+
+# Optimization & Schedule
+batch_size: 8192
+grad_accum: 1
+num_steps: 100
+cooldown_steps: 10
+max_length: 128        # Small power of 2 for quick tests
+scheduler_type: "cosine"
+lr_warmup_steps: 10
+
+# Adam Optimizer Parameters
+lr: 0.0001
+lr_embed: 0.001
+lr_head: 0.001
+lr_scalar: 0.001
+
+# Muon Optimizer Parameters
+use_muon: true
+lr_hidden: 0.001
+muon_momentum_warmup_steps: 10
+
+# Evaluation & Logging
+eval_every: 50
+hf_model_name: "Synthyra/debug_conv_unet"
+save_every: null
+
+# Dataloader Parameters
+num_workers: 2
+prefetch_factor: 2
