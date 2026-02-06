@@ -1,5 +1,5 @@
 # Speedrunning Protein Language Model Training
-<img width="1000", alt="Repo Image" src="assets/speedrun_image.png">
+![Repo Image](assets/speedrun_image.png)
 
 Please reach out to Logan Hallee at `lhallee@udel.edu` with any questions. Feel free to open up a GitHub issue with suggestions, or pull request to contribute!
 
