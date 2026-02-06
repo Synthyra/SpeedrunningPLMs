@@ -34,6 +34,7 @@ This project aims to democratize protein language model (pLM) training by reduci
 ## Table of Contents
 
 - [Introduction](#introduction)
+- [Model Architectures](#model-architectures)
 - [Getting Started](#getting-started)
 - [Running Experiments](#running-experiments)
 - [Performance Benchmarks](#performance-benchmarks)
@@ -63,6 +64,125 @@ Recent work suggests this may no longer be a significant limitation. Several stu
 Additional research directions include direct encoder-decoder architectures to stratify representation learning and generative capabilities, autoencoders, and clever regularization at intermediate transformer layers.
 
 Another limitation of traditional pLM training lies in MLM itself, which results in poor generation capabilities and hampers protein design prospects. Recent work from our group introduced [DSM](https://github.com/Gleghorn-Lab/DSM), which reformats pLM MLM into masked diffusion, enhancing generative qualities. However, naive replacement of MLM with masked diffusion in speedrun contexts doesn't work perfectly. A warmup strategy from fixed-rate MLM to variable-rate masked diffusion may provide optimal results for both objectives.
+
+## Model Architectures
+
+We provide three model architecture options, ranging from standard baselines to highly optimized experimental designs.
+
+### 1. Regular Transformer
+The standard encoder-only architecture (like BERT/ESM) where the sequence length and hidden dimension remain constant throughout all layers. This serves as a strong baseline.
+
+```mermaid
+flowchart TB
+    subgraph Input
+        emb[Embedding Layer]
+    end
+
+    subgraph Encoder[Encoder Layers]
+        L1[TransformerBlock 1]
+        L2[TransformerBlock 2]
+        LN[... TransformerBlock N]
+    end
+
+    subgraph Output
+        head[LM Head]
+    end
+
+    emb --> L1 --> L2 --> LN --> head
+```
+
+### 2. Conv1D UNet Transformer
+A U-Net style architecture that uses Conv1D for downsampling and ConvTranspose1D for upsampling. It progressively reduces sequence length while increasing hidden dimension, allowing the model to process information at hierarchically different resolutions.
+
+```mermaid
+flowchart TB
+    subgraph Input
+        emb[Embedding Layer<br/>seq_len x hidden_size]
+    end
+    
+    subgraph Encoder[Encoder Path]
+        e0[TransformerBlock 0<br/>FULL RESOLUTION<br/>1024 x 768]
+        down1[Conv1D Downsample]
+        e1[TransformerBlock 1<br/>512 x 832]
+        down2[Conv1D Downsample]
+        e2[TransformerBlock 2<br/>256 x 896]
+        down3[...]
+        eN[MLP Block if seq=1]
+    end
+    
+    subgraph Decoder[Decoder Path]
+        dN[MLP Block if seq=1]
+        up1[ConvTranspose1D Upsample]
+        d2[TransformerBlock + Skip<br/>256 x 896]
+        up2[ConvTranspose1D Upsample]
+        d1[TransformerBlock + Skip<br/>512 x 832]
+        up3[ConvTranspose1D Upsample]
+        d0[TransformerBlock N<br/>FULL RESOLUTION<br/>1024 x 768]
+    end
+    
+    subgraph ExtraLayers[Extra Sequential Layers]
+        ex1[TransformerBlock<br/>Full Resolution]
+        ex2[TransformerBlock<br/>Full Resolution]
+    end
+    
+    subgraph Output
+        head[LM Head]
+    end
+    
+    emb --> e0
+    e0 --> down1 --> e1 --> down2 --> e2 --> down3 --> eN
+    eN --> dN --> up1 --> d2 --> up2 --> d1 --> up3 --> d0
+    d0 --> ex1 --> ex2 --> head
+    
+    e0 -.->|skip| d0
+    e1 -.->|skip| d1
+    e2 -.->|skip| d2
+```
+
+### 3. Patch UNet Transformer
+An optimized U-Net architecture designed for speed. It uses "Patch Merging" (concatenating adjacent tokens) for downsampling instead of convolutions, which is faster and cleaner. It operates on batched inputs `(B, L)` and efficiently handles document boundaries and padding without complex dynamic shape logic.
+
+```mermaid
+flowchart TB
+    subgraph InputProcessing[Input Processing]
+        flat["flat tokens (total_tokens,)"]
+        reshape["reshape to (B, max_length)"]
+        docids["compute doc_ids per chunk"]
+        masks["pre-compute block masks at all resolutions"]
+    end
+
+    subgraph Encoder[Encoder Path]
+        enc0["TransformerBlock at (B, L, D0)"]
+        pm0["PatchMerge -> (B, L/2, D1)"]
+        enc1["TransformerBlock at (B, L/2, D1)"]
+        pm1["PatchMerge -> (B, L/4, D2)"]
+        encN["... deeper levels or BottleneckMLP"]
+    end
+
+    subgraph Decoder[Decoder Path]
+        decN["... BottleneckMLP or TransformerBlock"]
+        pe1["PatchExpand -> (B, L/2, D1)"]
+        dec1["TransformerBlock + Skip at (B, L/2, D1)"]
+        pe0["PatchExpand -> (B, L, D0)"]
+        dec0["TransformerBlock + Skip at (B, L, D0)"]
+    end
+
+    subgraph ExtraLayers[Extra Layers]
+        extra["N x TransformerBlock at full resolution"]
+    end
+
+    subgraph Output[Output]
+        head["LM Head -> (B, L, vocab_size)"]
+        loss["CrossEntropyLoss on flattened logits"]
+    end
+
+    flat --> reshape --> docids --> masks
+    masks --> enc0 --> pm0 --> enc1 --> pm1 --> encN
+    encN --> decN --> pe1 --> dec1 --> pe0 --> dec0
+    enc0 -.->|skip| dec0
+    enc1 -.->|skip| dec1
+    dec0 --> extra --> head --> loss
+```
 
 ## Getting Started
 
