@@ -21,14 +21,14 @@ auto_grad_clip_p: 10.0
 hidden_size: 768
 num_attention_heads: 6
 num_hidden_layers: 24
-num_unet_layers: 0 # Number of layers for Conv1D UNet (set to > 0 to use)
+num_unet_layers: 0 # Number of layers for Patch UNet (set to > 0 to use)
 num_extra_layers: 0 # Number of extra transformer layers after UNet
 vocab_size: 33
 expansion_ratio: 2.0
 soft_logit_cap: 32.0
 tie_embeddings: false
 unet: true
-conv_unet: false # Use Conv1D UNet with downsampling
+patch_unet: false # Use Patch UNet with downsampling
 token_dropout: true
 bfloat16: false
 compile_model: true

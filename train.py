@@ -86,7 +86,7 @@ def arg_parser():
     parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
     parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture (skip connections only)")
-    parser.add_argument("--conv_unet", action="store_true", help="Use Conv1D UNet with downsampling")
+    parser.add_argument("--patch_unet", action="store_true", help="Use Patch UNet with downsampling (Swin-style)")
     parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
     parser.add_argument("--compile_model", type=bool, default=True, help="Use torch.compile on the full model")
@@ -169,7 +169,7 @@ class Trainer:
         # Initialize global timer
         self.train_timer = GlobalTimer()
         
-        # Initialize mask rate tracking (used directly for conv_unet GPU-side masking)
+        # Initialize mask rate tracking (used directly for patch_unet GPU-side masking)
         self.current_mask_rate = args.mask_rate if args.mlm else 1.0
         
         # Initialize auto gradient clipper
@@ -463,7 +463,7 @@ class Trainer:
         self._save_checkpoint_timed = exclude_from_timer(self.train_timer)(self.save_checkpoint)
 
     def init_dataloader(self, filename_pattern, training=True):
-        if self.args.conv_unet:
+        if self.args.patch_unet:
             # Chunked loader for batched UNet: yields (B, max_length) raw input_ids
             if training:
                 loader = ChunkedTrainLoader(
@@ -623,7 +623,7 @@ class Trainer:
         confusion = torch.zeros((self.args.vocab_size, self.args.vocab_size), dtype=torch.int64)
         preview_done = False
 
-        if self.args.conv_unet:
+        if self.args.patch_unet:
             # Chunked loader: yields (B, max_length) raw input_ids on GPU
             raw_ids = loader.next_batch()
         else:
@@ -635,7 +635,7 @@ class Trainer:
         pbar = tqdm(desc=f'{prefix} set', leave=False, disable=not self.master_process)
         
         while raw_ids.numel():
-            if self.args.conv_unet:
+            if self.args.patch_unet:
                 # Apply masking on GPU with fixed eval mask rate
                 input_ids, labels, mask_rate = apply_masking_gpu(
                     raw_ids, special_tokens_gpu, self.mask_token_id, mask_rate=0.15, mlm=True,
@@ -656,7 +656,7 @@ class Trainer:
                 self._print_val_preview(input_ids, labels, logits)
                 preview_done = True
 
-            if self.args.conv_unet:
+            if self.args.patch_unet:
                 raw_ids = loader.next_batch()
             else:
                 input_ids, labels, mask_rate = loader.next_batch()
@@ -732,7 +732,7 @@ class Trainer:
                 if self.ddp_world_size > 1 and i < self.args.grad_accum - 1:
                     stack.enter_context(self.model.no_sync())
                 
-                if self.args.conv_unet:
+                if self.args.patch_unet:
                     # Chunked pipeline: yields raw (B, max_length) on GPU
                     raw_ids = self.train_loader.next_batch()
                     if raw_ids.numel() == 0:
@@ -833,8 +833,8 @@ class Trainer:
                     else:
                         mask_rate = self.mask_rate_scheduler(frac_done_mask)
                     self.current_mask_rate = mask_rate
-                    if self.args.conv_unet:
-                        # For conv_unet, mask_rate is applied in train_step via apply_masking_gpu
+                    if self.args.patch_unet:
+                        # For patch_unet, mask_rate is applied in train_step via apply_masking_gpu
                         if self.args.masked_diffusion and frac_done_mask > 1:
                             model_for_mlm = self.model.module if self.ddp_world_size > 1 else self.model
                             model_for_mlm.mlm = False
@@ -1026,7 +1026,7 @@ if __name__ == '__main__':
         soft_logit_cap=args.soft_logit_cap,
         tie_embeddings=args.tie_embeddings,
         unet=args.unet,
-        conv_unet=args.conv_unet,
+        patch_unet=args.patch_unet,
         mlm=args.mlm or args.masked_diffusion,
         masked_diffusion=args.masked_diffusion,
         token_dropout=args.token_dropout,

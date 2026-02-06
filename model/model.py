@@ -28,7 +28,7 @@ class PLMConfig(PretrainedConfig):
         sliding_window_size: int = 2048,
         tie_embeddings: bool = False,
         unet: bool = False,
-        conv_unet: bool = False,
+        patch_unet: bool = False,
         mlm: bool = False,
         masked_diffusion: bool = False,
         token_dropout: bool = True,
@@ -48,7 +48,7 @@ class PLMConfig(PretrainedConfig):
         self.sliding_window_size = sliding_window_size
         self.tie_embeddings = tie_embeddings
         self.unet = unet
-        self.conv_unet = conv_unet
+        self.patch_unet = patch_unet
         self.mlm = mlm
         self.masked_diffusion = masked_diffusion
         self.token_dropout = token_dropout
@@ -661,11 +661,11 @@ class PLM(PreTrainedModel):
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
 
         self.unet = config.unet
-        self.conv_unet = config.conv_unet
+        self.patch_unet = config.patch_unet
         
-        if config.conv_unet:
+        if config.patch_unet:
             # Batched UNet with Swin-style patch merge/expand
-            assert config.num_unet_layers > 0, "num_unet_layers must be > 0 for conv_unet"
+            assert config.num_unet_layers > 0, "num_unet_layers must be > 0 for patch_unet"
             self.transformer = BatchedUnetTransformer(config)
             hidden_sizes = self.transformer.hidden_sizes
             self.value_embeds = BatchedValueEmbedding(config.vocab_size, hidden_sizes)
@@ -698,9 +698,9 @@ class PLM(PreTrainedModel):
         self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor:
-        if self.conv_unet:
+        if self.patch_unet:
             # Batched UNet path: input_ids is (B, L)
-            assert input_ids.dim() == 2, f"conv_unet expects (B, L) input, got shape {input_ids.shape}"
+            assert input_ids.dim() == 2, f"patch_unet expects (B, L) input, got shape {input_ids.shape}"
             B, L = input_ids.shape
 
             # Pre-compute multi-resolution block masks
@@ -795,18 +795,18 @@ class PLM(PreTrainedModel):
         """Mean-pool hidden states per document to get per-document embeddings.
         
         Args:
-            input_ids: (B, L) for conv_unet or (total_len,) for standard/unet
+            input_ids: (B, L) for patch_unet or (total_len,) for standard/unet
             sliding_window_size: Override sliding window size
         
         Returns:
-            For conv_unet (B, L): flattened (total_docs, hidden_size) across all batch elements
+            For patch_unet (B, L): flattened (total_docs, hidden_size) across all batch elements
             For standard (total_len,): (num_docs, hidden_size)
         """
         if sliding_window_size is None:
             sliding_window_size = self.sliding_window_size
         x = self.get_last_hidden_state(input_ids, sliding_window_size)
 
-        if self.conv_unet:
+        if self.patch_unet:
             # Batched: x is (B, L, D), input_ids is (B, L)
             B, L, D = x.shape
             doc_ids = (input_ids == self.cls_token_id).cumsum(dim=1)  # (B, L)
@@ -871,7 +871,7 @@ class PLM(PreTrainedModel):
         """Get LM logits without computing loss.
 
         Args:
-            input_ids: (B, L) for conv_unet or (total_len,) for standard/unet
+            input_ids: (B, L) for patch_unet or (total_len,) for standard/unet
             sliding_window_size: Override sliding window size
 
         Returns:
@@ -892,7 +892,7 @@ class PLM(PreTrainedModel):
         """Get per-sequence pooled embeddings.
 
         Args:
-            input_ids: (B, L) for conv_unet or (total_len,) for standard/unet
+            input_ids: (B, L) for patch_unet or (total_len,) for standard/unet
             sliding_window_size: Override sliding window size
             pooling: 'mean' for mean pooling over non-pad tokens, 'cls' for CLS token embedding
 
@@ -903,7 +903,7 @@ class PLM(PreTrainedModel):
             sliding_window_size = self.sliding_window_size
         hidden = self.get_last_hidden_state(input_ids, sliding_window_size)
 
-        if self.conv_unet:
+        if self.patch_unet:
             # Batched: hidden is (B, L, D), input_ids is (B, L)
             assert input_ids.dim() == 2
             B, L, D = hidden.shape
@@ -1013,20 +1013,20 @@ if __name__ == "__main__":
     print(f"Original UNet loss: {loss.item():.4f}")
 
     print("\n" + "=" * 80)
-    print("Testing Batched UNet Transformer (conv_unet)")
+    print("Testing Batched UNet Transformer (patch_unet)")
     print("=" * 80)
     max_length = 128  # Power of 2 for patch merging
-    conv_config = PLMConfig(
+    patch_config = PLMConfig(
         hidden_size=384,
         num_attention_heads=6,
         num_unet_layers=8,  # 4 encoder + 4 decoder
         num_extra_layers=2,
         max_sequence_length=max_length,
         expansion_ratio=8/3,
-        conv_unet=True,
+        patch_unet=True,
     )
-    conv_model = PLM(conv_config).cuda()
-    print(f"Model parameters: {sum(p.numel() for p in conv_model.parameters()):,}")
+    patch_model = PLM(patch_config).cuda()
+    print(f"Model parameters: {sum(p.numel() for p in patch_model.parameters()):,}")
 
     # Create batched test input (B, max_length) with packed documents per element
     B = 4
@@ -1042,13 +1042,13 @@ if __name__ == "__main__":
     batched_labels = batched_ids.clone()
     batched_labels[batched_labels != 32] = -100
 
-    loss = conv_model(batched_ids, batched_labels, mask_rate)
+    loss = patch_model(batched_ids, batched_labels, mask_rate)
     print(f"Batched UNet loss: {loss.item():.4f}")
 
-    print(f"\nHidden sizes: {conv_model.transformer.hidden_sizes}")
-    print(f"Vector depth (log2(max_length)): {conv_model.transformer.vector_depth}")
-    print(f"Num encoder layers: {conv_model.transformer.num_encoder_layers}")
-    print(f"Num decoder layers: {conv_model.transformer.num_decoder_layers}")
+    print(f"\nHidden sizes: {patch_model.transformer.hidden_sizes}")
+    print(f"Vector depth (log2(max_length)): {patch_model.transformer.vector_depth}")
+    print(f"Num encoder layers: {patch_model.transformer.num_encoder_layers}")
+    print(f"Num decoder layers: {patch_model.transformer.num_decoder_layers}")
 
     print("\n" + "=" * 80)
     print("Testing Batched UNet with deep layers (MLP at vector depth)")
@@ -1060,7 +1060,7 @@ if __name__ == "__main__":
         num_extra_layers=1,
         max_sequence_length=128,  # log2(128)=7, so layers 7+ become MLPs
         expansion_ratio=8/3,
-        conv_unet=True,
+        patch_unet=True,
     )
     deep_model = PLM(deep_config).cuda()
 
@@ -1086,7 +1086,7 @@ if __name__ == "__main__":
         input_ids=batched_ids,
         cls_token_id=0,
         pad_token_id=1,
-        num_levels=conv_model.transformer.num_resolution_levels,
+        num_levels=patch_model.transformer.num_resolution_levels,
         sliding_window_size=128,
         n_heads=6,
         device=batched_ids.device,

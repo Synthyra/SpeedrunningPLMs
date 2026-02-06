@@ -6,7 +6,7 @@
 
 # General Configuration
 bugfix: false
-save_path: "Synthyra/speedrun_conv_unet"
+save_path: "Synthyra/speedrun_patch_unet"
 data_name: "uniref50"
 num_chunks: 197
 log_name: null
@@ -24,7 +24,7 @@ auto_grad_clip_p: 10.0
 # With only 6 heads: hidden dimension is capped to keep head_dim <= 128.
 hidden_size: 768
 num_attention_heads: 12
-num_hidden_layers: 0  # Not used for conv_unet
+num_hidden_layers: 0  # Not used for patch_unet
 num_unet_layers: 12   # 6 encoder + 6 decoder
 num_extra_layers: 4    # Extra full-resolution transformer layers after UNet
 vocab_size: 33
@@ -32,7 +32,7 @@ expansion_ratio: 2.0
 soft_logit_cap: 32.0
 tie_embeddings: false
 unet: false            # Standard UNet off
-conv_unet: true        # Batched Conv UNet on
+patch_unet: true        # Batched Patch UNet on
 token_dropout: false
 bfloat16: true
 compile_model: true
@@ -69,7 +69,7 @@ muon_momentum_warmup_steps: 300
 
 # Evaluation & Logging
 eval_every: 1000
-hf_model_name: "lhallee/speedrun_conv_unet"
+hf_model_name: "lhallee/speedrun_patch_unet"
 save_every: null
 
 # Dataloader Parameters

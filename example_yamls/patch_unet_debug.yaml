@@ -4,10 +4,10 @@
 
 # General Configuration
 bugfix: true
-save_path: "Synthyra/debug_conv_unet"
+save_path: "Synthyra/debug_patch_unet"
 data_name: "uniref50"
 num_chunks: 10
-log_name: "debug_conv_unet"
+log_name: "debug_patch_unet"
 
 # Distributed Training & Reproducibility
 seed: 42
@@ -27,7 +27,7 @@ expansion_ratio: 2.0
 soft_logit_cap: 16.0
 tie_embeddings: false
 unet: false
-conv_unet: true
+patch_unet: true
 token_dropout: false
 bfloat16: true
 compile_model: false   # Faster startup for debugging
@@ -64,7 +64,7 @@ muon_momentum_warmup_steps: 10
 
 # Evaluation & Logging
 eval_every: 50
-hf_model_name: "Synthyra/debug_conv_unet"
+hf_model_name: "Synthyra/debug_patch_unet"
 save_every: null
 
 # Dataloader Parameters

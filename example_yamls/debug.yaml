@@ -28,7 +28,7 @@ expansion_ratio: 2.0
 soft_logit_cap: 16.0
 tie_embeddings: false
 unet: true
-conv_unet: false
+patch_unet: false
 token_dropout: true
 bfloat16: true
 compile_model: false

@@ -5,7 +5,7 @@
 
 # General Configuration
 bugfix: false
-save_path: "Synthyra/conv_unet_test"
+save_path: "Synthyra/patch_unet_test"
 data_name: "uniref50"
 num_chunks: 197
 log_name: null # If null, a random UUID will be generated
@@ -21,14 +21,14 @@ auto_grad_clip_p: 10.0
 hidden_size: 768
 num_attention_heads: 6
 num_hidden_layers: 24
-num_unet_layers: 12 # Number of layers for Conv1D UNet (set to > 0 to use)
+num_unet_layers: 12 # Number of layers for Patch UNet (set to > 0 to use)
 num_extra_layers: 4 # Number of extra transformer layers after UNet
 vocab_size: 33
 expansion_ratio: 2.0
 soft_logit_cap: 32.0
 tie_embeddings: false
 unet: true
-conv_unet: true # Use Conv1D UNet with downsampling
+patch_unet: true # Use Patch UNet with downsampling
 token_dropout: false
 bfloat16: true
 compile_model: true

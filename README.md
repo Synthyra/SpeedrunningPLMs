@@ -91,56 +91,36 @@ flowchart TB
     emb --> L1 --> L2 --> LN --> head
 ```
 
-### 2. Conv1D UNet Transformer
-A U-Net style architecture that uses Conv1D for downsampling and ConvTranspose1D for upsampling. It progressively reduces sequence length while increasing hidden dimension, allowing the model to process information at hierarchically different resolutions.
+### 2. Transformer UNet
+A U-Net architecture that uses skip connections between encoder and decoder layers, but maintains the same sequence length and hidden dimension throughout (no downsampling). This allows the model to mix features from early and late layers.
 
 ```mermaid
 flowchart TB
     subgraph Input
-        emb[Embedding Layer<br/>seq_len x hidden_size]
+        emb[Embedding Layer]
     end
-    
+
     subgraph Encoder[Encoder Path]
-        e0[TransformerBlock 0<br/>FULL RESOLUTION<br/>1024 x 768]
-        down1[Conv1D Downsample]
-        e1[TransformerBlock 1<br/>512 x 832]
-        down2[Conv1D Downsample]
-        e2[TransformerBlock 2<br/>256 x 896]
-        down3[...]
-        eN[MLP Block if seq=1]
+        e1[TransformerBlock 1]
+        e2[TransformerBlock 2]
     end
-    
+
     subgraph Decoder[Decoder Path]
-        dN[MLP Block if seq=1]
-        up1[ConvTranspose1D Upsample]
-        d2[TransformerBlock + Skip<br/>256 x 896]
-        up2[ConvTranspose1D Upsample]
-        d1[TransformerBlock + Skip<br/>512 x 832]
-        up3[ConvTranspose1D Upsample]
-        d0[TransformerBlock N<br/>FULL RESOLUTION<br/>1024 x 768]
+        d2[TransformerBlock 3 + Skip]
+        d1[TransformerBlock 4 + Skip]
     end
-    
-    subgraph ExtraLayers[Extra Sequential Layers]
-        ex1[TransformerBlock<br/>Full Resolution]
-        ex2[TransformerBlock<br/>Full Resolution]
-    end
-    
+
     subgraph Output
         head[LM Head]
     end
-    
-    emb --> e0
-    e0 --> down1 --> e1 --> down2 --> e2 --> down3 --> eN
-    eN --> dN --> up1 --> d2 --> up2 --> d1 --> up3 --> d0
-    d0 --> ex1 --> ex2 --> head
-    
-    e0 -.->|skip| d0
+
+    emb --> e1 --> e2 --> d2 --> d1 --> head
     e1 -.->|skip| d1
     e2 -.->|skip| d2
 ```
 
 ### 3. Patch UNet Transformer
-An optimized U-Net architecture designed for speed. It uses "Patch Merging" (concatenating adjacent tokens) for downsampling instead of convolutions, which is faster and cleaner. It operates on batched inputs `(B, L)` and efficiently handles document boundaries and padding without complex dynamic shape logic.
+An optimized U-Net architecture designed for speed. It uses "Patch Merging" (concatenating adjacent tokens) for downsampling, which is faster and cleaner than convolutions. It operates on batched inputs `(B, L)` and efficiently handles document boundaries and padding without complex dynamic shape logic.
 
 ```mermaid
 flowchart TB
