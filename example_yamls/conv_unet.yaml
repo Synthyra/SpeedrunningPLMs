@@ -58,13 +58,13 @@ lr_warmup_steps: 1000
 
 # Adam Optimizer Parameters
 lr: 0.001
-lr_embed: 0.005
-lr_head: 0.005
-lr_scalar: 0.005
+lr_embed: 0.05
+lr_head: 0.01
+lr_scalar: 0.05
 
 # Muon Optimizer Parameters
 use_muon: true
-lr_hidden: 0.005
+lr_hidden: 0.05
 muon_momentum_warmup_steps: 300
 
 # Evaluation & Logging

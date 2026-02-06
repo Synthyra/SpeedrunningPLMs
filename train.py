@@ -543,10 +543,9 @@ class Trainer:
     def init_optimizers(self):
         self.print0("Initializing optimizers...")
         if self.args.use_muon:
-            hidden_matrix_params = [
+            matrix_params = [
                 p for n, p in self.model.named_parameters() 
-                if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower()
-                and "x0_projection" not in n.lower() and p.requires_grad
+                if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
             ]
             embed_params = [
                 p for n, p in self.model.named_parameters() if "embed" in n.lower() and p.requires_grad
@@ -558,19 +557,24 @@ class Trainer:
                 p for n, p in self.model.named_parameters() 
                 if p.ndim < 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
             ]
-            projection_params = [
-                p for n, p in self.model.named_parameters() if "x0_projection" in n.lower() and p.requires_grad
-            ]
+            
+            # Confirm every parameter is mapped to an optimizer
+            all_params = [p for p in self.model.parameters() if p.requires_grad]
+            mapped_params = matrix_params + embed_params + head_params + scalar_params
+            assert len(all_params) == len(mapped_params), f"Muon parameter mapping mismatch: {len(all_params)} total vs {len(mapped_params)} mapped"
+            self.print0(f"Muon optimizer initialized: {len(matrix_params)} matrix, {len(embed_params)} embed, {len(head_params)} head, {len(scalar_params)} scalar params. Total: {len(all_params)}")
+
             optimizer1 = torch.optim.Adam([
                 dict(params=embed_params, lr=self.args.lr_embed),
                 dict(params=head_params, lr=self.args.lr_head),
                 dict(params=scalar_params, lr=self.args.lr_scalar),
-                dict(params=projection_params, lr=self.args.lr_hidden),
             ], betas=(0.8, 0.95), fused=True)
-            optimizer2 = Muon(hidden_matrix_params, lr=self.args.lr_hidden, momentum=0.95)
+            optimizer2 = Muon(matrix_params, lr=self.args.lr_hidden, momentum=0.95)
             optimizers = [optimizer1, optimizer2]
         else:
-            optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.lr)
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            self.print0(f"AdamW optimizer initialized with {len(params)} parameters.")
+            optimizer = torch.optim.AdamW(params, lr=self.args.lr)
             optimizers = [optimizer]
         return optimizers
     
