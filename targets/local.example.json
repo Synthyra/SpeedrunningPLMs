@@ -1,0 +1,6 @@
+{
+  "name": "local-gpu",
+  "hosts": [
+    {"host": null, "workdir": "/absolute/path/to/experiment-staging", "python": "/absolute/path/to/venv/bin/python", "gpus": 1}
+  ]
+}

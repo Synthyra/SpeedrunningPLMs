@@ -1,14 +1,23 @@
-# Data directories - these will be accessed via volume mount
-data/
-results/
-logs_to_keep/
+# Generated data payloads are accessed via a volume mount. Keep the root
+# compatibility modules and the packaged speedrunning_plms.data source code.
+/data/*
+!/data/
+!/data/*.py
+/results/
+/logs_to_keep/
+/runs/
+/targets.local.json
 
 # Cache directories
 .cache/
+.pytest_cache/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+build/
+dist/
 
 # Git files
 .git/
@@ -27,6 +36,7 @@ Thumbs.db
 
 # Python virtual environments
 venv/
+.venv/
 env/
 .env
 
@@ -45,4 +55,4 @@ logs/
 
 # Temporary files
 tmp/
-temp/ 
+temp/

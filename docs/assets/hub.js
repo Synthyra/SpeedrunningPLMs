@@ -1,63 +1,51 @@
-// docs/assets/hub.js
 (async () => {
+  const status = document.getElementById('load-status');
+  const sourceUrl = 'https://raw.githubusercontent.com/Synthyra/SpeedrunningPLMs/main/misc/experiments.tsv';
+
   try {
-    // Update the repository name to match the actual repository
-    const csvUrl = 'https://raw.githubusercontent.com/Synthyra/SpeedrunningPLMs/main/misc/experiments.tsv';
-    
-    console.log('Attempting to fetch CSV from:', csvUrl);
-
-    // Fetch & parse
-    const response = await fetch(csvUrl);
-    
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+    if (typeof Papa === 'undefined' || typeof DataTable === 'undefined') {
+      throw new Error('Table libraries could not load. Reload the page or open the source data.');
     }
-    
-    const csvText = await response.text();
-    console.log('CSV data received:', csvText.slice(0, 200) + '...');
-    
-    const { data, meta } = Papa.parse(csvText, { header: true, skipEmptyLines: true });
-    console.log('Parsed data:', data);
-    console.log('Meta fields:', meta.fields);
 
-    // Build the column list for DataTables from CSV headers
-    const columns = meta.fields.map(field => ({ title: field, data: field }));
+    const response = await fetch(sourceUrl);
+    if (!response.ok) {
+      throw new Error(`Source data request failed (HTTP ${response.status}).`);
+    }
 
-    // Inject DataTable
+    const { data, meta, errors } = Papa.parse(await response.text(), {
+      delimiter: '\t',
+      header: true,
+      skipEmptyLines: 'greedy',
+      transformHeader: header => header.trim(),
+    });
+    if (errors.length || !meta.fields?.length || !data.length) {
+      throw new Error('The source table is empty or malformed. Open the source data for details.');
+    }
+
+    const columns = meta.fields.map(field => {
+      const title = document.createElement('span');
+      title.textContent = field;
+      return {
+        title: title.innerHTML,
+        data: row => row[field],
+        defaultContent: '',
+        render: DataTable.render.text(),
+      };
+    });
     new DataTable('#exp-table', {
       data,
       columns,
-      responsive: true,
-      searchable: true,
-      sortable: true,
+      searching: true,
+      ordering: true,
       paging: true,
       pageLength: 25,
-      className: 'stripe hover',
-      // Optional: highlight good/bad results, etc.
-      createdRow: (row, rowData) => {
-        if (rowData.accuracy >= 0.90) row.classList.add('bg-green-50');
-        if (rowData.failed === 'yes') row.classList.add('bg-red-50');
-      },
+      order: [],
     });
-    
-    console.log('DataTable initialized successfully');
-    
+    status.textContent = `${data.length} historical experiments loaded.`;
   } catch (error) {
-    console.error('Error loading or processing data:', error);
-    
-    // Display error message to user
-    const tableContainer = document.getElementById('exp-table');
-    if (tableContainer) {
-      tableContainer.innerHTML = `
-        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded" role="alert">
-          <strong class="font-bold">Error loading data!</strong>
-          <span class="block sm:inline"> ${error.message}</span>
-          <details class="mt-2">
-            <summary class="cursor-pointer">Technical details</summary>
-            <pre class="mt-2 text-xs">${error.stack}</pre>
-          </details>
-        </div>
-      `;
-    }
+    console.error('Could not load historical experiments:', error);
+    status.textContent = error.message;
+    status.setAttribute('data-error', '');
+    status.setAttribute('role', 'alert');
   }
 })();

@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "tokenizer": {
+    "repo_id": "facebook/esm2_t33_650M_UR50D",
+    "revision": "08e4846e537177426273712802403f7ba8261b6c"
+  },
+  "models": [
+    {
+      "repo_id": "Synthyra/ESM2-8M",
+      "nickname": "ESM2-8M",
+      "revision": "185ecbd45665d050a8dae326d91886d330c5f9d0"
+    },
+    {
+      "repo_id": "Synthyra/ESM2-35M",
+      "nickname": "ESM2-35M",
+      "revision": "37ab9f56b41e365b3bd9e25d6fefe9150fd910f0"
+    },
+    {
+      "repo_id": "Synthyra/ESM2-150M",
+      "nickname": "ESM2-150M",
+      "revision": "979e0880dfc9e0c0080839b83d9d2dc05b92786a"
+    },
+    {
+      "repo_id": "Synthyra/ESMplusplus_small",
+      "nickname": "ESMC-300M",
+      "revision": "46c5f7d562e47d4c14165b424c71ab7db008e6fb"
+    },
+    {
+      "repo_id": "Synthyra/ESMplusplus_large",
+      "nickname": "ESMC-600M",
+      "revision": "f813401638b3fddab09748aec1ad2bf537aa4208"
+    },
+    {
+      "repo_id": "Synthyra/ESM2-650M",
+      "nickname": "ESM2-650M",
+      "revision": "ca0718a5d52b80d5c60dd76860e55e061a95fb0a"
+    },
+    {
+      "repo_id": "Synthyra/ESM2-3B",
+      "nickname": "ESM2-3B",
+      "revision": "ff89d0180f414ab9c677219a25da79bf09185456"
+    }
+  ],
+  "datasets": [
+    {
+      "name": "omg_prot50",
+      "repo_id": "Synthyra/omg_prot50",
+      "revision": "c5b07302de5fc0e2cac87933d9167e0b2d6f05c0",
+      "filename": "data/{split}-00000-of-00001.parquet"
+    },
+    {
+      "name": "og_prot90",
+      "repo_id": "Synthyra/og_prot90",
+      "revision": "322bcb78561007be855ccbf0b744f24bbec41c6b",
+      "filename": "data/{split}-00000-of-00001.parquet"
+    },
+    {
+      "name": "uniref50",
+      "repo_id": "Synthyra/uniref50",
+      "revision": "36d67a647c4c596664ad2284ca9ab571baff08b9",
+      "filename": "data/{split}-00000-of-00001.parquet"
+    }
+  ]
+}

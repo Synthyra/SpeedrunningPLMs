@@ -1,7 +1,14 @@
 omgprot50/
 __pycache__/
+.pytest_cache/
 *.parquet
 *.bin
 /logs
 /experiments/*.yaml
 /.cache
+*.egg-info/
+/runs/
+/targets.local.json
+/.venv/
+/data/*/manifest.json
+/data/*/*.pt

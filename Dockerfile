@@ -1,13 +1,10 @@
-# sudo docker build -t speedrun_plm .
-# sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm torchrun --standalone --nproc_per_node=4 train.py
-# docker run --gpus all -v ${PWD}:/workspace speedrun_plm python train.py --bugfix
-# 1️⃣  CUDA / cuDNN base with no Python
+# docker build -t speedrun_plm .
+# docker run --gpus all -v "${PWD}:/workspace" speedrun_plm python train.py --config experiment.json
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
-# 2️⃣  System prerequisites + Python 3.12
-ENV        DEBIAN_FRONTEND=noninteractive \
-           PYTHON_VERSION=3.12.7 \
-           PATH=/usr/local/bin:$PATH
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHON_VERSION=3.12.7 \
+    PATH=/usr/local/bin:$PATH
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -27,34 +24,27 @@ RUN curl -fsSLO https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYT
     ln -s /usr/local/bin/python3.12 /usr/local/bin/python && \
     ln -s /usr/local/bin/pip3.12    /usr/local/bin/pip
 
-# 3️⃣  Location of project code (inside image) – NOT shared with host
 WORKDIR /app
 
-# 4️⃣  Copy requirements first for layer caching
+# Cache dependency installation independently of source changes.
 COPY requirements.txt .
 
 RUN pip install --upgrade pip setuptools && \
-    pip install -r requirements.txt -U && \
-    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U && \
-    pip install numpy==1.26.4
-    
+    pip install torch --index-url https://download.pytorch.org/whl/cu128 -U && \
+    pip install -r requirements.txt
 
-# 5️⃣  Copy the rest of the source
 COPY . .
 
-# 6️⃣  Change working directory to where the volume will be mounted
+RUN pip install -e ".[test,evaluation]"
+
 WORKDIR /workspace
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 7️⃣  Single persistent host volume (/workspace) for *all* artefacts & caches
-#     Bind-mount it when you run the container:  -v ${PWD}:/workspace
-# ──────────────────────────────────────────────────────────────────────────────
+# Prefer the bind-mounted candidate over the image's installed source.
 ENV PROJECT_ROOT=/workspace \
-    TRANSFORMERS_CACHE=/workspace/.cache/huggingface \
+    PYTHONPATH=/workspace/src \
     HF_HOME=/workspace/.cache/huggingface \
     TORCH_HOME=/workspace/.cache/torch \
     XDG_CACHE_HOME=/workspace/.cache \
-    WANDB_DIR=/workspace/logs \
     TQDM_CACHE=/workspace/.cache/tqdm
 
 RUN mkdir -p \
@@ -65,8 +55,6 @@ RUN mkdir -p \
       /workspace/data \
       /workspace/results
 
-# Declare the volume so other developers know it's intended to persist
 VOLUME ["/workspace"]
 
-# 8️⃣  Default command – override in `docker run … python train.py`
 CMD ["bash"]

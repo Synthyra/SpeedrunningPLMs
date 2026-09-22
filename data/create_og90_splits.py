@@ -1,33 +1,24 @@
 import argparse
-from datasets import load_dataset, DatasetDict
+import sys
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--hf_token', type=str, default=None)
+from pathlib import Path
 
-args = parser.parse_args()
 
-if args.hf_token:
-    import huggingface_hub
-    huggingface_hub.login(token=args.hf_token)
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-data = load_dataset('tattabio/OG_prot90', split='train').remove_columns('id').shuffle(seed=11)
-#data = data.cast_column('sequence', Value(dtype='string'))
-print(data)
+from speedrunning_plms.data.splits import build_og_prot90_splits, login_if_token, push_splits
 
-data = data.train_test_split(test_size=20000, seed=22)
 
-train = data['train']
-valid = data['test']
-valid = valid.train_test_split(test_size=10000, seed=33)
-test = valid['test']
-valid = valid['train']
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hf_token", type=str, default=None)
+    args = parser.parse_args()
+    login_if_token(args.hf_token)
+    data = build_og_prot90_splits()
+    push_splits(data, "Synthyra/og_prot90")
 
-data = DatasetDict({
-    'train': train,
-    'valid': valid,
-    'test': test
-})
 
-print(data)
-
-data.push_to_hub('Synthyra/og_prot90')
+if __name__ == "__main__":
+    main()

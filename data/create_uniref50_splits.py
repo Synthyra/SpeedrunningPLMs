@@ -1,35 +1,24 @@
 import argparse
-from datasets import load_dataset, DatasetDict, concatenate_datasets
+import sys
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--hf_token', type=str, default=None)
+from pathlib import Path
 
-args = parser.parse_args()
 
-if args.hf_token:
-    import huggingface_hub
-    huggingface_hub.login(token=args.hf_token)
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-data = load_dataset('agemagician/uniref50_09012025').remove_columns('id').remove_columns('name').shuffle(seed=11)
-data = data.rename_column('text', 'sequence')
-print(data)
+from speedrunning_plms.data.splits import build_uniref50_splits, login_if_token, push_splits
 
-data = concatenate_datasets([data['train'], data['validation'], data['test']])
 
-data = data.train_test_split(test_size=20000, seed=22)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hf_token", type=str, default=None)
+    args = parser.parse_args()
+    login_if_token(args.hf_token)
+    data = build_uniref50_splits()
+    push_splits(data, "Synthyra/uniref50")
 
-train = data['train']
-valid = data['test']
-valid = valid.train_test_split(test_size=10000, seed=33)
-test = valid['test']
-valid = valid['train']
 
-data = DatasetDict({
-    'train': train,
-    'valid': valid,
-    'test': test
-})
-
-print(data)
-
-data.push_to_hub('Synthyra/uniref50')
+if __name__ == "__main__":
+    main()
