@@ -1,5 +1,6 @@
 import sys
 import unittest
+
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,7 +12,7 @@ if str(SRC) not in sys.path:
 
 
 class ImportAndModelTests(unittest.TestCase):
-    def test_public_package_imports(self):
+    def test_public_package_imports(self) -> None:
         from speedrunning_plms import PLM, PLMConfig
         from speedrunning_plms.data import ChunkPacker, LegacyFlatPacker, TokenIds, read_shard_tokens
         from speedrunning_plms.flex import generate_dilated_sliding_window
@@ -26,7 +27,7 @@ class ImportAndModelTests(unittest.TestCase):
         self.assertIsNotNone(generate_dilated_sliding_window)
         self.assertIsNotNone(Muon)
 
-    def test_root_compatibility_imports(self):
+    def test_root_compatibility_imports(self) -> None:
         from data.dataloading import EvalLoader
         from model.model import PLM, PLMConfig
         from optimizer import Muon
@@ -36,7 +37,7 @@ class ImportAndModelTests(unittest.TestCase):
         self.assertIsNotNone(PLMConfig)
         self.assertIsNotNone(Muon)
 
-    def test_model_explicit_token_ids_avoid_tokenizer_requirement(self):
+    def test_model_explicit_token_ids_avoid_tokenizer_requirement(self) -> None:
         from speedrunning_plms.models import PLM, PLMConfig
 
         config = PLMConfig(

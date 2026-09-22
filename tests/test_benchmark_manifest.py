@@ -2,9 +2,9 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
-
 import pytest
+
+from pathlib import Path
 
 from speedrunning_plms.evaluation import (
     download_dataset_split,
@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = ROOT / "evaluation" / "benchmark_manifest.json"
 
 
-def test_manifest_pins_every_asset_to_a_full_commit_sha():
+def test_manifest_pins_every_asset_to_a_full_commit_sha() -> None:
     manifest = load_benchmark_manifest(MANIFEST_PATH)
 
     assets = [manifest["tokenizer"], *manifest["models"], *manifest["datasets"]]
@@ -28,7 +28,7 @@ def test_manifest_pins_every_asset_to_a_full_commit_sha():
         assert FULL_COMMIT_SHA.fullmatch(asset["revision"])
 
 
-def test_manifest_rejects_mutable_revision(tmp_path):
+def test_manifest_rejects_mutable_revision(tmp_path: Path) -> None:
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     manifest["models"][0]["revision"] = "main"
     path = tmp_path / "mutable.json"
@@ -38,7 +38,7 @@ def test_manifest_rejects_mutable_revision(tmp_path):
         load_benchmark_manifest(path)
 
 
-def test_benchmark_entrypoint_loads_manifest_aware_code():
+def test_benchmark_entrypoint_loads_manifest_aware_code() -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
     completed = subprocess.run(
@@ -53,14 +53,14 @@ def test_benchmark_entrypoint_loads_manifest_aware_code():
     assert "--manifest" in completed.stdout
 
 
-def test_full_shas_propagate_to_every_hub_loader():
+def test_full_shas_propagate_to_every_hub_loader() -> None:
     manifest = load_benchmark_manifest(MANIFEST_PATH)
 
     model_calls = []
 
     class RecordingModelLoader:
         @classmethod
-        def from_pretrained(cls, repo_id, **kwargs):
+        def from_pretrained(cls, repo_id: str, **kwargs: object) -> str:
             model_calls.append((repo_id, kwargs))
             return repo_id
 
@@ -83,7 +83,7 @@ def test_full_shas_propagate_to_every_hub_loader():
 
     class RecordingTokenizerLoader:
         @classmethod
-        def from_pretrained(cls, repo_id, **kwargs):
+        def from_pretrained(cls, repo_id: str, **kwargs: object) -> str:
             tokenizer_calls.append((repo_id, kwargs))
             return repo_id
 
@@ -98,7 +98,7 @@ def test_full_shas_propagate_to_every_hub_loader():
 
     dataset_calls = []
 
-    def recording_download(**kwargs):
+    def recording_download(**kwargs: object) -> str:
         dataset_calls.append(kwargs)
         return kwargs["filename"]
 

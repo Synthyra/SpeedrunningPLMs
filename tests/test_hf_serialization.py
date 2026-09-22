@@ -1,19 +1,19 @@
 import json
-import inspect
 import os
 import subprocess
 import sys
 import textwrap
-from pathlib import Path
-
 import pytest
 import torch
+
+from pathlib import Path
+from typing import NoReturn
 
 from speedrunning_plms.models import PLM, PLMConfig
 from speedrunning_plms.training.publishing import publish_model_to_hub
 
 
-def tiny_config(**overrides) -> PLMConfig:
+def tiny_config(**overrides: object) -> PLMConfig:
     values = {
         "hidden_size": 8,
         "num_attention_heads": 2,
@@ -37,7 +37,7 @@ def tiny_model() -> PLM:
     return PLM(tiny_config())
 
 
-def test_config_save_has_canonical_autoclass_metadata(tmp_path):
+def test_config_save_has_canonical_autoclass_metadata(tmp_path: Path) -> None:
     config = tiny_config(auto_map={"AutoModel": "legacy.Unsupported"})
     config.save_pretrained(tmp_path)
 
@@ -59,7 +59,7 @@ def test_config_save_has_canonical_autoclass_metadata(tmp_path):
         assert "huggingface_hub" not in source
 
 
-def test_direct_pretrained_round_trip_preserves_config_and_weights(tiny_model, tmp_path):
+def test_direct_pretrained_round_trip_preserves_config_and_weights(tiny_model: PLM, tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint"
     tiny_model.save_pretrained(checkpoint)
 
@@ -73,7 +73,7 @@ def test_direct_pretrained_round_trip_preserves_config_and_weights(tiny_model, t
         torch.testing.assert_close(restored.state_dict()[key], expected)
 
 
-def test_tied_embedding_round_trip_preserves_parameter_sharing(tmp_path):
+def test_tied_embedding_round_trip_preserves_parameter_sharing(tmp_path: Path) -> None:
     model = PLM(tiny_config(tie_embeddings=True))
     checkpoint = tmp_path / "tied-checkpoint"
 
@@ -86,7 +86,7 @@ def test_tied_embedding_round_trip_preserves_parameter_sharing(tmp_path):
     torch.testing.assert_close(restored.embedding.weight, model.embedding.weight)
 
 
-def test_save_weights_local_uses_zero_padded_step_directory(tiny_model, tmp_path):
+def test_save_weights_local_uses_zero_padded_step_directory(tiny_model: PLM, tmp_path: Path) -> None:
     tiny_model.save_weights_local(tmp_path, step=42)
 
     checkpoint = tmp_path / "step_000042"
@@ -95,36 +95,36 @@ def test_save_weights_local_uses_zero_padded_step_directory(tiny_model, tmp_path
     torch.testing.assert_close(restored.embedding.weight, tiny_model.embedding.weight)
 
 
-def test_masked_lm_contract_supports_batched_inference_attention_and_labels():
+def test_masked_lm_contract_supports_batched_inference_attention_and_labels() -> None:
     model = PLM(tiny_config(num_hidden_layers=1))
     input_ids = torch.tensor(
         [
             [0, 5, 32, 2, 1, 1],
             [0, 7, 8, 32, 2, 1],
         ]
-    )
+    )  # (2, 6)
     attention_mask = torch.tensor(
         [
             [1, 1, 1, 1, 0, 0],
             [1, 1, 1, 1, 1, 0],
         ]
-    )
+    )  # (2, 6)
 
     model.eval()
-    inference = model(input_ids=input_ids, attention_mask=attention_mask)
+    inference = model(input_ids=input_ids, attention_mask=attention_mask)  # logits: (2, 6, 33)
     assert inference.loss is None
     assert inference.logits.shape == (2, 6, 33)
 
-    labels = torch.full_like(input_ids, -100)
-    labels[0, 2] = 9
-    labels[1, 3] = 10
+    labels = torch.full_like(input_ids, -100)  # (2, 6)
+    labels[0, 2] = 9  # scalar target
+    labels[1, 3] = 10  # scalar target
     model.train()
     training = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         labels=labels,
         output_hidden_states=True,
-    )
+    )  # logits: (2, 6, 33); hidden_states[0]: (2, 6, 8); loss: ()
     assert training.loss is not None
     assert training.loss.ndim == 0
     assert training.logits.shape == (2, 6, 33)
@@ -136,11 +136,11 @@ def test_masked_lm_contract_supports_batched_inference_attention_and_labels():
         input_ids=input_ids,
         attention_mask=attention_mask,
         return_dict=False,
-    )
+    )  # logits: (2, 6, 33)
     assert tuple_output[0].shape == (2, 6, 33)
 
 
-def test_autoclasses_load_saved_remote_code_without_installed_package(tmp_path):
+def test_autoclasses_load_saved_remote_code_without_installed_package(tmp_path: Path) -> None:
     checkpoint = tmp_path / "remote-checkpoint"
     PLM(tiny_config(num_hidden_layers=1)).save_pretrained(checkpoint)
 
@@ -179,8 +179,8 @@ def test_autoclasses_load_saved_remote_code_without_installed_package(tmp_path):
         assert masked_lm.__class__.__name__ == "PLM"
         assert tuple(masked_lm.lm_head.decoder.weight.shape) == (33, 8)
 
-        input_ids = torch.tensor([[0, 5, 32, 2, 1], [0, 6, 32, 2, 1]])
-        attention_mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]])
+        input_ids = torch.tensor([[0, 5, 32, 2, 1], [0, 6, 32, 2, 1]])  # (2, 5)
+        attention_mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]])  # (2, 5)
         inference = masked_lm(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -188,8 +188,8 @@ def test_autoclasses_load_saved_remote_code_without_installed_package(tmp_path):
         assert inference.loss is None
         assert tuple(inference.logits.shape) == (2, 5, 33)
 
-        labels = torch.full_like(input_ids, -100)
-        labels[:, 2] = torch.tensor([7, 8])
+        labels = torch.full_like(input_ids, -100)  # (2, 5)
+        labels[:, 2] = torch.tensor([7, 8])  # (2,) selected targets
         training = masked_lm(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -220,10 +220,10 @@ def test_autoclasses_load_saved_remote_code_without_installed_package(tmp_path):
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_hub_publication_is_disabled_by_default(tiny_model):
+def test_hub_publication_is_disabled_by_default(tiny_model: PLM) -> None:
     calls = []
 
-    def unexpected_api_factory():
+    def unexpected_api_factory() -> NoReturn:
         calls.append("api_factory")
         raise AssertionError("The Hub API must not be constructed by default.")
 
@@ -239,37 +239,36 @@ def test_hub_publication_is_disabled_by_default(tiny_model):
     assert not hasattr(tiny_model, "push_weights_to_hub")
 
 
-def test_training_cli_requires_explicit_hub_opt_in(monkeypatch):
-    from speedrunning_plms.training.trainer import arg_parser
+@pytest.mark.parametrize("arguments", [["--push-to-hub"], ["--masked-diffusion"], ["--mask-rate", "0.2"]])
+def test_research_cli_rejects_publication_and_objective_overrides(arguments: list[str]) -> None:
+    from speedrunning_plms.research.engine import main
 
-    monkeypatch.setattr(sys, "argv", ["speedrun-plm"])
-    args = arg_parser()
-
-    assert args.push_to_hub is False
-    assert args.hf_model_name is None
-
-
-def test_trainer_publishes_only_after_final_evaluation():
-    from speedrunning_plms.training.trainer import Trainer
-
-    source = inspect.getsource(Trainer.train)
-    final_evaluation = source.rfind("self._run_eval_loader_timed")
-    publication = source.rfind("self.publish_final_artifact")
-
-    assert final_evaluation >= 0
-    assert publication > final_evaluation
+    with pytest.raises(SystemExit) as error:
+        main(arguments)
+    assert error.value.code == 2
 
 
-def test_opted_in_hub_publication_is_one_complete_artifact(tiny_model):
+@pytest.mark.parametrize("max_shard_size", ["5GB", "1KB"])
+def test_opted_in_hub_publication_is_one_complete_artifact(tiny_model: PLM, monkeypatch: pytest.MonkeyPatch, max_shard_size: str) -> None:
     calls = []
+    save_pretrained = tiny_model.save_pretrained
+
+    def save_with_shard_limit(path: Path, **kwargs: object) -> None:
+        save_pretrained(path, max_shard_size=max_shard_size, **kwargs)
+
+    monkeypatch.setattr(tiny_model, "save_pretrained", save_with_shard_limit)
 
     class RecordingApi:
-        def create_repo(self, **kwargs):
+        def create_repo(self, **kwargs: object) -> None:
             calls.append(("create_repo", kwargs))
 
-        def upload_folder(self, folder_path, **kwargs):
+        def upload_folder(self, folder_path: Path, **kwargs: object) -> dict[str, str]:
             folder = Path(folder_path)
             requirements = (folder / "requirements.txt").read_text(encoding="utf-8")
+            restored = PLM.from_pretrained(folder, local_files_only=True)
+            assert restored.state_dict().keys() == tiny_model.state_dict().keys()
+            for key, expected in tiny_model.state_dict().items():
+                torch.testing.assert_close(restored.state_dict()[key], expected)
             calls.append(
                 (
                     "upload_folder",
@@ -301,7 +300,12 @@ def test_opted_in_hub_publication_is_one_complete_artifact(tiny_model):
         "commit_message": "Publish final trained model artifact",
     }
     assert {"config.json", "plm.py", "attention.py", "layers.py", "requirements.txt"} <= files
-    assert {"model.safetensors", "pytorch_model.bin"} & files
+    if max_shard_size == "1KB":
+        assert "model.safetensors.index.json" in files
+        assert "model.safetensors" not in files
+        assert len([name for name in files if name.endswith(".safetensors")]) > 1
+    else:
+        assert "model.safetensors" in files
     assert config["auto_map"]["AutoModelForMaskedLM"] == "plm.PLM"
     assert "AutoModel" not in config["auto_map"]
     assert requirements == "torch>=2.5\ntransformers>=4.57.6,<5\n"

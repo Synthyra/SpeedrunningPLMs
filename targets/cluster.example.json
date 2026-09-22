@@ -1,0 +1,9 @@
+{
+  "name": "two-node-eight-gpu",
+  "hosts": [
+    {"host": "gpu-node-0", "workdir": "/workspace/experiments", "python": "/workspace/venv/bin/python", "gpus": 4},
+    {"host": "gpu-node-1", "workdir": "/workspace/experiments", "python": "/workspace/venv/bin/python", "gpus": 4}
+  ],
+  "master_addr": "10.0.0.10",
+  "master_port": 29500
+}

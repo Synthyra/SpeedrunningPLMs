@@ -2,42 +2,35 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Experiment Hub</title>
-
-  <!-- Tailwind for styling -->
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@^3/dist/tailwind.min.css" rel="stylesheet">
-  <!-- DataTables CSS -->
-  <link href="https://cdn.datatables.net/2.0.8/css/dataTables.tailwind.min.css" rel="stylesheet">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Historical protein language model experiments</title>
+  <link href="https://cdn.datatables.net/2.0.8/css/dataTables.dataTables.min.css" rel="stylesheet">
+  <style>
+    body { margin: 0; padding: 3rem 1rem; background: #f9fafb; color: #111827; font: 1rem/1.5 system-ui, sans-serif; }
+    main { max-width: 90rem; margin: auto; }
+    h1 { line-height: 1.2; }
+    a { color: #1d4ed8; }
+    .table-container { overflow-x: auto; }
+    table { width: 100%; font-size: .875rem; }
+    #load-status[data-error] { color: #991b1b; }
+  </style>
 </head>
-
-<body class="bg-gray-50 min-h-screen py-12">
-  <main class="max-w-7xl mx-auto px-4">
-    <h1 class="text-4xl font-bold mb-6"> Protein Language Model Speedrunning Experiment Hub 🧬🖥️</h1>
-
-    <!-- Container for the generated table -->
-    <table id="exp-table" class="stripe display w-full text-sm"></table>
+<body>
+  <main>
+    <h1>Historical protein language model experiments</h1>
+    <p>These records use earlier training and evaluation protocols. Their losses are not
+      comparable with the current fixed 15% masking benchmark's bits per masked residue.</p>
+    <p>See the <a href="https://github.com/Synthyra/SpeedrunningPLMs#readme">current research workflow</a>
+      or the <a href="https://github.com/Synthyra/SpeedrunningPLMs/blob/main/misc/experiments.tsv">historical source data</a>.</p>
+    <p id="load-status" role="status">Loading historical experiments...</p>
+    <noscript><p>JavaScript is required for the searchable table. The source data link remains available.</p></noscript>
+    <div class="table-container">
+      <table id="exp-table" class="stripe display" aria-label="Historical experiments"></table>
+    </div>
   </main>
-
-  <!-- Load scripts in correct order: jQuery first, then dependencies, then custom logic -->
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
   <script src="https://cdn.datatables.net/2.0.8/js/dataTables.min.js"></script>
-  
-  <!-- Your custom logic - wait for all dependencies to load -->
-  <script>
-    // Wait for all dependencies to load before running our script
-    function waitForDependencies() {
-      if (typeof $ !== 'undefined' && typeof Papa !== 'undefined' && typeof DataTable !== 'undefined') {
-        // Load our custom script
-        const script = document.createElement('script');
-        script.src = 'assets/hub.js';
-        document.body.appendChild(script);
-      } else {
-        // Retry after a short delay
-        setTimeout(waitForDependencies, 100);
-      }
-    }
-    waitForDependencies();
-  </script>
+  <script src="assets/hub.js"></script>
 </body>
 </html>

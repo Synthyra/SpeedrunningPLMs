@@ -1,9 +1,12 @@
-# https://github.com/pytorch-labs/attention-gym/blob/main/attn_gym/mods/softcapping.py
+"""Inspect FlexAttention modifiers as dense score or mask matrices.
+
+Adapted from pytorch-labs/attention-gym, attn_gym/mods/softcapping.py.
+"""
 
 import math
 import numpy as np
 import torch
-from typing import Optional
+from contextlib import nullcontext
 from pathlib import Path
 from torch.nn.attention.flex_attention import (
     _score_mod_signature,
@@ -16,70 +19,64 @@ try:
     from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
 except ImportError:
     from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
-from contextlib import nullcontext
 
 
 def create_score_mod(
     query: torch.Tensor,
     key: torch.Tensor,
-    score_mod: Optional[_score_mod_signature],
-    mask_mod: Optional[_mask_mod_signature],
+    score_mod: _score_mod_signature | None,
+    mask_mod: _mask_mod_signature | None,
     device: str = "cuda",
     _compile: bool = False,
-    scale: Optional[float] = None,
+    scale: float | None = None,
     batch_idx: int = 0,
     head_idx: int = 0,
 ) -> torch.Tensor:
-    B = 1
-    H = 1
-    M = query.shape[0]
-    N = key.shape[0]
+    # query: (m, d_h); key: (n, d_h), for one selected batch and head.
+    m = query.shape[0]  # query count
+    n = key.shape[0]  # key count
 
-    b = torch.arange(0, B, device=device) + batch_idx
-    h = torch.arange(0, H, device=device) + head_idx
-    m = torch.arange(0, M, device=device)
-    n = torch.arange(0, N, device=device)
+    batch_indices = torch.arange(0, 1, device=device) + batch_idx  # (1,)
+    head_indices = torch.arange(0, 1, device=device) + head_idx  # (1,)
+    query_indices = torch.arange(0, m, device=device)  # (m,)
+    key_indices = torch.arange(0, n, device=device)  # (n,)
 
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    type = _ModificationType.SCORE_MOD if score_mod is not None else _ModificationType.MASK_MOD
+    modification_type = _ModificationType.SCORE_MOD if score_mod is not None else _ModificationType.MASK_MOD
     if _compile:
         ctx = nullcontext()
     else:
         ctx = TransformGetItemToIndex()
 
     with ctx:
-        mod_fn = score_mod if type == _ModificationType.SCORE_MOD else mask_mod
-        prefix = (0,) if type == _ModificationType.SCORE_MOD else ()
+        mod_fn = score_mod if modification_type == _ModificationType.SCORE_MOD else mask_mod
+        prefix = (0,) if modification_type == _ModificationType.SCORE_MOD else ()
         mod = _vmap_for_bhqkv(mod_fn, prefix=prefix)
-        scores = query @ key.transpose(-2, -1)
-        scores *= scale_factor
-        scores = scores.view(1, 1, M, N)
-        if type == _ModificationType.SCORE_MOD:
-            out = mod(scores, b, h, m, n)
+        scores = query @ key.transpose(-2, -1)  # (m, n)
+        scores *= scale_factor  # (m, n)
+        scores = scores.view(1, 1, m, n)  # (1, 1, m, n)
+        if modification_type == _ModificationType.SCORE_MOD:
+            out = mod(scores, batch_indices, head_indices, query_indices, key_indices)  # (1, 1, m, n)
         else:
-            out = mod(b, h, m, n)
+            out = mod(batch_indices, head_indices, query_indices, key_indices)  # (1, 1, m, n)
 
-    return out
+    return out  # (1, 1, m, n)
 
 
 def generate_dilated_sliding_window(window_size: int, dilation: int) -> _mask_mod_signature:
-    """Generates a dilated sliding window attention mask.
-    Args:
-        window_size: The size of the sliding window.
-        dilation: The dilation factor for the sliding window.
+    """Allow distances at most window_size that are divisible by dilation."""
 
-    Note:
-        Query at position i can only attend to keys within a window of size `window_size`
-        centered around i, where the keys are at positions j such that:
-        * abs(i - j) <= window_size
-        * abs(i - j) % dilation == 0
-    """
-
-    def dilated_sliding_window(b, h, q_idx, kv_idx):
-        diff = torch.abs(q_idx - kv_idx)
-        in_window = diff <= window_size
-        is_dilated = (diff % dilation) == 0
-        return in_window & is_dilated
+    def dilated_sliding_window(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        # FlexAttention supplies scalar indices (); direct calls may broadcast them.
+        diff = torch.abs(q_idx - kv_idx)  # broadcast(q_idx.shape, kv_idx.shape)
+        in_window = diff <= window_size  # same broadcast shape
+        is_dilated = (diff % dilation) == 0  # same broadcast shape
+        return in_window & is_dilated  # same broadcast shape
 
     dilated_sliding_window.__name__ = f"dilated_sliding_window_{window_size}_dilation_{dilation}"
     return dilated_sliding_window
@@ -94,40 +91,28 @@ def _name_to_title(name: str) -> str:
 def visualize_attention_scores(
     query: torch.Tensor,
     key: torch.Tensor,
-    score_mod: Optional[_score_mod_signature] = None,
-    mask_mod: Optional[_mask_mod_signature] = None,
+    score_mod: _score_mod_signature | None = None,
+    mask_mod: _mask_mod_signature | None = None,
     device: str = "cuda",
     name: str = "attention_scores",
-    path: Optional[Path] = None,
+    path: Path | None = None,
     batch_idx: int = 0,
     head_idx: int = 0,
-    scale: Optional[float] = None,
-):
-    """
-    Generate and save a visualization of attention scores.
+    scale: float | None = None,
+) -> None:
+    """Save one batch/head's scores or mask as a 300 dpi PNG.
 
-    Args:
-        query (Tensor): Query tensor of shape (batch_size, num_heads, seq_len_q, head_dim).
-        key (Tensor): Key tensor of shape (batch_size, num_heads, seq_len_k, head_dim).
-        score_mod (Optional[Callable]): If this is set this will take precedence over the mask_mod.
-        mask_mod (Optional[Callable]): The mask_mod function used to create block_mask
-        device (str): Device to run computations on (default: "cuda").
-        name (str): Base name for the file and title (default: 'attention_scores').
-        path (Path): Path to save the visualization. If None, will be saved to the current working directory.
-        batch_idx (int): Index of the batch to visualize (default: 0).
-        head_idx (int): Index of the head to visualize (default: 0).
-        scale (float): Scale factor to apply to the attention scores. If None, will be set to 1 / sqrt(head_dim).
-
-    Returns:
-        None
+    Inputs have shape (b, h, m, d_h) and (b, h, n, d_h). If both modifiers
+    are supplied, apply the score modifier and mask excluded scores with -inf.
+    By default, use 1 / sqrt(d_h) scaling and save to name.png in the current directory.
     """
     import matplotlib.pyplot as plt
 
     assert score_mod is not None or mask_mod is not None, (
         "Must provide either score_mod or mask_mod"
     )
-    query = query[batch_idx, head_idx, :, :]
-    key = key[batch_idx, head_idx, :, :]
+    query = query[batch_idx, head_idx, :, :]  # (m, d_h)
+    key = key[batch_idx, head_idx, :, :]  # (n, d_h)
     scores_viz = create_score_mod(
         query,
         key,
@@ -137,8 +122,7 @@ def visualize_attention_scores(
         device=device,
         batch_idx=batch_idx,
         head_idx=head_idx,
-    )
-    # If both score_mod and mask_mod are provided, apply both
+    )  # (1, 1, m, n)
     if score_mod is not None and mask_mod is not None:
         mask_viz = create_score_mod(
             query,
@@ -149,9 +133,8 @@ def visualize_attention_scores(
             device=device,
             batch_idx=batch_idx,
             head_idx=head_idx,
-        )
-        # Apply mask by setting masked positions to -inf
-        scores_viz = torch.where(mask_viz == 0, float("-inf"), scores_viz)
+        )  # (1, 1, m, n)
+        scores_viz = torch.where(mask_viz == 0, float("-inf"), scores_viz)  # (1, 1, m, n)
 
     suffix_title = f"Batch {batch_idx}, Head {head_idx}" if batch_idx != 0 or head_idx != 0 else ""
 
@@ -159,7 +142,8 @@ def visualize_attention_scores(
     color = "viridis" if score_mod is not None else "cividis"
     if score_mod is not None and mask_mod is not None:
         color = "plasma"
-    im = ax.imshow(scores_viz.cpu().detach()[0, 0, :, :], aspect="auto", cmap=color)
+    scores_image = scores_viz.cpu().detach()[0, 0, :, :]  # (m, n)
+    im = ax.imshow(scores_image, aspect="auto", cmap=color)
     fig.colorbar(im)
 
     title = _name_to_title(name)
@@ -169,7 +153,7 @@ def visualize_attention_scores(
     ax.set_xlabel("Key Tokens", fontsize=18)
     ax.set_ylabel("Query Tokens", fontsize=18)
 
-    # Move y-axis ticks and labels to the top
+    # Place key-token labels above the image.
     ax.tick_params(axis="x", top=True, labeltop=True, bottom=False, labelbottom=False)
 
     # Add tick labels if the number of tokens is manageable
@@ -183,29 +167,22 @@ def visualize_attention_scores(
         ax.set_yticks(range(num_query_tokens))
         ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)], fontsize=16)
         # Align grid with pixel boundaries
-        ax.set_xticks(np.arange(-0.5, num_kv_tokens, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, num_query_tokens, 1), minor=True)
+        ax.set_xticks(np.arange(-0.5, num_kv_tokens, 1), minor=True)  # boundaries: (n + 1,)
+        ax.set_yticks(np.arange(-0.5, num_query_tokens, 1), minor=True)  # boundaries: (m + 1,)
         ax.grid(which="minor", color="black", linestyle="-", linewidth=2)
 
     plt.tight_layout()
     plt.savefig(file_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)  # Close the figure to free up memory
+    plt.close(fig)
 
     print(f"Visualization saved as {file_path}")
 
 
-def main(device: str = "cpu"):
-    """Visualize the attention scores of dilated sliding window mask mod.
-
-    Args:
-        device (str): Device to use for computation.
-    """
-    B, H, SEQ_LEN, HEAD_DIM = 1, 1, 24, 8
-
-    def make_tensor():
-        return torch.ones(B, H, SEQ_LEN, HEAD_DIM, device=device)
-
-    query, key = make_tensor(), make_tensor()
+def main(device: str = "cpu") -> None:
+    """Visualize a dilated sliding window mask."""
+    b, h, l, d_h = 1, 1, 24, 8  # batch, heads, sequence length, head width
+    query = torch.ones(b, h, l, d_h, device=device)  # (b, h, l, d_h)
+    key = torch.ones(b, h, l, d_h, device=device)  # (b, h, l, d_h)
 
     dilated_sliding_window_mask = generate_dilated_sliding_window(window_size=8, dilation=4)
     visualize_attention_scores(

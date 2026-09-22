@@ -1,0 +1,6 @@
+{
+  "name": "single-gpu-host",
+  "hosts": [
+    {"host": "gpu-box", "workdir": "/workspace/experiments", "python": "/workspace/venv/bin/python", "gpus": 1}
+  ]
+}

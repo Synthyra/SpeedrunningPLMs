@@ -18,6 +18,7 @@ from speedrunning_plms.models.plm import (
     precompute_multiresolution_masks,
 )
 
+
 __all__ = [
     "BatchedTransformerBlock",
     "BatchedUnetTransformer",

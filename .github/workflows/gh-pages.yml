@@ -3,7 +3,7 @@ on:
   push:
     branches: [main]
 
-permissions:          # 👈 add this block (workflow- or job-level)
+permissions:
   contents: write
 
 jobs:
@@ -14,6 +14,6 @@ jobs:
 
       - uses: peaceiris/actions-gh-pages@v4
         with:
-          publish_dir: docs          # folder to publish
-          publish_branch: gh-pages   # default is fine; adjust if you use a different branch
-          github_token: ${{ secrets.PERSONAL_TOKEN }}
+          publish_dir: docs
+          publish_branch: gh-pages
+          github_token: ${{ secrets.GITHUB_TOKEN }}

@@ -12,6 +12,7 @@ from speedrunning_plms.models.plm import (
     get_hidden_sizes,
 )
 
+
 __all__ = [
     "BatchedTransformerBlock",
     "BatchedUnetTransformer",

@@ -1,13 +1,21 @@
-import torch
+"""Evaluate pinned reference models with the legacy benchmark protocol."""
+
+from __future__ import annotations
+
 import argparse
 import os
+import numpy as np
 import pandas as pd
+import torch
+
+from collections.abc import Sequence
 from pathlib import Path
-from torch.utils.data import DataLoader, Dataset as TorchDataset
 from datasets import Dataset
 from huggingface_hub import hf_hub_download, login
+from numpy.typing import NDArray
+from torch.utils.data import DataLoader, Dataset as TorchDataset
 from tqdm.auto import tqdm
-from transformers import AutoModelForMaskedLM, AutoTokenizer
+from transformers import AutoModelForMaskedLM, AutoTokenizer, BatchEncoding, PreTrainedTokenizerBase
 
 from evaluation.masker import ProteinMasker
 from speedrunning_plms.evaluation import (
@@ -19,7 +27,7 @@ from speedrunning_plms.evaluation import (
 from speedrunning_plms.training.utils import set_seed
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf_token', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=4)
@@ -35,22 +43,22 @@ def parse_args():
 
 
 class ProteinDataset(TorchDataset):
-    def __init__(self, sequences):
+    def __init__(self, sequences: Sequence[str]) -> None:
         self.sequences = sequences
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.sequences)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> str:
         return self.sequences[idx]
 
 
 class ProteinCollator:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self.tokenizer = tokenizer
         self.masker = ProteinMasker(tokenizer, mask_rate=0.15)
 
-    def __call__(self, batch):
+    def __call__(self, batch: list[str]) -> BatchEncoding:
         tokenized_batch = self.tokenizer(
             batch,
             padding='longest',
@@ -58,13 +66,18 @@ class ProteinCollator:
             truncation=True,
             return_tensors='pt',
             add_special_tokens=True
-        )
-        tokenized_batch['input_ids'], tokenized_batch['labels'] = self.masker(tokenized_batch['input_ids'], tokenized_batch['attention_mask'])
-        return tokenized_batch
+        )  # Tensor fields: (b, l), with l set by the longest truncated sequence.
+        tokenized_batch['input_ids'], tokenized_batch['labels'] = self.masker(
+            tokenized_batch['input_ids'], tokenized_batch['attention_mask']
+        )  # (b, l), (b, l)
+        return tokenized_batch  # Tensor fields: (b, l).
 
 
-def calculate_metrics(preds, labels):
-    """Calculate metrics only where labels != -100"""
+def calculate_metrics(
+    preds: NDArray[np.integer], labels: NDArray[np.integer],
+) -> dict[str, float | int]:
+    """Calculate metrics at positions with a target label."""
+    # preds, labels: (n); masked selections: (m <= n).
     from sklearn.metrics import (
         accuracy_score,
         f1_score,
@@ -73,8 +86,7 @@ def calculate_metrics(preds, labels):
         recall_score,
     )
 
-    # Create mask for valid positions (labels != -100)
-    valid_mask = labels != -100
+    valid_mask = labels != -100  # (n)
     
     if not valid_mask.any():
         return {
@@ -86,11 +98,9 @@ def calculate_metrics(preds, labels):
             'num_tokens': 0
         }
     
-    # Extract valid predictions and labels
-    valid_preds = preds[valid_mask]
-    valid_labels = labels[valid_mask]
+    valid_preds = preds[valid_mask]  # (m)
+    valid_labels = labels[valid_mask]  # (m)
     
-    # Calculate metrics
     accuracy = accuracy_score(valid_labels, valid_preds)
     precision = precision_score(valid_labels, valid_preds, average='weighted', zero_division=0)
     recall = recall_score(valid_labels, valid_preds, average='weighted', zero_division=0)
@@ -107,16 +117,13 @@ def calculate_metrics(preds, labels):
     }
 
 
-def main():
+def main() -> None:
     args = parse_args()
-    # Create results directory
     os.makedirs(args.results_dir, exist_ok=True)
 
-    # Login once if token is provided
     if args.hf_token is not None:
         login(args.hf_token)
     
-    # Initialize components that don't need to be recreated for each model or dataset
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     manifest = load_benchmark_manifest(args.manifest)
     tokenizer_asset = manifest['tokenizer']
@@ -135,7 +142,6 @@ def main():
             print(f"Loaded {dataset_name} {split_type}: {len(data)} sequences")
             sequences = data['sequence']
             sequences = sorted(sequences, key=len, reverse=True)
-            #sequences = sequences[-100:]  # Uncomment for debugging with smaller subset
             print(f"Shortest sequence: {len(sequences[-1])} tokens")
 
             for model_asset in manifest['models']:
@@ -162,44 +168,42 @@ def main():
                     num_workers=args.num_workers,
                 )
                 
-                # Initialize accumulators
                 total_loss = 0.0
                 total_tokens = 0
-                all_preds = []
-                all_labels = []
+                all_preds: list[torch.Tensor] = []  # Each entry: (m_batch).
+                all_labels: list[torch.Tensor] = []  # Each entry: (m_batch).
                 num_batches = 0
                 
                 for batch in tqdm(dataloader, total=len(dataloader), desc=f'{nickname} {dataset_name} {split_type}'):
-                    # Move batch to device
-                    batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+                    batch = {
+                        key: value.to(device) if torch.is_tensor(value) else value
+                        for key, value in batch.items()
+                    }  # Tensor fields: (b, l).
                     
                     with torch.no_grad():
-                        outputs = model(**batch)
-                        labels = batch['labels'].cpu()
+                        outputs = model(**batch)  # logits: (b, l, vocab_size); loss: ().
+                        labels = batch['labels'].cpu()  # (b, l)
                         loss = outputs.loss.item()
-                        logits = outputs.logits.cpu()
-                        preds = logits.argmax(dim=-1)
+                        logits = outputs.logits.cpu()  # (b, l, vocab_size)
+                        preds = logits.argmax(dim=-1)  # (b, l)
                         
-                        # Accumulate loss
                         total_loss += loss
                         num_batches += 1
                         
-                        # Flatten predictions and labels for metric calculation
-                        preds_flat = preds.flatten()
-                        labels_flat = labels.flatten()
+                        preds_flat = preds.flatten()  # (b * l)
+                        labels_flat = labels.flatten()  # (b * l)
                         
-                        # Only keep predictions and labels where labels != -100
-                        valid_mask = labels_flat != -100
+                        valid_mask = labels_flat != -100  # (b * l)
                         if valid_mask.any():
-                            all_preds.append(preds_flat[valid_mask])
-                            all_labels.append(labels_flat[valid_mask])
+                            all_preds.append(preds_flat[valid_mask])  # (m_batch)
+                            all_labels.append(labels_flat[valid_mask])  # (m_batch)
                             total_tokens += valid_mask.sum().item()
                 
-                # Calculate overall metrics
                 if all_preds:
-                    all_preds = torch.cat(all_preds)
-                    all_labels = torch.cat(all_labels)
-                    metrics = calculate_metrics(all_preds.numpy(), all_labels.numpy())
+                    metrics = calculate_metrics(
+                        torch.cat(all_preds).numpy(),  # (m_total)
+                        torch.cat(all_labels).numpy(),  # (m_total)
+                    )
                 else:
                     metrics = {
                         'accuracy': 0.0,
@@ -210,11 +214,10 @@ def main():
                         'num_tokens': 0
                     }
                 
-                # Calculate perplexity
+                # Retain the legacy mean of batch losses for historical comparisons.
                 avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
                 perplexity = torch.exp(torch.tensor(avg_loss)).item() if avg_loss > 0 else 0.0
                 
-                # Store results
                 result = {
                     'model': nickname,
                     'model_path': model_name,
@@ -249,13 +252,11 @@ def main():
                 del model, tokenizer, collator
                 torch.cuda.empty_cache()
 
-    # Save results to CSV
-    results_df = pd.DataFrame(all_results)
+    results_df = pd.DataFrame(all_results)  # (n_results, n_metrics)
     results_file = os.path.join(args.results_dir, 'benchmark_results_esm.csv')
     results_df.to_csv(results_file, index=False)
     print(f"\nResults saved to: {results_file}")
     
-    # Print summary
     print("\n" + "="*80)
     print("BENCHMARK SUMMARY")
     print("="*80)

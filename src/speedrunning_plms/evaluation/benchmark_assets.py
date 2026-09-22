@@ -1,9 +1,13 @@
 """Load benchmark assets only at manifest-pinned Hub commits."""
 
+from __future__ import annotations
+
 import json
 import re
+
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 
 FULL_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -62,8 +66,8 @@ def download_dataset_split(
     asset: Mapping[str, Any],
     split: str,
     *,
-    downloader: Callable,
-):
+    downloader: Callable[..., str],
+) -> str:
     """Download one dataset split at its pinned manifest revision."""
     return downloader(
         repo_id=asset["repo_id"],
@@ -73,7 +77,7 @@ def download_dataset_split(
     )
 
 
-def load_benchmark_model(asset: Mapping[str, Any], *, auto_model_cls):
+def load_benchmark_model(asset: Mapping[str, Any], *, auto_model_cls: Any) -> Any:
     """Load model weights and remote code from the same immutable commit."""
     revision = asset["revision"]
     return auto_model_cls.from_pretrained(
@@ -84,7 +88,7 @@ def load_benchmark_model(asset: Mapping[str, Any], *, auto_model_cls):
     )
 
 
-def load_benchmark_tokenizer(asset: Mapping[str, Any], *, auto_tokenizer_cls):
+def load_benchmark_tokenizer(asset: Mapping[str, Any], *, auto_tokenizer_cls: Any) -> Any:
     """Load the tokenizer from its immutable manifest commit."""
     return auto_tokenizer_cls.from_pretrained(
         asset["repo_id"],

@@ -1,16 +1,55 @@
 """Opt-in publication of complete trained-model artifacts."""
 
+import json
+
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Callable, Optional
+from typing import Any
 
 
 REMOTE_CODE_REQUIREMENTS = "torch>=2.5\ntransformers>=4.57.6,<5\n"
 
 
-def _unwrap_model(model):
+def _validate_model_weights(artifact_dir: Path, files: set[str]) -> None:
+    """Require a weight file or an index whose referenced shards all exist."""
+    weight_names = ("model.safetensors", "pytorch_model.bin")
+    for name in weight_names:
+        if name in files:
+            return
+
+        index_name = f"{name}.index.json"
+        if index_name not in files:
+            continue
+
+        try:
+            index = json.loads((artifact_dir / index_name).read_text(encoding="utf-8"))
+        except (ValueError, OSError) as error:
+            raise RuntimeError(f"Invalid model weight index: {index_name}") from error
+
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map or any(
+            not isinstance(key, str)
+            or not isinstance(shard, str)
+            or not shard.endswith(Path(name).suffix)
+            for key, shard in weight_map.items()
+        ):
+            raise RuntimeError(f"Invalid weight_map in model weight index: {index_name}")
+
+        missing = set(weight_map.values()) - files
+        if missing:
+            raise RuntimeError(
+                "Refusing to publish an incomplete model artifact; missing weight shards: "
+                + ", ".join(sorted(missing))
+            )
+        return
+
+    raise RuntimeError("Refusing to publish an artifact without model weights.")
+
+
+def _unwrap_model(model: Any) -> Any:
     """Remove DDP and torch.compile wrappers before serialization."""
-    seen = set()
+    seen: set[int] = set()
     while id(model) not in seen:
         seen.add(id(model))
         if hasattr(model, "module"):
@@ -24,12 +63,12 @@ def _unwrap_model(model):
 
 
 def publish_model_to_hub(
-    model,
-    repo_id: Optional[str],
+    model: Any,
+    repo_id: str | None,
     *,
     enabled: bool = False,
-    api_factory: Optional[Callable] = None,
-):
+    api_factory: Callable[[], Any] | None = None,
+) -> Any:
     """Publish one complete model snapshot in a single Hub commit.
 
     Nothing is imported from or sent to the Hub unless ``enabled`` is true.
@@ -67,8 +106,7 @@ def publish_model_to_hub(
                 "Refusing to publish an incomplete model artifact; missing: "
                 + ", ".join(sorted(missing))
             )
-        if not ({"model.safetensors", "pytorch_model.bin"} & files):
-            raise RuntimeError("Refusing to publish an artifact without model weights.")
+        _validate_model_weights(artifact_dir, files)
 
         if api_factory is None:
             from huggingface_hub import HfApi

@@ -2,17 +2,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from typing import Optional, Protocol
+
+
+class MLPConfig(Protocol):
+    hidden_size: int
+    expansion_ratio: float
+
 
 def norm(x: torch.Tensor) -> torch.Tensor:
-    return F.rms_norm(x, (x.size(-1),))
+    # x: (..., d), with any leading dimensions.
+    return F.rms_norm(x, (x.size(-1),))  # (..., d)
 
 
 class Linear(nn.Linear):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__(in_features, out_features, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight.to(x.dtype))
+        # x: (..., d_in); weight: (d_out, d_in).
+        return F.linear(x, self.weight.to(x.dtype))  # (..., d_out)
     
 
 def correction_fn(expansion_ratio: float, d_model: int) -> int:
@@ -20,31 +29,30 @@ def correction_fn(expansion_ratio: float, d_model: int) -> int:
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: MLPConfig) -> None:
         super().__init__()
-        corrected_dim = correction_fn(config.expansion_ratio, config.hidden_size)
+        corrected_dim = correction_fn(config.expansion_ratio, config.hidden_size)  # d_mlp
         self.up = Linear(config.hidden_size, corrected_dim)
         self.down = Linear(corrected_dim, config.hidden_size)
-        self.down.weight.data.zero_()
+        self.down.weight.data.zero_()  # (d, d_mlp); start with a zero MLP residual.
         self.relu = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(self.relu(self.up(x)).square())
+        # x: (..., d); the intermediate projection has width d_mlp.
+        return self.down(self.relu(self.up(x)).square())  # (..., d)
 
 
 class BottleneckMLP(nn.Module):
-    """MLP block used when sequence is a vector (length 1) in Conv1D UNet.
-    Replaces transformer blocks at depths where sequence length = 1.
-    Takes hidden_size directly instead of config to support variable sizes per layer.
-    """
-    def __init__(self, hidden_size: int, expansion_ratio: float, base_hidden_size: int = None):
+    """Residual MLP for a UNet bottleneck with sequence length one."""
+
+    def __init__(self, hidden_size: int, expansion_ratio: float, base_hidden_size: Optional[int] = None) -> None:
         super().__init__()
-        corrected_dim = correction_fn(expansion_ratio, hidden_size)
+        corrected_dim = correction_fn(expansion_ratio, hidden_size)  # d_mlp
         self.up = Linear(hidden_size, corrected_dim)
         self.down = Linear(corrected_dim, hidden_size)
-        self.down.weight.data.zero_()
+        self.down.weight.data.zero_()  # (d, d_mlp)
         self.relu = nn.ReLU()
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))  # (2,)
         
         # Projection layer for x0 if hidden sizes differ (for Conv1D UNet)
         if base_hidden_size is not None and base_hidden_size != hidden_size:
@@ -55,14 +63,13 @@ class BottleneckMLP(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
-            x0: torch.Tensor = None,
-            **kwargs,
+            x0: Optional[torch.Tensor] = None,
+            **kwargs: object,
         ) -> torch.Tensor:
-        # Apply residual mixing with x0 if provided (for UNet skip connections)
+        # x: (b, 1, d); x0: (b, 1, d_base) before optional projection.
         if x0 is not None:
             if self.x0_projection is not None:
-                x0 = self.x0_projection(x0)
-            x = self.lambdas[0] * x + self.lambdas[1] * x0
-        # Two-layer MLP with squared ReLU
-        out = self.down(self.relu(self.up(norm(x))).square())
-        return x + out
+                x0 = self.x0_projection(x0)  # (b, 1, d)
+            x = self.lambdas[0] * x + self.lambdas[1] * x0  # (b, 1, d)
+        out = self.down(self.relu(self.up(norm(x))).square())  # (b, 1, d)
+        return x + out  # (b, 1, d)

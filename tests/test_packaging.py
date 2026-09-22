@@ -7,16 +7,16 @@ import sys
 import tarfile
 import venv
 import zipfile
-from pathlib import Path
-
 import pytest
+
+from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(scope="module")
-def built_distributions(tmp_path_factory):
+def built_distributions(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path, Path]:
     build_root = tmp_path_factory.mktemp("package-build")
     source = build_root / "source"
     source.mkdir()
@@ -27,9 +27,14 @@ def built_distributions(tmp_path_factory):
         "README.md",
         "pyproject.toml",
         "requirements.txt",
+        "prepare.py",
+        "train.py",
+        "research.py",
+        "program.md",
+        "experiment.json",
     ):
         shutil.copy2(ROOT / filename, source / filename)
-    for directory in ("evaluation", "example_yamls", "src", "tests"):
+    for directory in ("evaluation", "src", "tests", "targets"):
         shutil.copytree(ROOT / directory, source / directory)
 
     dist = build_root / "dist"
@@ -58,7 +63,7 @@ def built_distributions(tmp_path_factory):
     return wheels[0], sdists[0], build_root
 
 
-def test_wheel_contains_full_package_and_declares_runtime_dependencies(built_distributions):
+def test_wheel_contains_full_package_and_declares_runtime_dependencies(built_distributions: tuple[Path, Path, Path]) -> None:
     wheel, _, _ = built_distributions
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
@@ -71,6 +76,9 @@ def test_wheel_contains_full_package_and_declares_runtime_dependencies(built_dis
             "speedrunning_plms/optim/muon.py",
             "speedrunning_plms/training/cli.py",
             "speedrunning_plms/training/publishing.py",
+            "speedrunning_plms/research/benchmark.py",
+            "speedrunning_plms/research/engine.py",
+            "speedrunning_plms/research/runner.py",
         }
         assert expected_modules <= names
         assert not any(name.startswith("tests/") for name in names)
@@ -86,7 +94,7 @@ def test_wheel_contains_full_package_and_declares_runtime_dependencies(built_dis
         assert any('extra == "test"' in requirement for requirement in requirements)
 
 
-def test_sdist_contains_sources_tests_and_build_metadata(built_distributions):
+def test_sdist_contains_sources_tests_and_build_metadata(built_distributions: tuple[Path, Path, Path]) -> None:
     _, sdist, _ = built_distributions
     with tarfile.open(sdist, "r:gz") as archive:
         names = {Path(name).as_posix() for name in archive.getnames()}
@@ -101,10 +109,14 @@ def test_sdist_contains_sources_tests_and_build_metadata(built_distributions):
         f"{prefix}src/speedrunning_plms/models/plm.py",
         f"{prefix}tests/test_benchmark_manifest.py",
         f"{prefix}tests/test_hf_serialization.py",
+        f"{prefix}program.md",
+        f"{prefix}experiment.json",
+        f"{prefix}prepare.py",
+        f"{prefix}research.py",
     } <= names
 
 
-def test_installed_wheel_imports_and_console_entrypoint(built_distributions):
+def test_installed_wheel_imports_and_console_entrypoint(built_distributions: tuple[Path, Path, Path]) -> None:
     wheel, _, build_root = built_distributions
     environment = build_root / "venv"
     venv.EnvBuilder(with_pip=True).create(environment)
@@ -190,4 +202,12 @@ assert callable(publish_model_to_hub)
         timeout=120,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "Synthyra Trainer" in completed.stdout
+    assert "fixed 15% masking" in completed.stdout
+    for name, expected in (("speedrun-prepare", "--include-test"), ("speedrun-research", "run")):
+        entrypoint = console.with_name(name + (".exe" if os.name == "nt" else ""))
+        completed = subprocess.run(
+            [str(entrypoint), "--help"], cwd=smoke_dir, env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert expected in completed.stdout

@@ -1,0 +1,13 @@
+{
+  "architecture": "standard",
+  "hidden_size": 256,
+  "heads": 4,
+  "layers": 6,
+  "batch_size": 16,
+  "grad_accum": 1,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.01,
+  "compile": false,
+  "bf16": false,
+  "seed": 42
+}

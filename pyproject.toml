@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "speedrunning-plms"
 version = "0.1.0"
-description = "Fast protein language model training components and recipes."
+description = "Fixed 15% protein MLM benchmarks and autonomous GPU experiments."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -49,10 +49,14 @@ evaluation = [
 test = [
     "build>=1.2,<2",
     "pytest>=8,<9",
+    "setuptools>=68",
+    "wheel>=0.43",
 ]
 
 [project.scripts]
-speedrun-plm = "speedrunning_plms.training.cli:main"
+speedrun-plm = "speedrunning_plms.research.engine:main"
+speedrun-prepare = "speedrunning_plms.research.benchmark:prepare_main"
+speedrun-research = "speedrunning_plms.research.runner:main"
 
 [project.urls]
 Homepage = "https://github.com/Synthyra/SpeedrunningPLMs"

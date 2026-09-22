@@ -28,6 +28,7 @@ from speedrunning_plms.data.splits import (
 )
 from speedrunning_plms.data.tokens import TokenIds
 
+
 __all__ = [
     "AsyncBatchPipeline",
     "ChunkedEvalDataset",
