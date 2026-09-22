@@ -13,6 +13,10 @@ class AttentionConfig(Protocol):
     num_attention_heads: int
     unet: bool
     compile_flex_attention: bool
+    fused_qkv: bool
+    attention_backend: str
+    value_embeddings: bool
+    value_embedding_gate: bool
 
 
 class Rotary(nn.Module):
@@ -55,18 +59,25 @@ class SelfAttention(nn.Module):
         self.Wo = Linear(self.hidden_size, self.hidden_size)
         self.Wo.weight.data.zero_()  # (d, d); start with a zero attention residual.
         
-        if config.unet:
+        self.value_embeddings = getattr(config, "value_embeddings", config.unet)
+        self.fused_qkv = getattr(config, "fused_qkv", False)
+        self.attention_backend = getattr(config, "attention_backend", "flex")
+        if self.value_embeddings:
             self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))  # (2,)
+        self.value_gate = None
+        if getattr(config, "value_embedding_gate", False) and self.value_embeddings:
+            self.value_gate = Linear(self.hidden_size, self.n_heads)
+            self.value_gate.weight.data.zero_()  # (h, d); initial gate multiplier is one.
 
         self.unet = config.unet
         self.flex_attention = flex_attention
-        if config.compile_flex_attention:
+        if config.compile_flex_attention and self.attention_backend == "flex":
             self.flex_attention = torch.compile(flex_attention)
 
     def forward(
             self,
             x: torch.Tensor,
-            attention_mask: Optional[BlockMask] = None,
+            attention_mask: Optional[BlockMask | torch.Tensor] = None,
             vi: Optional[torch.Tensor] = None,
             **kwargs: object,
         ) -> torch.Tensor:
@@ -79,14 +90,23 @@ class SelfAttention(nn.Module):
                 vi = vi.unsqueeze(0)  # (1, l, d)
 
         batch_size, seq_len, hidden_size = x.size()
-        Q, K, V = self.Wq(x), self.Wk(x), self.Wv(x)  # each (b, l, d)
+        if self.fused_qkv:
+            # Keep the three parameters separate for checkpoint and optimizer semantics.
+            weight = torch.cat((self.Wq.weight, self.Wk.weight, self.Wv.weight), dim=0).to(x.dtype)  # (3 * d, d)
+            Q, K, V = F.linear(x, weight).chunk(3, dim=-1)  # each (b, l, d)
+        else:
+            Q, K, V = self.Wq(x), self.Wk(x), self.Wv(x)  # each (b, l, d)
 
         Q = Q.view(batch_size, seq_len, self.n_heads, self.d_head)  # (b, l, h, d_h)
         K = K.view(batch_size, seq_len, self.n_heads, self.d_head)  # (b, l, h, d_h)
         V = V.view(batch_size, seq_len, self.n_heads, self.d_head)  # (b, l, h, d_h)
 
-        if self.unet and vi is not None:
-            V = self.lambdas[0] * V + self.lambdas[1] * vi.view_as(V)  # (b, l, h, d_h)
+        if self.value_embeddings and vi is not None:
+            values = vi.view_as(V)  # (b, l, h, d_h)
+            if self.value_gate is not None:
+                gate = 2 * torch.sigmoid(self.value_gate(x)).unsqueeze(-1)  # (b, l, h, 1)
+                values = values * gate  # (b, l, h, d_h)
+            V = self.lambdas[0] * V + self.lambdas[1] * values  # (b, l, h, d_h)
         
         Q, K = norm(Q), norm(K)  # each (b, l, h, d_h)
         Q, K = self.rotary(Q), self.rotary(K)  # each (b, l, h, d_h)
@@ -94,12 +114,12 @@ class SelfAttention(nn.Module):
             assert seq_len <= 1, "attention_mask is required for seq_len > 1 to avoid dense attention"
         
         Q, K, V = Q.transpose(1, 2), K.transpose(1, 2), V.transpose(1, 2)  # each (b, h, l, d_h)
-        if Q.device.type == "cpu":
+        if self.attention_backend == "sdpa" or Q.device.type == "cpu":
             # FlexAttention does not support CPU backward. Build the exact
             # token-level mask from the BlockMask closure and use PyTorch's
             # differentiable dense attention fallback for CPU use.
-            dense_mask = None  # Optional (b, h, l, l).
-            if attention_mask is not None:
+            dense_mask = attention_mask  # Optional (b, 1 or h, l, l) tensor or BlockMask.
+            if isinstance(attention_mask, BlockMask):
                 dense_mask = create_mask(
                     attention_mask.mask_mod,
                     B=batch_size,

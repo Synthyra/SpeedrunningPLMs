@@ -6,6 +6,7 @@ include train.py
 include research.py
 include program.md
 include experiment.json
+include experiments/generalizable.json
 recursive-include targets *.json
 recursive-include evaluation *.py *.json
 recursive-include tests *.py

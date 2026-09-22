@@ -43,7 +43,13 @@ GPT-6 Astra (`gpt-6-astra`), GPT-5.6 Sol (`gpt-5.6-sol`), and Claude Opus 5.5
 
 Start with experiment.json: architecture, width, depth, attention heads, batch
 size, accumulation, learning rate, weight decay, and precision/compilation options.
-Model code under src/speedrunning_plms/models is also editable. Changes to the
+The optional settings in README.md add Muon/Polar Express, budget-relative LR and
+momentum schedules, accumulation growth, prefetching, fused QKV, SDPA, and independent
+value-embedding/residual features. `experiments/generalizable.json` is an unmeasured
+candidate profile, not a replacement for the baseline. Change one option at a time
+before testing combinations. Keep compilation and prefetch cleanup in the budget.
+Model code under src/speedrunning_plms/models and optimizer code under
+src/speedrunning_plms/optim are editable. Changes to the
 training algorithm in research/engine.py are allowed if they preserve fixed
 corruption, time accounting, validation calls, and result integrity.
 Keep the evaluator and transport code fixed. Do not optimize by changing seed,

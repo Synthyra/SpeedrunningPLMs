@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import transformers
 
 from collections.abc import Iterator, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,9 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel
 
 from speedrunning_plms.models import PLM, PLMConfig
+from speedrunning_plms.optim.factory import build_optimizers
 from speedrunning_plms.research import benchmark
+from speedrunning_plms.research.batches import prepared_batches
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,25 @@ class ExperimentConfig:
     grad_accum: int = 1
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
+    optimizer: str = "adamw"
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_steps: int = 5
+    muon_backend: str = "newton_schulz"
+    momentum_warmup_fraction: float = 0.0
+    momentum_start: float = 0.85
+    fused_adam: bool = False
+    lr_schedule: str = "constant"
+    warmup_fraction: float = 0.05
+    cooldown_fraction: float = 0.5
+    min_lr_ratio: float = 0.1
+    grad_accum_final: int | None = None
+    prefetch: bool = False
+    fused_qkv: bool = False
+    attention_backend: str = "flex"
+    value_embeddings: bool | None = None
+    embedding_residual: bool | None = None
+    value_embedding_gate: bool = False
     architecture: str = "standard"
     hidden_size: int = 256
     heads: int = 4
@@ -51,20 +73,45 @@ class ExperimentConfig:
 
 def _validate(config: ExperimentConfig) -> None:
     integer_fields = (
-        "batch_size", "grad_accum", "hidden_size", "heads", "layers", "patch_layers", "cpu_threads",
+        "batch_size", "grad_accum", "hidden_size", "heads", "layers", "patch_layers", "cpu_threads", "muon_steps",
     )
     for name in integer_fields:
         value = getattr(config, name)
         if type(value) is not int or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
 
-    for name in ("time_budget", "learning_rate", "weight_decay"):
+    for name in ("time_budget", "learning_rate", "weight_decay", "muon_lr"):
         value = getattr(config, name)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
 
     if config.time_budget == 0 or config.learning_rate == 0:
         raise ValueError("time_budget and learning_rate must be positive")
+    if config.muon_lr == 0:
+        raise ValueError("muon_lr must be positive")
+    for name in ("warmup_fraction", "cooldown_fraction", "min_lr_ratio", "momentum_warmup_fraction",
+                 "muon_momentum", "momentum_start"):
+        value = getattr(config, name)
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{name} must be finite and between zero and one")
+    if config.warmup_fraction + config.cooldown_fraction > 1:
+        raise ValueError("warmup_fraction + cooldown_fraction must be at most one")
+    if config.muon_momentum == 1 or config.momentum_start == 1:
+        raise ValueError("Muon momentum must be less than one")
+    if config.grad_accum_final is not None and (
+        type(config.grad_accum_final) is not int or config.grad_accum_final < config.grad_accum
+    ):
+        raise ValueError("grad_accum_final must be an integer >= grad_accum")
+    for name, choices in (
+        ("optimizer", {"adamw", "muon"}),
+        ("muon_backend", {"newton_schulz", "polar_express"}),
+        ("lr_schedule", {"constant", "warmup_cosine"}),
+        ("attention_backend", {"flex", "sdpa"}),
+    ):
+        if getattr(config, name) not in choices:
+            raise ValueError(f"{name} must be one of {sorted(choices)}")
+    if config.muon_backend == "polar_express" and config.muon_steps != 5:
+        raise ValueError("polar_express requires muon_steps=5")
     if config.max_steps is not None and (type(config.max_steps) is not int or config.max_steps <= 0):
         raise ValueError("max_steps must be a positive integer")
     if type(config.seed) is not int or not -(2**63) <= config.seed < 2**64:
@@ -85,9 +132,12 @@ def _validate(config: ExperimentConfig) -> None:
     if config.split == "test" and not config.evaluate_only:
         raise ValueError("The test split is only available with --evaluate-only")
 
-    for name in ("compile", "bf16"):
+    for name in ("compile", "bf16", "fused_adam", "prefetch", "fused_qkv", "value_embedding_gate"):
         if type(getattr(config, name)) is not bool:
             raise ValueError(f"{name} must be a boolean")
+    for name in ("value_embeddings", "embedding_residual"):
+        if getattr(config, name) is not None and type(getattr(config, name)) is not bool:
+            raise ValueError(f"{name} must be a boolean or null")
 
 
 def _distributed_environment() -> tuple[int, int, int]:
@@ -158,6 +208,43 @@ def _deadline_reached(
     return bool(stop.item())
 
 
+def learning_rate_scale(progress: float, config: ExperimentConfig) -> float:
+    """Warm up, hold, then cosine-decay using fractions of the training budget."""
+    if config.lr_schedule == "constant":
+        return 1.0
+    progress = min(1.0, max(0.0, progress))
+    if config.warmup_fraction and progress < config.warmup_fraction:
+        return config.min_lr_ratio + (1 - config.min_lr_ratio) * progress / config.warmup_fraction
+    if config.cooldown_fraction and progress > 1 - config.cooldown_fraction:
+        phase = (progress - (1 - config.cooldown_fraction)) / config.cooldown_fraction
+        return config.min_lr_ratio + (1 - config.min_lr_ratio) * (1 + math.cos(math.pi * phase)) / 2
+    return 1.0
+
+
+def _training_progress(
+    start: float, config: ExperimentConfig, device: torch.device, rank: int, world_size: int,
+) -> float:
+    # Only rank zero reads the clock so all ranks choose the same accumulation count.
+    scheduled = (config.lr_schedule != "constant" or config.grad_accum_final is not None
+                 or (config.optimizer == "muon" and config.momentum_warmup_fraction > 0))
+    if not scheduled:
+        return 0.0
+    elapsed = time.perf_counter() - start if rank == 0 else 0.0
+    progress = torch.tensor(elapsed / config.time_budget, device=device, dtype=torch.float64)  # ()
+    if world_size > 1:
+        dist.broadcast(progress, src=0)  # ()
+    return min(1.0, max(0.0, progress.item()))
+
+
+def accumulation_steps(progress: float, config: ExperimentConfig) -> int:
+    """Grow effective batch size without changing microbatch shapes or token order."""
+    final = config.grad_accum_final or config.grad_accum
+    if final == config.grad_accum:
+        return final
+    stages = final - config.grad_accum + 1
+    return min(final, config.grad_accum + int(max(0.0, progress) * stages))
+
+
 def _train(
     model: torch.nn.Module,
     tokens: Tensor,
@@ -167,7 +254,12 @@ def _train(
     world_size: int,
 ) -> tuple[int, int, float]:
     # tokens: (n, l). DDP averages gradients; scale to the global masked-token mean.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizers = build_optimizers(
+        model, optimizer=config.optimizer, learning_rate=config.learning_rate, muon_lr=config.muon_lr,
+        weight_decay=config.weight_decay, muon_momentum=config.muon_momentum,
+        muon_steps=config.muon_steps, muon_backend=config.muon_backend, fused_adam=config.fused_adam,
+    )
+    initial_lrs = [[group["lr"] for group in optimizer.param_groups] for optimizer in optimizers]
     batches = training_batches(tokens, config.batch_size, config.seed, rank, world_size)
     generator = torch.Generator().manual_seed((config.seed + 1 + rank) % 2**64)
     model.train()
@@ -175,53 +267,65 @@ def _train(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     start = time.perf_counter()
-    while True:
-        if config.max_steps is not None and attempts >= config.max_steps:
-            break
-        if _deadline_reached(start, config.time_budget, device, rank, world_size):
-            break
-
-        optimizer.zero_grad(set_to_none=True)
-        masked_count = torch.zeros((), dtype=torch.long, device=device)  # ()
-        finite = torch.ones((), dtype=torch.long, device=device)  # ()
-        interrupted = False
-        for _ in range(config.grad_accum):
-            if _deadline_reached(start, config.time_budget, device, rank, world_size):
-                interrupted = True
+    with prepared_batches(batches, generator, device, prefetch=config.prefetch) as prepared:
+        while True:
+            if config.max_steps is not None and attempts >= config.max_steps:
                 break
-            inputs, labels = benchmark.corrupt_tokens(next(batches), generator=generator)  # each (b, l)
-            inputs, labels = inputs.to(device), labels.to(device)  # each (b, l)
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.bf16):
-                attention_mask = inputs != benchmark.PAD_TOKEN_ID  # (b, l)
-                logits = model(input_ids=inputs, attention_mask=attention_mask).logits  # (b, l, c)
-                loss = _loss_sum(logits, labels)  # ()
-            finite *= torch.isfinite(loss).long()  # ()
-            loss.backward()
-            masked_count += (labels != -100).sum()  # ()
-        if interrupted:
-            optimizer.zero_grad(set_to_none=True)
-            break
-
-        if world_size > 1:
-            dist.all_reduce(masked_count)  # ()
-            dist.all_reduce(finite, op=dist.ReduceOp.MIN)  # ()
-        if not finite.item():
-            raise ValueError("Training produced a non-finite loss")
-
-        count = masked_count.item()
-        if count:
-            for parameter in model.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.mul_(world_size / count)  # same shape as parameter
-            # Discard overtime work so long microbatches or accumulation cannot
-            # buy extra updates. CUDA synchronization also meters gradient scaling.
             if _deadline_reached(start, config.time_budget, device, rank, world_size):
-                optimizer.zero_grad(set_to_none=True)
                 break
-            optimizer.step()
-            steps += 1
-        attempts += 1
-        total_masked += count
+
+            model.zero_grad(set_to_none=True)
+            progress = _training_progress(start, config, device, rank, world_size)
+            grad_accum = accumulation_steps(progress, config)
+            masked_count = torch.zeros((), dtype=torch.long, device=device)  # ()
+            finite = torch.ones((), dtype=torch.long, device=device)  # ()
+            interrupted = False
+            for microbatch in range(grad_accum):
+                if _deadline_reached(start, config.time_budget, device, rank, world_size):
+                    interrupted = True
+                    break
+                inputs, labels = next(prepared)  # each (b, l)
+                synchronize = microbatch == grad_accum - 1 or not isinstance(model, DistributedDataParallel)
+                with nullcontext() if synchronize else model.no_sync():
+                    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.bf16):
+                        attention_mask = inputs != benchmark.PAD_TOKEN_ID  # (b, l)
+                        logits = model(input_ids=inputs, attention_mask=attention_mask).logits  # (b, l, c)
+                        loss = _loss_sum(logits, labels)  # ()
+                    finite *= torch.isfinite(loss).long()  # ()
+                    loss.backward()
+                masked_count += (labels != -100).sum()  # ()
+            if interrupted:
+                model.zero_grad(set_to_none=True)
+                break
+
+            if world_size > 1:
+                dist.all_reduce(masked_count)  # ()
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN)  # ()
+            if not finite.item():
+                raise ValueError("Training produced a non-finite loss")
+
+            count = masked_count.item()
+            if count:
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(world_size / count)  # same shape as parameter
+                scale = learning_rate_scale(progress, config)
+                for optimizer, base_lrs in zip(optimizers, initial_lrs):
+                    for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                        group["lr"] = base_lr * scale
+                        if "momentum" in group and config.momentum_warmup_fraction:
+                            phase = min(1.0, progress / config.momentum_warmup_fraction)
+                            group["momentum"] = config.momentum_start + phase * (config.muon_momentum - config.momentum_start)
+                # Discard overtime work so long microbatches or accumulation cannot
+                # buy extra updates. CUDA synchronization also meters gradient scaling.
+                if _deadline_reached(start, config.time_budget, device, rank, world_size):
+                    model.zero_grad(set_to_none=True)
+                    break
+                for optimizer in optimizers:
+                    optimizer.step()
+                steps += 1
+            attempts += 1
+            total_masked += count
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -277,6 +381,9 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                 compile_flex_attention=False, tokenizer_name=None,
                 cls_token_id=benchmark.CLS_TOKEN_ID, eos_token_id=benchmark.EOS_TOKEN_ID,
                 pad_token_id=benchmark.PAD_TOKEN_ID, mask_token_id=benchmark.MASK_TOKEN_ID,
+                fused_qkv=config.fused_qkv, attention_backend=config.attention_backend,
+                value_embeddings=config.value_embeddings, embedding_residual=config.embedding_residual,
+                value_embedding_gate=config.value_embedding_gate,
             )
             model = PLM(model_config).to(device)
 
@@ -353,11 +460,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     for field in fields(ExperimentConfig):
         default = getattr(defaults, field.name)
         kwargs: dict[str, Any] = {"default": argparse.SUPPRESS}
-        if field.name in {"compile", "bf16"}:
+        if isinstance(default, bool) or field.name in {"value_embeddings", "embedding_residual"}:
             kwargs["action"] = argparse.BooleanOptionalAction
         else:
             value_type = str if default is None else type(default)
-            kwargs["type"] = int if field.name == "max_steps" else value_type
+            kwargs["type"] = int if field.name in {"max_steps", "grad_accum_final"} else value_type
         parser.add_argument("--" + field.name.replace("_", "-"), **kwargs)
 
     arguments = vars(parser.parse_args(argv))

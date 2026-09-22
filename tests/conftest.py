@@ -1,4 +1,4 @@
-"""Keep the test suite offline and inexpensive on CPU."""
+"""Keep tests offline; hide GPUs unless CUDA checks are explicitly requested."""
 
 import os
 import sys
@@ -9,7 +9,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+if os.environ.get("PLM_TEST_CUDA") != "1":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"

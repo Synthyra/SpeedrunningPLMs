@@ -45,17 +45,25 @@ class MLP(nn.Module):
 class BottleneckMLP(nn.Module):
     """Residual MLP for a UNet bottleneck with sequence length one."""
 
-    def __init__(self, hidden_size: int, expansion_ratio: float, base_hidden_size: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion_ratio: float,
+        base_hidden_size: Optional[int] = None,
+        embedding_residual: bool = True,
+    ) -> None:
         super().__init__()
         corrected_dim = correction_fn(expansion_ratio, hidden_size)  # d_mlp
         self.up = Linear(hidden_size, corrected_dim)
         self.down = Linear(corrected_dim, hidden_size)
         self.down.weight.data.zero_()  # (d, d_mlp)
         self.relu = nn.ReLU()
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))  # (2,)
+        self.embedding_residual = embedding_residual
+        if self.embedding_residual:
+            self.lambdas = nn.Parameter(torch.tensor([1., 0.]))  # (2,)
         
         # Projection layer for x0 if hidden sizes differ (for Conv1D UNet)
-        if base_hidden_size is not None and base_hidden_size != hidden_size:
+        if self.embedding_residual and base_hidden_size is not None and base_hidden_size != hidden_size:
             self.x0_projection = Linear(base_hidden_size, hidden_size)
         else:
             self.x0_projection = None
@@ -67,7 +75,7 @@ class BottleneckMLP(nn.Module):
             **kwargs: object,
         ) -> torch.Tensor:
         # x: (b, 1, d); x0: (b, 1, d_base) before optional projection.
-        if x0 is not None:
+        if self.embedding_residual and x0 is not None:
             if self.x0_projection is not None:
                 x0 = self.x0_projection(x0)  # (b, 1, d)
             x = self.lambdas[0] * x + self.lambdas[1] * x0  # (b, 1, d)

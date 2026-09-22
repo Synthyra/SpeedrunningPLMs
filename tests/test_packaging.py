@@ -34,7 +34,7 @@ def built_distributions(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path,
         "experiment.json",
     ):
         shutil.copy2(ROOT / filename, source / filename)
-    for directory in ("evaluation", "src", "tests", "targets"):
+    for directory in ("evaluation", "src", "tests", "targets", "experiments"):
         shutil.copytree(ROOT / directory, source / directory)
 
     dist = build_root / "dist"
@@ -74,10 +74,12 @@ def test_wheel_contains_full_package_and_declares_runtime_dependencies(built_dis
             "speedrunning_plms/flex/mods.py",
             "speedrunning_plms/models/plm.py",
             "speedrunning_plms/optim/muon.py",
+            "speedrunning_plms/optim/factory.py",
             "speedrunning_plms/training/cli.py",
             "speedrunning_plms/training/publishing.py",
             "speedrunning_plms/research/benchmark.py",
             "speedrunning_plms/research/engine.py",
+            "speedrunning_plms/research/batches.py",
             "speedrunning_plms/research/runner.py",
         }
         assert expected_modules <= names
@@ -111,6 +113,7 @@ def test_sdist_contains_sources_tests_and_build_metadata(built_distributions: tu
         f"{prefix}tests/test_hf_serialization.py",
         f"{prefix}program.md",
         f"{prefix}experiment.json",
+        f"{prefix}experiments/generalizable.json",
         f"{prefix}prepare.py",
         f"{prefix}research.py",
     } <= names

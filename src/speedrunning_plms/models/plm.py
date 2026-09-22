@@ -53,6 +53,11 @@ class PLMConfig(PretrainedConfig):
         masked_diffusion: bool = False,
         token_dropout: bool = True,
         compile_flex_attention: bool = True,
+        fused_qkv: bool = False,
+        attention_backend: str = "flex",
+        value_embeddings: Optional[bool] = None,
+        embedding_residual: Optional[bool] = None,
+        value_embedding_gate: bool = False,
         tokenizer_name: Optional[str] = "facebook/esm2_t6_8M_UR50D",
         cls_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
@@ -85,6 +90,15 @@ class PLMConfig(PretrainedConfig):
         self.masked_diffusion = masked_diffusion
         self.token_dropout = token_dropout
         self.compile_flex_attention = compile_flex_attention
+        if attention_backend not in {"flex", "sdpa"}:
+            raise ValueError("attention_backend must be 'flex' or 'sdpa'.")
+        self.fused_qkv = fused_qkv
+        self.attention_backend = attention_backend
+        self.value_embeddings = (unet or patch_unet) if value_embeddings is None else value_embeddings
+        self.embedding_residual = (unet or patch_unet) if embedding_residual is None else embedding_residual
+        self.value_embedding_gate = value_embedding_gate
+        if value_embedding_gate and not self.value_embeddings:
+            raise ValueError("value_embedding_gate requires value_embeddings.")
         self.tokenizer_name = tokenizer_name
         self.cls_token_id = cls_token_id
         self.eos_token_id = eos_token_id
@@ -156,15 +170,18 @@ class PatchExpand(nn.Module):
 class ValueEmbedding(nn.Module):
     def __init__(self, config: PLMConfig) -> None:
         super().__init__()
+        self.unet = config.unet
+        count = config.num_hidden_layers // 2 if config.unet else config.num_hidden_layers
         self.embed = nn.ModuleList([
             nn.Embedding(config.vocab_size, config.hidden_size)
-            for _ in range(config.num_hidden_layers // 2)
+            for _ in range(count)
         ])
 
     def forward(self, inputs: torch.Tensor) -> list[torch.Tensor]:
         # inputs: (l,) or (b, l); each embedding appends hidden width d.
         ve = [emb(inputs) for emb in self.embed]  # List of (..., d) tensors; mirrored for decoder layers.
-        ve += reversed(ve)  # List of (..., d) tensors; mirrored for decoder layers.
+        if self.unet:
+            ve += reversed(ve)  # List of (..., d) tensors; mirrored for decoder layers.
         return ve  # List of (..., d) tensors.
 
 
@@ -192,35 +209,29 @@ class TransformerBlock(nn.Module):
         self.attn = SelfAttention(config)
         self.mlp = MLP(config)
         self.unet = config.unet
-        if config.unet:
+        self.embedding_residual = config.embedding_residual
+        if self.embedding_residual:
             self.lambdas = nn.Parameter(torch.tensor([1., 0.]))  # (2,)
 
     def forward(
             self,
             x: torch.Tensor,
-            attention_mask: Optional[BlockMask] = None,
+            attention_mask: Optional[BlockMask | torch.Tensor] = None,
             vi: Optional[torch.Tensor] = None,
             x0: Optional[torch.Tensor] = None,
             last_eos: Optional[int] = None,
             **kwargs: Any,
         ) -> torch.Tensor:
         # x, vi, x0: (..., d); attention_mask covers (b, h, l, l).
-        if self.unet:
+        if self.embedding_residual and x0 is not None:
             x = self.lambdas[0] * x + self.lambdas[1] * x0  # (..., d)
-            x = x + self.attn(
-                x=norm(x),
-                attention_mask=attention_mask,
-                vi=vi,
-                last_eos=last_eos,
-                **kwargs,
-            )  # (..., d)
-        else:
-            x = x + self.attn(
-                x=norm(x),
-                attention_mask=attention_mask,
-                last_eos=last_eos,
-                **kwargs,
-            )  # (..., d)
+        x = x + self.attn(
+            x=norm(x),
+            attention_mask=attention_mask,
+            vi=vi,
+            last_eos=last_eos,
+            **kwargs,
+        )  # (..., d)
         x = x + self.mlp(norm(x))  # (..., d)
         return x  # (..., d)
 
@@ -233,14 +244,18 @@ class Transformer(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
-            attention_mask: Optional[BlockMask] = None,
+            attention_mask: Optional[BlockMask | torch.Tensor] = None,
+            ve: Optional[list[torch.Tensor]] = None,
             **kwargs: Any,
         ) -> torch.Tensor:
         # x: (..., d); attention_mask covers (b, h, l, l).
-        for layer in self.layers:
+        x0 = x  # (..., d)
+        for index, layer in enumerate(self.layers):
             x = layer(
                 x=x,
                 attention_mask=attention_mask,
+                vi=ve[index] if ve is not None else None,
+                x0=x0,
                 **kwargs,
             )  # (..., d)
         return x  # (..., d)
@@ -260,19 +275,18 @@ class UnetTransformer(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
-            ve: list[torch.Tensor],
-            attention_mask: Optional[BlockMask] = None,
+            ve: Optional[list[torch.Tensor]] = None,
+            attention_mask: Optional[BlockMask | torch.Tensor] = None,
             **kwargs: Any,
         ) -> torch.Tensor:
         # x and each ve entry: (..., d); attention_mask covers (b, h, l, l).
         x0 = x  # (..., d)
-        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]  # Each entry: (..., d).
         skip_connections: list[torch.Tensor] = []  # One hidden-state tensor per encoder layer.
         for i in range(self.num_encoder_layers):
             x = self.layers[i](
                 x=x,
                 attention_mask=attention_mask,
-                vi=ve_enc[i],
+                vi=ve[i] if ve is not None else None,
                 x0=x0,
                 **kwargs,
             )  # (..., d)
@@ -283,7 +297,7 @@ class UnetTransformer(nn.Module):
             x = self.layers[self.num_encoder_layers + i](
                 x=x,
                 attention_mask=attention_mask,
-                vi=ve_dec[i],
+                vi=ve[self.num_encoder_layers + i] if ve is not None else None,
                 x0=x0,
                 **kwargs,
             )  # (..., d)
@@ -300,6 +314,11 @@ class BatchedTransformerBlock(nn.Module):
         expansion_ratio: float,
         base_hidden_size: Optional[int] = None,
         compile_flex_attention: bool = True,
+        fused_qkv: bool = False,
+        attention_backend: str = "flex",
+        value_embeddings: bool = True,
+        embedding_residual: bool = True,
+        value_embedding_gate: bool = False,
     ) -> None:
         super().__init__()
         config = SimpleNamespace(
@@ -307,6 +326,10 @@ class BatchedTransformerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             unet=True,
             compile_flex_attention=compile_flex_attention,
+            fused_qkv=fused_qkv,
+            attention_backend=attention_backend,
+            value_embeddings=value_embeddings,
+            value_embedding_gate=value_embedding_gate,
         )
         self.attn = SelfAttention(config)
 
@@ -316,9 +339,11 @@ class BatchedTransformerBlock(nn.Module):
         self.mlp_down.weight.data.zero_()  # (d, d_mlp); initialize the residual projection to zero.
         self.mlp_relu = nn.ReLU()
 
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))  # (2,)
+        self.embedding_residual = embedding_residual
+        if self.embedding_residual:
+            self.lambdas = nn.Parameter(torch.tensor([1., 0.]))  # (2,)
 
-        if base_hidden_size is not None and base_hidden_size != hidden_size:
+        if self.embedding_residual and base_hidden_size is not None and base_hidden_size != hidden_size:
             self.x0_projection = Linear(base_hidden_size, hidden_size)
         else:
             self.x0_projection = None
@@ -326,13 +351,13 @@ class BatchedTransformerBlock(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
-            attention_mask: Optional[BlockMask] = None,
+            attention_mask: Optional[BlockMask | torch.Tensor] = None,
             vi: Optional[torch.Tensor] = None,
             x0: Optional[torch.Tensor] = None,
             **kwargs: Any,
         ) -> torch.Tensor:
         # x, vi: (b, l, d); x0: (b, l, d_base) before projection.
-        if x0 is not None:
+        if self.embedding_residual and x0 is not None:
             if self.x0_projection is not None:
                 x0 = self.x0_projection(x0)  # (b, l, d)
             x = self.lambdas[0] * x + self.lambdas[1] * x0  # (b, l, d)
@@ -366,6 +391,20 @@ class BatchedValueEmbedding(nn.Module):
         return encoder_ve, decoder_ve  # Two lists of (b, l, d_i) tensors.
 
 
+def dense_document_mask(
+    doc_ids: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    sliding_window_size: int,
+) -> torch.Tensor:
+    """Build bidirectional document, padding, and window constraints for SDPA."""
+    # doc_ids, valid_tokens: (b, l); broadcast the mask over attention heads.
+    positions = torch.arange(doc_ids.shape[1], device=doc_ids.device)  # (l,)
+    window = (positions[:, None] - positions[None, :]).abs() < sliding_window_size  # (l, l)
+    same_document = doc_ids[:, :, None] == doc_ids[:, None, :]  # (b, l, l)
+    valid_pairs = valid_tokens[:, :, None] & valid_tokens[:, None, :]  # (b, l, l)
+    return (same_document & valid_pairs & window).unsqueeze(1)  # (b, 1, l, l)
+
+
 @torch.compiler.disable
 def precompute_multiresolution_masks(
     input_ids: torch.Tensor,
@@ -376,8 +415,9 @@ def precompute_multiresolution_masks(
     n_heads: int,
     device: torch.device,
     attention_mask: Optional[torch.Tensor] = None,
-) -> list[Optional[BlockMask]]:
-    """Build one attention BlockMask per UNet resolution.
+    attention_backend: str = "flex",
+) -> list[Optional[BlockMask | torch.Tensor]]:
+    """Build one attention mask per UNet resolution.
 
     input_ids and optional attention_mask have shape (b, l). CLS marks document
     starts; nonzero attention_mask entries mark valid tokens. Each level covers
@@ -399,7 +439,7 @@ def precompute_multiresolution_masks(
             )
         valid_tokens = attention_mask.to(device=device, dtype=torch.bool)  # (b, l)
 
-    masks: list[Optional[BlockMask]] = []
+    masks: list[Optional[BlockMask | torch.Tensor]] = []
     current_doc_ids = doc_ids  # (b, l)
     current_valid_tokens = valid_tokens  # (b, l)
     current_length = seq_len
@@ -426,14 +466,17 @@ def precompute_multiresolution_masks(
 
         mask_mod = make_mask_mod(current_doc_ids, current_valid_tokens, sliding_window_size)
 
-        block_mask = create_block_mask(
-            mask_mod=mask_mod,
-            B=batch_size,
-            H=n_heads,
-            Q_LEN=current_length,
-            KV_LEN=current_length,
-            device=device,
-        )  # BlockMask covering (b, h, current_length, current_length).
+        if attention_backend == "sdpa":
+            block_mask = dense_document_mask(current_doc_ids, current_valid_tokens, sliding_window_size)  # (b, 1, current_length, current_length)
+        else:
+            block_mask = create_block_mask(
+                mask_mod=mask_mod,
+                B=batch_size,
+                H=n_heads,
+                Q_LEN=current_length,
+                KV_LEN=current_length,
+                device=device,
+            )  # BlockMask covering (b, h, current_length, current_length).
         masks.append(block_mask)
 
         # A merged token remains valid if either source token is valid.
@@ -467,6 +510,7 @@ class BatchedUnetTransformer(nn.Module):
         self.num_decoder_layers = config.num_unet_layers // 2  # n_decoder_layers
         self.base_hidden_size = config.hidden_size  # d_base
         self.max_sequence_length = config.max_sequence_length
+        self.embedding_residual = config.embedding_residual
 
         # Vector depth: after this many downsamplings, seq_len=1
         self.vector_depth = int(math.log2(config.max_sequence_length))
@@ -485,7 +529,7 @@ class BatchedUnetTransformer(nn.Module):
 
             if i >= self.vector_depth:
                 self.encoder_blocks.append(
-                    BottleneckMLP(layer_hidden_size, config.expansion_ratio, self.base_hidden_size)
+                    BottleneckMLP(layer_hidden_size, config.expansion_ratio, self.base_hidden_size, config.embedding_residual)
                 )
             else:
                 self.encoder_blocks.append(
@@ -495,6 +539,11 @@ class BatchedUnetTransformer(nn.Module):
                         expansion_ratio=config.expansion_ratio,
                         base_hidden_size=self.base_hidden_size,
                         compile_flex_attention=config.compile_flex_attention,
+                        fused_qkv=config.fused_qkv,
+                        attention_backend=config.attention_backend,
+                        value_embeddings=config.value_embeddings,
+                        embedding_residual=config.embedding_residual,
+                        value_embedding_gate=config.value_embedding_gate,
                     )
                 )
 
@@ -519,7 +568,7 @@ class BatchedUnetTransformer(nn.Module):
 
             if effective_depth >= self.vector_depth:
                 self.decoder_blocks.append(
-                    BottleneckMLP(decoder_hidden_size, config.expansion_ratio, self.base_hidden_size)
+                    BottleneckMLP(decoder_hidden_size, config.expansion_ratio, self.base_hidden_size, config.embedding_residual)
                 )
             else:
                 self.decoder_blocks.append(
@@ -529,6 +578,11 @@ class BatchedUnetTransformer(nn.Module):
                         expansion_ratio=config.expansion_ratio,
                         base_hidden_size=self.base_hidden_size,
                         compile_flex_attention=config.compile_flex_attention,
+                        fused_qkv=config.fused_qkv,
+                        attention_backend=config.attention_backend,
+                        value_embeddings=config.value_embeddings,
+                        embedding_residual=config.embedding_residual,
+                        value_embedding_gate=config.value_embedding_gate,
                     )
                 )
 
@@ -557,7 +611,7 @@ class BatchedUnetTransformer(nn.Module):
             x: torch.Tensor,
             encoder_ve: list[torch.Tensor],
             decoder_ve: list[torch.Tensor],
-            attention_masks: list[Optional[BlockMask]],
+            attention_masks: list[Optional[BlockMask | torch.Tensor]],
             x0_full: torch.Tensor,
             **kwargs: Any,
         ) -> torch.Tensor:
@@ -598,7 +652,7 @@ class BatchedUnetTransformer(nn.Module):
                 x=x,
                 attention_mask=attn_mask,
                 vi=vi,
-                x0=x0_current,
+                x0=x0_current if self.embedding_residual else None,
                 **kwargs,
             )  # (b, current_length, d_i) at this layer.
             skip_connections.append(x)  # (b, current_length, d_i)
@@ -640,7 +694,7 @@ class BatchedUnetTransformer(nn.Module):
                 x=x,
                 attention_mask=attn_mask,
                 vi=vi,
-                x0=x0_current,
+                x0=x0_current if self.embedding_residual else None,
                 **kwargs,
             )  # (b, current_length, d_i) at this layer.
 
@@ -702,14 +756,18 @@ class PLM(PreTrainedModel):
             assert config.num_unet_layers > 0, "num_unet_layers must be > 0 for patch_unet"
             self.transformer = BatchedUnetTransformer(config)
             hidden_sizes = self.transformer.hidden_sizes
-            self.value_embeds = BatchedValueEmbedding(config.vocab_size, hidden_sizes)
+            if config.value_embeddings:
+                self.value_embeds = BatchedValueEmbedding(config.vocab_size, hidden_sizes)
         elif config.unet:
             # Original UNet (skip connections only, no downsampling)
             self.transformer = UnetTransformer(config)
-            self.value_embeds = ValueEmbedding(config)
+            if config.value_embeddings:
+                self.value_embeds = ValueEmbedding(config)
         else:
             # Standard transformer
             self.transformer = Transformer(config)
+            if config.value_embeddings:
+                self.value_embeds = ValueEmbedding(config)
 
         # Extra sequential transformer layers after U-Net (at full resolution)
         self.num_extra_layers = config.num_extra_layers
@@ -717,6 +775,9 @@ class PLM(PreTrainedModel):
             # Create a config for extra layers without unet skip connections
             extra_config = copy(config)
             extra_config.unet = False
+            extra_config.value_embeddings = False
+            extra_config.embedding_residual = False
+            extra_config.value_embedding_gate = False
             self.extra_layers = nn.ModuleList([
                 TransformerBlock(extra_config)
                 for _ in range(config.num_extra_layers)
@@ -780,14 +841,17 @@ class PLM(PreTrainedModel):
             valid_mask = valid_tokens[b, q_idx] & valid_tokens[b, kv_idx]  # ()
             return sliding_mask & doc_mask & valid_mask  # ()
 
-        block_mask = create_block_mask(
-            mask_mod=doc_mask_mod,
-            B=batch_size,
-            H=self.n_heads,
-            Q_LEN=seq_len,
-            KV_LEN=seq_len,
-            device=input_ids.device,
-        )  # BlockMask covering (b, h, l, l).
+        if self.config.attention_backend == "sdpa":
+            block_mask = dense_document_mask(docs, valid_tokens, sliding_window_size)  # (b, 1, l, l)
+        else:
+            block_mask = create_block_mask(
+                mask_mod=doc_mask_mod,
+                B=batch_size,
+                H=self.n_heads,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
+                device=input_ids.device,
+            )  # BlockMask covering (b, h, l, l).
 
         x = self.embedding(input_ids)  # (b, l, d)
         if self.token_dropout:
@@ -799,11 +863,8 @@ class PLM(PreTrainedModel):
             x = (x * (1 - mask_ratio_observed.unsqueeze(-1))).to(x.dtype)  # (b, l, d)
 
         x = norm(x)  # (b, l, d)
-        if self.unet:
-            ve = self.value_embeds(input_ids)  # List of (b, l, d) tensors.
-            x = self.transformer(x=x, ve=ve, attention_mask=block_mask)  # (b, l, d)
-        else:
-            x = self.transformer(x=x, attention_mask=block_mask)  # (b, l, d)
+        ve = self.value_embeds(input_ids) if self.config.value_embeddings else None  # Optional list of (b, l, d) tensors.
+        x = self.transformer(x=x, ve=ve, attention_mask=block_mask)  # (b, l, d)
 
         if self.extra_layers is not None:
             for layer in self.extra_layers:
@@ -840,6 +901,7 @@ class PLM(PreTrainedModel):
                 n_heads=self.n_heads,
                 device=input_ids.device,
                 attention_mask=valid_tokens,
+                attention_backend=self.config.attention_backend,
             )
             full_res_mask = attention_masks[0]  # Optional BlockMask covering (b, h, l, l).
             x = self.embedding(input_ids)  # (b, l, d)
@@ -853,7 +915,7 @@ class PLM(PreTrainedModel):
                 x = (x * (1 - mask_ratio_observed.unsqueeze(-1))).to(x.dtype)  # (b, l, d)
 
             x = norm(x)  # (b, l, d)
-            encoder_ve, decoder_ve = self.value_embeds(input_ids)  # Each path entry i: (b, l, d_i).
+            encoder_ve, decoder_ve = self.value_embeds(input_ids) if self.config.value_embeddings else ([], [])  # Each path entry i: (b, l, d_i).
             x = self.transformer(
                 x=x,
                 encoder_ve=encoder_ve,

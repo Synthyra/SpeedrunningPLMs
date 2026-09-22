@@ -33,6 +33,7 @@ measurements of the new fixed-15% workflow or guarantees of downstream quality.
 - [Getting started: package, Docker, venv, and compiler setup](#getting-started)
 - [Model architectures](#model-architectures)
 - [Running experiments and current configuration](#running-experiments)
+- [Optional training improvements](#optional-training-improvements)
 - [Metric and held-out evaluation](#metric-and-held-out-evaluation)
 - [Workstation to GPU hosts](#workstation-to-gpu-hosts)
 - [Autonomous agents](#autonomous-agents)
@@ -317,7 +318,7 @@ JSON file; explicit CLI flags override it. These defaults come from
 | `--batch-size` | `16` | Sequences per microbatch per rank, not the old token-batch unit. |
 | `--grad-accum` | `1` | Microbatches per optimizer update. |
 | `--learning-rate` | `0.0003` | AdamW learning rate. |
-| `--weight-decay` | `0.01` | AdamW weight decay. |
+| `--weight-decay` | `0.01` | Decoupled weight decay for AdamW and, when selected, Muon. |
 | `--architecture` | `standard` | `standard`, `unet`, or `patch_unet`. |
 | `--hidden-size` | `256` | Model hidden width. |
 | `--heads` | `4` | Attention heads. |
@@ -333,6 +334,85 @@ Sequence length and dataset identity are set during preparation, not by training
 flags. The masking probability and replacement rule are fixed by the benchmark.
 Run `python train.py --help`, `python prepare.py --help`, or
 `python research.py run --help` for entry-point options.
+
+### Optional training improvements
+
+The default configuration retains the plain AdamW baseline. A candidate combining
+the restored optimization options is in
+[`experiments/generalizable.json`](experiments/generalizable.json):
+
+```bash
+python train.py --data-dir data/uniref50 --config experiments/generalizable.json \
+  --output-dir runs/muon-sdpa --time-budget 300 --device cuda
+```
+
+This is an experiment starting point, not a measured improvement. It enables BF16
+and requires a GPU that supports it. Compare individual options against the same
+baseline before combining them. All options are recorded in `result.json`; model
+options are also saved in checkpoints.
+The example leaves compilation, Polar Express, accumulation growth, and value
+gates off so they can be evaluated separately.
+
+| JSON field / CLI flag | Default | Behavior |
+| --- | --- | --- |
+| `optimizer` / `--optimizer` | `adamw` | `muon` uses Muon for hidden linear weights and AdamW for embeddings, the output head, gates, and scalar/vector parameters. |
+| `muon_lr` / `--muon-lr` | `0.02` | Separate hidden-matrix learning rate; AdamW still uses `learning_rate`. |
+| `muon_momentum` / `--muon-momentum` | `0.95` | Target Muon momentum. |
+| `muon_steps` / `--muon-steps` | `5` | Newton-Schulz iteration count. |
+| `muon_backend` / `--muon-backend` | `newton_schulz` | Optional `polar_express` uses its fixed five-iteration coefficient schedule. |
+| `momentum_warmup_fraction` / `--momentum-warmup-fraction` | `0` | Fraction of the training budget used to ramp Muon momentum from `momentum_start` (default `0.85`). |
+| `momentum_start` / `--momentum-start` | `0.85` | Starting momentum when Muon momentum warmup is enabled. |
+| `fused_adam` / `--fused-adam` | `false` | Request fused AdamW on CUDA; CPU uses ordinary AdamW. |
+| `lr_schedule` / `--lr-schedule` | `constant` | `warmup_cosine` warms up, holds, then cools down using elapsed training-budget fractions. |
+| `warmup_fraction` / `--warmup-fraction` | `0.05` | LR warmup fraction, starting at `min_lr_ratio`. |
+| `cooldown_fraction` / `--cooldown-fraction` | `0.5` | Final fraction used for cosine cooldown. Warmup and cooldown fractions must sum to at most one. |
+| `min_lr_ratio` / `--min-lr-ratio` | `0.1` | LR multiplier at the start of warmup and end of cooldown. |
+| `grad_accum_final` / `--grad-accum-final` | `null` | Optional accumulation growth from `grad_accum` to this value in equal-duration stages. Microbatch shapes and sequence order stay fixed. |
+| `prefetch` / `--prefetch` | `false` | Prepare one CPU-corrupted batch ahead, using pinned asynchronous CUDA transfers on GPU. |
+| `fused_qkv` / `--fused-qkv` | `false` | Combine attention projections in one forward operation while keeping Q/K/V parameters and Muon updates separate. |
+| `attention_backend` / `--attention-backend` | `flex` | `sdpa` builds one exact bidirectional document/window/padding mask per resolution and uses PyTorch SDPA. |
+| `value_embeddings` / `--value-embeddings` | `null` | Enable independent token-value embeddings. `null` preserves architecture defaults: off for standard, on for U-Nets. |
+| `embedding_residual` / `--embedding-residual` | `null` | Mix the input embedding into each block through learned scalar weights, independently of value embeddings. Same architecture defaults. |
+| `value_embedding_gate` / `--value-embedding-gate` | `false` | Add a per-token, per-head value-embedding gate initialized to a multiplier of one. Requires value embeddings. |
+
+Boolean flags accept `--no-...`. Muon supports CPU smoke tests and arbitrary DDP
+parameter counts; DDP synchronizes gradients before its local optimizer updates.
+Accumulated training synchronizes DDP gradients only on the final microbatch.
+Loss normalization remains the global masked-residue mean, including when the
+effective batch size grows. Rank zero supplies scheduling progress to all ranks.
+No automatic LR scaling is applied when accumulation grows.
+Schedules follow elapsed time even in `--max-steps` smoke runs; those runs can
+finish before warmup completes. The current Muon implementation replicates local
+optimizer work across DDP ranks and runs its update math eagerly.
+
+Prefetching preserves the corruption RNG order for consumed batches. It can prepare
+one unused batch at shutdown; preparation and cleanup remain inside measured
+training time. Deadline checks and rejection of overtime accumulation remain active.
+Evaluation retains fixed masks, float32 computation, and the original denominator.
+
+SDPA retains full mask semantics, including packed proteins and empty padding rows.
+It uses a dense Boolean mask, not a variable-length unpadding kernel; dispatch and
+speed depend on the PyTorch build, dtype, GPU, and sequence length. FlexAttention
+remains available for sparse long-sequence workloads. `--compile` allows compiler
+fusion of the existing ReLU-squared MLP and surrounding operations, with compilation
+charged to the training budget. No custom Triton MLP kernel is required.
+Existing checkpoints without the new model fields retain their architecture's
+defaults. Fused QKV preserves the separate projection parameter names.
+
+The test suite hides GPUs by default. To run the optional CUDA optimizer and
+prefetch checks on a provisioned CUDA host, use:
+
+```bash
+PLM_TEST_CUDA=1 python -m pytest tests/test_optimizer_features.py tests/test_research_batches.py -q
+```
+
+These checks do not measure end-to-end training speed or validation quality.
+
+The Muon and fusion choices are informed by
+[modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt),
+[Muon](https://kellerjordan.github.io/posts/muon/), and
+[Polar Express](https://arxiv.org/abs/2505.16932). These options do not add FP8,
+layer omissions, token smearing, auxiliary prediction losses, or window schedules.
 
 ### Experiment records and launcher wrapper
 

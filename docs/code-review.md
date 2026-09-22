@@ -1,5 +1,37 @@
 # Code review and standards coverage
 
+## Optional training improvements review (2026-09-22)
+
+The current review covers the configurable Muon/AdamW optimizer, optional Polar
+Express updates, budget-relative scheduling, accumulation growth, deterministic
+prefetching, DDP accumulation, fused QKV, SDPA, and independent value embeddings,
+embedding residuals, and value gates. The plain AdamW baseline remains the default.
+The [README configuration reference](../README.md#optional-training-improvements)
+and [candidate profile](../experiments/generalizable.json) describe the options.
+
+Checks cover CPU output and gradient parity for fused QKV/SDPA, document/window/padding
+masks, optimizer partitioning and state, checkpoint round trips, deterministic
+prefetching, deadline discard, and a two-process Gloo Muon update against an
+independent global masked-residue reference. Legacy attention config objects retain
+their defaults, and disabled fused AdamW preserves PyTorch's automatic dispatch.
+Source distributions include the example profile; wheels include the new modules.
+
+Final verification: 390 Python tests passed, with three CUDA checks skipped on the
+CPU-only PyTorch 2.6 environment; all four JavaScript tests passed. Dependency and
+whitespace checks passed. The CUDA opt-in invocation also passed its 23 CPU checks
+and skipped the same three CUDA checks. Set `PLM_TEST_CUDA=1` to retain visible GPUs
+when running the optional checks on a CUDA host. Separate review exercised 18 model
+feature combinations with CPU BF16 backward and FP32 checkpoint round trips.
+
+Physical CUDA execution and GPU performance remain unverified. SDPA uses dense
+Boolean masks, and the MLP relies on optional model compilation rather than a new
+custom kernel. The benchmark, evaluation masks, float32 evaluation, and masked-residue
+denominator are unchanged. No training-quality improvement is claimed by these checks.
+The CPU FlexAttention comparison uses its SDPA fallback, so it does not establish
+parity with CUDA FlexAttention kernels.
+
+## Historical standards pass
+
 This pass inspected all 64 extant first-party Python files, including compatibility
 entry points and tests. The inventory uses tracked and untracked Python files,
 excluding deleted modules and generated environments. Classifications are relative
