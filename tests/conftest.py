@@ -1,25 +1,41 @@
-"""Keep tests offline; hide GPUs unless CUDA checks are explicitly requested."""
+"""A tiny synthetic source dataset in the benchmark's parquet shape, prepared once for the test session."""
 
-import os
-import sys
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
 import pytest
 
 from pathlib import Path
 
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-if os.environ.get("PLM_TEST_CUDA") != "1":
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+from speedrunning_plms import benchmark
 
 
-def pytest_sessionstart(session: pytest.Session) -> None:
-    import torch
+RESIDUES = "ACDEFGHIKLMNPQRSTVWY"
 
-    # Thread-pool overhead dominates the tiny models exercised here.
-    torch.set_num_threads(1)
+
+def synthetic_frame(count: int, families: int, seed: int, min_length: int = 50, max_length: int = 160) -> pd.DataFrame:
+    generator = np.random.default_rng(seed)
+    rows = []
+    for index in range(count):
+        length = int(generator.integers(min_length, max_length))
+        rows.append({"name": f"p{seed}_{index}", "seqs": "".join(generator.choice(list(RESIDUES), length)),
+                     "three_di": "".join(generator.choice(list(RESIDUES), length)), "family": f"fam{index % families}",
+                     "role": "rep" if index < families else "member"})
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture(scope="session")
+def tiny_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    source = tmp_path_factory.mktemp("source")
+    synthetic_frame(300, 60, 1).to_parquet(source / "train.parquet", index=False)
+    synthetic_frame(40, 20, 2).to_parquet(source / "validation.parquet", index=False)
+    synthetic_frame(40, 20, 3).to_parquet(source / "test.parquet", index=False)
+    return source
+
+
+@pytest.fixture(scope="session")
+def tiny_data(tiny_source: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    benchmark_dir = tmp_path_factory.mktemp("data") / "afdb_tiny"
+    benchmark.prepare(benchmark_dir, tiny_source)
+    return benchmark_dir

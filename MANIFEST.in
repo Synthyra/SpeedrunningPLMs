@@ -1,12 +1,5 @@
 include LICENSE
-include README.md
+include PUBLIC_README.md
 include requirements.txt
-include prepare.py
-include train.py
-include research.py
-include program.md
-include experiment.json
-include experiments/generalizable.json
-recursive-include targets *.json
-recursive-include evaluation *.py *.json
-recursive-include tests *.py
+include baselines.json
+recursive-include src *.py

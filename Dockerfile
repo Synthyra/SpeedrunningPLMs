@@ -1,60 +1,24 @@
-# docker build -t speedrun_plm .
-# docker run --gpus all -v "${PWD}:/workspace" speedrun_plm python train.py --config experiment.json
-FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
+# The speedrun image: CUDA 12.8 (the box's driver is 570), Python 3.12 in a venv, torch 2.11 cu128 (the newest
+# aarch64 cu128 wheel), this project installed editable. Built and run through run_gh200.sh, which bind-mounts the shipped tree and the foundry import root at
+# their host paths.
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHON_VERSION=3.12.7 \
-    PATH=/usr/local/bin:$PATH
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PATH=/opt/venv/bin:$PATH
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential curl git ca-certificates ninja-build \
-        libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
-        libsqlite3-dev libncursesw5-dev xz-utils tk-dev \
-        libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends python3.12 python3.12-dev python3.12-venv git ca-certificates && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    python3.12 -m venv /opt/venv
 
-RUN curl -fsSLO https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz && \
-    tar -xzf Python-${PYTHON_VERSION}.tgz && \
-    cd Python-${PYTHON_VERSION} && \
-    ./configure --enable-optimizations && \
-    make -j"$(nproc)" && \
-    make altinstall && \
-    cd .. && rm -rf Python-${PYTHON_VERSION}* && \
-    ln -s /usr/local/bin/python3.12 /usr/local/bin/python && \
-    ln -s /usr/local/bin/pip3.12    /usr/local/bin/pip
+WORKDIR /opt/speedrun
 
-WORKDIR /app
-
-# Cache dependency installation independently of source changes.
 COPY requirements.txt .
-
-RUN pip install --upgrade pip setuptools && \
-    pip install torch --index-url https://download.pytorch.org/whl/cu128 -U && \
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cu128 && \
     pip install -r requirements.txt
 
 COPY . .
+RUN pip install -e ".[test]"
 
-RUN pip install -e ".[test,evaluation]"
-
-WORKDIR /workspace
-
-# Prefer the bind-mounted candidate over the image's installed source.
-ENV PROJECT_ROOT=/workspace \
-    PYTHONPATH=/workspace/src \
-    HF_HOME=/workspace/.cache/huggingface \
-    TORCH_HOME=/workspace/.cache/torch \
-    XDG_CACHE_HOME=/workspace/.cache \
-    TQDM_CACHE=/workspace/.cache/tqdm
-
-RUN mkdir -p \
-      /workspace/.cache/huggingface \
-      /workspace/.cache/torch \
-      /workspace/.cache/tqdm \
-      /workspace/logs \
-      /workspace/data \
-      /workspace/results
-
-VOLUME ["/workspace"]
-
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 CMD ["bash"]

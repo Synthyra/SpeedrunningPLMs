@@ -1,20 +1,6 @@
-"""Lazy public model exports keep data and launcher imports lightweight."""
+"""SpeedrunningPLMs: a fixed 10-minute protein MLM benchmark (`speedrunning_plms.benchmark`) and the optimizers
+(`speedrunning_plms.optim`) a candidate `train.py` may use."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-
-if TYPE_CHECKING:
-    from speedrunning_plms.models import PLM, PLMConfig
-
-
-__all__ = ["PLM", "PLMConfig"]
-
-
-def __getattr__(name: str) -> type[PLM] | type[PLMConfig]:
-    if name in {"PLM", "PLMConfig"}:
-        from speedrunning_plms.models import PLM, PLMConfig
-
-        return {"PLM": PLM, "PLMConfig": PLMConfig}[name]
-    raise AttributeError(name)
+__version__ = "2.0.0"

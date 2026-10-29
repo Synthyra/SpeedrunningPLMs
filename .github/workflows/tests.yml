@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.10', '3.12']
+        python-version: ['3.12', '3.14']
     steps:
       - uses: actions/checkout@v7
         with:
@@ -31,10 +31,8 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install CPU dependencies
         run: |
-          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e ".[test,evaluation]"
+          python -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[test]"
           python -m pip check
       - name: Run offline tests
         run: python -m pytest -q --durations=10
-      - name: Test historical score viewer
-        run: node --test tests/test_hub.cjs

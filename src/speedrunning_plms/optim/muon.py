@@ -45,7 +45,7 @@ def _orthogonalize(
 
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int) -> torch.Tensor:
     """Apply quintic Newton-Schulz steps to approximately orthogonalize a matrix."""
-    # G and return: (m, n).
+    # G: (m, n); the return is (m, n).
     if type(steps) is not int or steps < 1:
         raise ValueError("steps must be a positive integer")
     return _orthogonalize(G, ((3.4445, -4.7750, 2.0315),) * steps, 0.0, 1e-7)  # (m, n)
@@ -53,7 +53,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int) -> torch.Tensor:
 
 def zeropower_via_polar_express(G: torch.Tensor) -> torch.Tensor:
     """Apply the fixed five-step Polar Express coefficient schedule."""
-    # G and return: (m, n).
+    # G: (m, n); the return is (m, n).
     return _orthogonalize(G, POLAR_EXPRESS_COEFFICIENTS, 0.02, 1e-6)  # (m, n)
 
 
@@ -82,6 +82,7 @@ class Muon(torch.optim.Optimizer):
             raise ValueError("orthogonalization must be newton_schulz or polar_express")
         if orthogonalization == "polar_express" and ns_steps != 5:
             raise ValueError("polar_express requires ns_steps=5 for its coefficient schedule")
+        # params: (m, n) per parameter
         parameters = list(params)  # Each parameter is (m, n).
         if any(p.ndim != 2 or not p.is_floating_point() for p in parameters):
             raise ValueError("Muon requires floating-point matrix parameters")
@@ -92,6 +93,7 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor] | None = None) -> torch.Tensor | None:
+        # closure: () -> (), recomputes the loss
         loss = None  # Optional scalar ().
         if closure is not None:
             with torch.enable_grad():

@@ -1,0 +1,1 @@
+Embedding lr 3e-3 and head lr 1e-3 (three times the incumbent): the two Adam-trained tables may be the slow learners in a 2,000-step run
