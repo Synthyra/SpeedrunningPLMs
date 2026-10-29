@@ -54,8 +54,8 @@ class Recipe:
     muon_momentum: float = 0.95
     muon_momentum_start: float = 0.85
     muon_momentum_warmup: float = 0.15  # share of the budget
-    embed_lr: float = 1e-3
-    head_lr: float = 3e-4
+    embed_lr: float = 3e-3
+    head_lr: float = 1e-3
     logit_softcap: float = 30.0  # tanh cap on the head's logits, modded-nanogpt records 9 and 18
     adam_betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.0

@@ -1,1 +1,0 @@
-Mimetic V and O initialization: W_O W_V = 0.25 I at the start, so every block begins as X plus a quarter of its attention-averaged input instead of the identity (mimetic initialization; modded-nanogpt record 64)

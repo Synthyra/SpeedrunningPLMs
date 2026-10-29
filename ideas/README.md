@@ -39,6 +39,10 @@ always the same: `val_select.loss` of the selected weights against the incumbent
 | 017 | A1: embedding lr 3e-3, head lr 1e-3, on 012 | reverted: inside the noise band of 012; retried on 015 | 2.7527 | 2.7495 |
 | 018 | A1: Muon lr 0.06, on 012 | reverted: behind from 270 s; past the optimum | 2.7551 | 2.7521 |
 | 019 | A1: cooldown over the last 60 percent, on 012 | reverted: the same within noise; ahead mid-run, level at the end | 2.7534 | 2.7498 |
+| 015 s1, s2 | the record (015) at seeds 1 and 2 | reference: three-seed test mean 2.7447, span 0.002; the noise band holds | 2.7482, 2.7480 | 2.7447, 2.7437 |
+| 020 | A6: mimetic V and O initialization, W_O W_V = 0.25 I at the start, on 015 | reverted: the same curve; what a block starts as is forgotten in 2,000 steps | 2.7496 | 2.7453 |
+| 021 | A16 (second form): the local-bias slopes as per-head parameters inside the flex attention score function, Adam at the embedding rate, on 015 | invalid: compile warmup 264 s against the 180 s cap, then 28 s a step for 21 steps; a captured parameter in `score_mod` takes a far slower path. Learned slopes need a mechanism outside the kernel (a per-head scale on the bias after the fact, or a fixed grid) | | |
+| 022 | A1: embedding lr 3e-3, head lr 1e-3, on 015 | kept by the rule: lower by 0.0005, as 017 was on 012; inside one seed's band | 2.7490 | 2.7455 |
 | pilot | B7: the MLP's matmuls in FP8 (e4m3, per-tensor dynamic scales, `torch._scaled_mm`) | not run: 0.284 s a step against 0.276 in bf16 in a 60 s pilot; the quantization overhead exceeds the saving at 768 x 2,048 | | |
 
 A second profile of the incumbent (after 001) puts the step at 0.276 s, all of it GPU time: matmuls 109 ms at about

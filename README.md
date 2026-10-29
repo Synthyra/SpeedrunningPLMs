@@ -17,14 +17,15 @@ data, the evaluator and the candidate that produced it, and every record holder'
 | 2 | 2.7546 | 3.974 | 2.7564 | 2,161 | Muon learning rate 0.02 to 0.04 | [`002_muon_lr_0.04.py`](candidates/002_muon_lr_0.04.py) |
 | 3 | 2.7539 | 3.973 | 2.7559 | 2,157 | tanh logit softcap at 30 | [`003_softcap.py`](candidates/003_softcap.py) |
 | 4 | 2.7501 | 3.968 | 2.7531 | 2,059 | a fixed ALiBi-style local bias on the attention scores beside RoPE, per-head slopes 2^(-8 i / h): every head is local from step 0 | [`012_local_bias.py`](candidates/012_local_bias.py) |
-| 5 | **2.7457** | 3.961 | 2.7495 | 2,051 | NorMuon: the orthogonalized update normalized per output neuron by an EMA of its mean square, rescaled to the Muon norm | [`015_normuon.py`](candidates/015_normuon.py) |
+| 5 | 2.7457 | 3.961 | 2.7495 | 2,051 | NorMuon: the orthogonalized update normalized per output neuron by an EMA of its mean square, rescaled to the Muon norm (confirmed at seeds 1 and 2: 2.7447 and 2.7437) | [`015_normuon.py`](candidates/015_normuon.py) |
+| 6 | **2.7455** | 3.961 | 2.7490 | 2,055 | embedding lr 3e-3 and head lr 1e-3, three times the tables' rates; kept by the rule, inside one seed's band | [`022_embed_head_lr.py`](candidates/022_embed_head_lr.py) |
 
 ![The selection curves of every candidate and the record progression](assets/selection_curves.png)
 
 **A.** The `val_select` loss of every seed-0 candidate against the training clock: kept candidates in orange, the
 record holder in red, reverted candidates in gray. **B.** The test loss of every candidate in the order tried, with the
-record as a step line. One seed resolves about 0.0015 nats (the incumbent repeated at seed 1: 2.7551 against 2.7539),
-so a gain inside that band is kept by the rule but not claimed.
+record as a step line. One seed resolves about 0.0015 nats (the NorMuon record at seeds 0, 1 and 2: 2.7457, 2.7447
+and 2.7437 on test), so a gain inside that band is kept by the rule but not claimed.
 
 The hardware of record is one NVIDIA GH200 (the H100 die, 96 GB HBM3). A run on other hardware is a different clock
 and is recorded as such.
@@ -41,7 +42,7 @@ reference models gain on long proteins, so use of context is what the short cloc
 | Model | Parameters | `val_select` | Validation | Test loss | Bits | Accuracy | F1 macro | MCC | ROC AUC | PR AUC |
 |---|---|---|---|---|---|---|---|---|---|---|
 | unigram floor | | 2.8934 | 2.8938 | 2.8933 | 4.174 | 0.098 | 0.009 | 0.000 | 0.500 | 0.050 |
-| **record, 10 min** | 198,231,552 | 2.7495 | 2.7467 | 2.7457 | 3.961 | 0.146 | 0.102 | 0.078 | 0.652 | 0.104 |
+| **record, 10 min** | 198,231,552 | 2.7490 | 2.7465 | 2.7455 | 3.961 | 0.146 | 0.102 | 0.078 | 0.652 | 0.104 |
 | ESM2 8M | 7,523,034 | 2.6393 | 2.6291 | 2.6253 | 3.788 | 0.186 | 0.157 | 0.124 | 0.695 | 0.157 |
 | ESM2 35M | 33,517,234 | 2.5164 | 2.4965 | 2.4992 | 3.606 | 0.225 | 0.206 | 0.168 | 0.735 | 0.208 |
 | ESM2 150M | 148,161,274 | 2.3490 | 2.3176 | 2.3303 | 3.362 | 0.275 | 0.267 | 0.224 | 0.780 | 0.275 |
@@ -83,6 +84,10 @@ on sit beside it.
 | 017 | embedding lr 3e-3, head lr 1e-3 | reverted: within noise of 015 | 2.7527 | 2.7495 |
 | 018 | Muon lr 0.06 | reverted: behind from 270 s | 2.7551 | 2.7521 |
 | 019 | cooldown over the last 60 percent of the clock | reverted: within noise of 015 | 2.7534 | 2.7498 |
+| 015 s1, s2 | the record at seeds 1 and 2 | reference: three-seed test mean 2.7447, span 0.002 | 2.7482, 2.7480 | 2.7447, 2.7437 |
+| 020 | mimetic V and O initialization (W_O W_V = 0.25 I at the start) | reverted: the same curve | 2.7496 | 2.7453 |
+| 021 | the local-bias slopes learned per head inside the flex attention score function | invalid: compile warmup 264 s against the 180 s cap, then 28 s a step | | |
+| 022 | embedding lr 3e-3, head lr 1e-3, on 015 | kept by the rule: lower by 0.0005, as it was on 012 | 2.7490 | 2.7455 |
 | pilot | the MLP's matmuls in FP8 (`torch._scaled_mm`, per-tensor scales) | not run: 0.284 s a step against 0.276 in bf16 | | |
 
 What the campaign has learned so far:
@@ -95,8 +100,14 @@ What the campaign has learned so far:
   first change beyond noise after the optimizer, and freeing half the heads (014) gave most of it back.
 - **The budget is not family-limited.** Covering every training family in the first half of the clock (013) gave
   the same curve as the shuffled stream.
+- **The optimizer's fine settings are inside the noise.** Three times the table rates (022) and a longer cooldown
+  (019) moved `val_select` by 0.0005 or less; the Muon rate past 0.04 (018) and cautious decay (016) lost 0.003 to
+  0.007. The record's three seeds span 0.002 on test.
+- **A learnable tensor inside the flex attention score function is not free.** Slopes as parameters (021) put the
+  kernel on a path a hundred times slower (28 s a step) and broke the compile cap; the fixed slopes keep the gain.
 - **Structure follows.** A probe from the hidden states to Foldseek 3Di states (reported, never selected on) reaches
-  test accuracy 0.358 and MCC 0.230 on the record holder; the reference models' probe rows are in the result record.
+  test accuracy 0.367 and MCC 0.245 on the NorMuon record, against 0.384 and 0.266 for ESM2 8M and 0.514 and 0.437
+  for ESMC 6B through the same probe.
 
 ## The benchmark
 

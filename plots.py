@@ -161,7 +161,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     arguments = parser.parse_args()
     runs, references, verdicts = load(arguments.runs, arguments.ledger)
-    runs = [run for run in runs if run.get("seed", 0) == 0]
+    runs = [run for run in runs if run.get("seed", 0) == 0 and run["clock"]["valid"]]  # seeds are references; an invalid run is no curve
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
     selection_curves(runs, verdicts, arguments.output_dir)
     references_figure(runs, references, verdicts, arguments.output_dir)

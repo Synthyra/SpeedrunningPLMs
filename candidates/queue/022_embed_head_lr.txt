@@ -1,1 +1,0 @@
-Embedding lr 3e-3 and head lr 1e-3 on 015 (017 was inside the noise band on 012)

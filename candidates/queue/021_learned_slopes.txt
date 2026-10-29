@@ -1,1 +1,0 @@
-The local bias slopes learned per head from the ALiBi values, by Adam at the embedding rate: a head that wants to be global can decay its slope
