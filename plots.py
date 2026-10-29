@@ -13,15 +13,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import matplotlib
+import numpy as np
 
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-import matplotlib.pyplot as plt
-import numpy as np
+matplotlib.use("Agg")  # the backend is fixed before pyplot loads: this script only writes files
 
-matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
 
 REFERENCE_LABELS = {"unigram": "unigram", "esm2_8m": "ESM2 8M", "esm2_35m": "ESM2 35M", "esm2_150m": "ESM2 150M",
                     "esm2_650m": "ESM2 650M", "esm2_3b": "ESM2 3B", "esmc_small": "ESMC 300M", "esmc_large": "ESMC 600M",

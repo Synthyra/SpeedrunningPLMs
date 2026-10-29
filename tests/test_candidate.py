@@ -74,25 +74,29 @@ def test_candidate_forward_contracts() -> None:
     assert dense[0, 0, 1, 2] and not dense[0, 0, 1, 4] and dense[0, 0, 4, 5]
 
 
-def test_candidate_muon_matches_the_per_matrix_muon() -> None:
-    """The candidate's banked Muon applies the package's per-matrix Polar Express update to every matrix."""
-    from speedrunning_plms.optim.muon import Muon
+def test_candidate_muon_banks_match_the_per_matrix_update() -> None:
+    """Banking by shape changes nothing: a matrix's update equals the one a bank of itself alone produces, and the
+    batched Polar Express equals the package's per-matrix one."""
+    from speedrunning_plms.optim.muon import zeropower_via_polar_express
 
     candidate = load_candidate()
     torch.manual_seed(0)
-    reference = [torch.nn.Parameter(torch.randn(shape) * 0.02) for shape in ((48, 48), (48, 48), (96, 48), (48, 96))]
-    banked = [torch.nn.Parameter(parameter.detach().clone()) for parameter in reference]
-    optimizers = (Muon(reference, lr=0.02, momentum=0.9, orthogonalization="polar_express"),
-                  candidate.Muon(banked, lr=0.02, momentum=0.9, weight_decay=0.0))
+    G = torch.randn(96, 48)  # (m, n)
+    assert torch.allclose(candidate.polar_express(G[None])[0], zeropower_via_polar_express(G), atol=1e-5)
+    banked = [torch.nn.Parameter(torch.randn(shape) * 0.02) for shape in ((48, 48), (48, 48), (96, 48), (48, 96))]
+    alone = [torch.nn.Parameter(parameter.detach().clone()) for parameter in banked]
+    optimizers = [candidate.Muon(banked, lr=0.02, momentum=0.9, weight_decay=0.0),
+                  *(candidate.Muon([parameter], lr=0.02, momentum=0.9, weight_decay=0.0) for parameter in alone)]
     for _ in range(2):
-        gradients = [torch.randn_like(parameter) for parameter in reference]
-        for parameters in (reference, banked):
+        gradients = [torch.randn_like(parameter) for parameter in banked]
+        for parameters in (banked, alone):
             for parameter, gradient in zip(parameters, gradients, strict=True):
                 parameter.grad = gradient.clone()
         for optimizer in optimizers:
             optimizer.step()
-    for expected, actual in zip(reference, banked, strict=True):
-        assert torch.allclose(expected, actual, atol=1e-6), float((expected - actual).abs().max())
+    for expected, actual in zip(alone, banked, strict=True):
+        difference = float((expected.detach() - actual.detach()).abs().max())
+        assert torch.allclose(expected.detach(), actual.detach(), atol=1e-6), difference
 
 
 def test_end_to_end_cpu_run_writes_a_result(tiny_data: Path, tmp_path: Path) -> None:

@@ -54,8 +54,8 @@ class Recipe:
     muon_momentum: float = 0.95
     muon_momentum_start: float = 0.85
     muon_momentum_warmup: float = 0.15  # share of the budget
-    embed_lr: float = 1e-3
-    head_lr: float = 3e-4
+    embed_lr: float = 3e-3
+    head_lr: float = 1e-3
     logit_softcap: float = 30.0  # tanh cap on the head's logits, modded-nanogpt records 9 and 18
     adam_betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.0
@@ -251,6 +251,9 @@ def polar_express(G: Tensor, safety_factor: float = 0.02, epsilon: float = 1e-6)
     return X.mT if transposed else X  # (k, m, n)
 
 
+NORMUON_BETA = 0.95  # EMA rate of the per-row second moment of the orthogonalized update
+
+
 class Muon(torch.optim.Optimizer):
     """Muon with Polar Express, one batched orthogonalization per parameter shape.
 
@@ -267,20 +270,24 @@ class Muon(torch.optim.Optimizer):
             by_shape: dict[tuple[int, ...], list[Tensor]] = {}
             for parameter in group["params"]:
                 by_shape.setdefault(tuple(parameter.shape), []).append(parameter)
-            group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device))
-                              for shape, members in by_shape.items()]  # momentum buffer: (k, m, n)
+            group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device),
+                               torch.zeros(len(members), shape[0], 1, dtype=torch.float32, device=members[0].device))
+                              for shape, members in by_shape.items()]  # momentum buffer (k, m, n), row second moment (k, m, 1)
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> None:
         assert closure is None
         for group in self.param_groups:
             lr, momentum = group["lr"], group["momentum"]
-            for members, buffer in group["banks"]:
+            for members, buffer, second_moment in group["banks"]:
                 if members[0].grad is None:
                     continue
                 G = torch.stack([member.grad for member in members]).float()  # (k, m, n)
                 buffer.lerp_(G, 1 - momentum)  # (k, m, n)
-                U = polar_express(G.lerp(buffer, momentum))  # (k, m, n), Nesterov
+                U = polar_express(G.lerp(buffer, momentum)).float()  # (k, m, n), Nesterov
+                second_moment.lerp_(U.square().mean(dim=2, keepdim=True), 1 - NORMUON_BETA)  # (k, m, 1)
+                normalized = U / (second_moment.sqrt() + 1e-8)  # (k, m, n)
+                U = normalized * (U.flatten(1).norm(dim=1) / normalized.flatten(1).norm(dim=1).clamp(min=1e-8)).view(-1, 1, 1)
                 scale = max(1, members[0].shape[0] / members[0].shape[1]) ** 0.5
                 if group["weight_decay"]:
                     torch._foreach_mul_(members, 1 - lr * group["weight_decay"])

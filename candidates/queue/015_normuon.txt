@@ -1,1 +1,0 @@
-NorMuon: the orthogonalized update normalized per output neuron by an EMA of its mean square (beta 0.95), rescaled to the Muon norm (modded-nanogpt record 41)

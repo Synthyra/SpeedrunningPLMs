@@ -1,1 +1,0 @@
-Cautious weight decay 0.1 on the Muon banks, applied only where the update and the weight agree in sign, scheduled with the lr (modded-nanogpt records 43 and 50)

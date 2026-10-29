@@ -15,4 +15,5 @@ Read `program.md` first: it is the brief for running the loop. The short form:
   --windows-per-step 2 --max-steps 3 --skip-final-evals`.
 - The clock measures applied training steps only; compile warmup and in-run validation are outside it and capped.
   A candidate that breaks a cap is `invalid`, not a record.
-- Python follows the shape-trace convention of the code: every tensor line says its shape in a trailing comment.
+- Python follows `CODING_STANDARDS.md`: import order, precise types, intent comments, and a shape trace on every
+  tensor line. `candidates/` snapshots are frozen bytes and exempt; `train.py` is the example the rest copies.

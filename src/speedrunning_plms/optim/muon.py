@@ -82,8 +82,7 @@ class Muon(torch.optim.Optimizer):
             raise ValueError("orthogonalization must be newton_schulz or polar_express")
         if orthogonalization == "polar_express" and ns_steps != 5:
             raise ValueError("polar_express requires ns_steps=5 for its coefficient schedule")
-        # params: (m, n) per parameter
-        parameters = list(params)  # Each parameter is (m, n).
+        parameters = list(params)  # each (m, n)
         if any(p.ndim != 2 or not p.is_floating_point() for p in parameters):
             raise ValueError("Muon requires floating-point matrix parameters")
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,

@@ -25,10 +25,13 @@ import torch
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from torch import Tensor
 
 from speedrunning_plms.benchmark import tokens
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 SOURCE_REPO = "Synthyra/alignment_atlas_families_afdb_v6"
@@ -125,7 +128,7 @@ def _split_seed(split: str) -> int:
     return MASK_SEED + {"val_select": 1_000_000, "validation": 2_000_000, "test": 3_000_000}[split]
 
 
-def select_one_per_family(frame: Any) -> Any:
+def select_one_per_family(frame: pd.DataFrame) -> pd.DataFrame:
     """The validation subset: each family's longest representative (ties by name), so every family is scored once."""
     representatives = frame[frame["role"] == "rep"].copy()
     representatives["length"] = representatives["seqs"].str.len()
@@ -133,7 +136,7 @@ def select_one_per_family(frame: Any) -> Any:
     return representatives.drop_duplicates("family", keep="first")
 
 
-def _write_train(frame: Any, output_dir: Path) -> dict[str, Any]:
+def _write_train(frame: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
     """The training stream in shuffled order, its offsets, 3Di states, families and the probe subset."""
     generator = np.random.default_rng(SHUFFLE_SEED)
     order = generator.permutation(len(frame))  # (n_train,)
@@ -171,7 +174,7 @@ def _write_train(frame: Any, output_dir: Path) -> dict[str, Any]:
 
 def prepare(output_dir: Path, source_dir: Path) -> dict[str, Any]:
     """Build the data directory from the three split parquet files downloaded from the pinned source."""
-    import pandas as pd
+    import pandas as pd  # only preparation reads parquet; a training run never imports pandas
 
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"refusing to overwrite the nonempty data directory {output_dir}")

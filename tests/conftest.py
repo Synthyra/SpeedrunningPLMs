@@ -16,7 +16,7 @@ RESIDUES = "ACDEFGHIKLMNPQRSTVWY"
 
 def synthetic_frame(count: int, families: int, seed: int, min_length: int = 50, max_length: int = 160) -> pd.DataFrame:
     generator = np.random.default_rng(seed)
-    rows = []
+    rows: list[dict[str, str]] = []
     for index in range(count):
         length = int(generator.integers(min_length, max_length))
         rows.append({"name": f"p{seed}_{index}", "seqs": "".join(generator.choice(list(RESIDUES), length)),

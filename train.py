@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -101,11 +101,13 @@ class Attention(nn.Module):
         slopes = 2.0 ** (-8.0 * torch.arange(1, heads + 1) / heads)  # (h,), ALiBi's geometric slopes
         self.register_buffer("slopes", slopes, persistent=False)
 
-    def score_mod(self) -> Any:
-        slopes = self.slopes
+    def score_mod(self) -> Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]:
+        """The flex attention score modifier: a distance penalty per head, ALiBi's local prior beside RoPE."""
+        slopes = self.slopes  # (h,)
 
         def local_bias(score: Tensor, batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
-            return score - slopes[head] * (query - key).abs()
+            # score and the indices: () each, one attention entry; returns ().
+            return score - slopes[head] * (query - key).abs()  # ()
 
         return local_bias
 
@@ -168,7 +170,7 @@ class Candidate(nn.Module):
         nn.init.normal_(self.head.weight, std=0.02)  # (v, d)
         for block in self.blocks:
             for linear in (block.attention.query, block.attention.key, block.attention.value, block.mlp.up):
-                nn.init.normal_(linear.weight, std=0.02)
+                nn.init.normal_(linear.weight, std=0.02)  # (d, d) or (f, d)
             nn.init.zeros_(block.attention.output.weight)  # (d, d): a block starts as the identity
             nn.init.zeros_(block.mlp.down.weight)  # (d, f)
 
@@ -251,6 +253,9 @@ def polar_express(G: Tensor, safety_factor: float = 0.02, epsilon: float = 1e-6)
     return X.mT if transposed else X  # (k, m, n)
 
 
+NORMUON_BETA = 0.95  # EMA rate of the per-row second moment of the orthogonalized update
+
+
 class Muon(torch.optim.Optimizer):
     """Muon with Polar Express, one batched orthogonalization per parameter shape.
 
@@ -267,20 +272,24 @@ class Muon(torch.optim.Optimizer):
             by_shape: dict[tuple[int, ...], list[Tensor]] = {}
             for parameter in group["params"]:
                 by_shape.setdefault(tuple(parameter.shape), []).append(parameter)
-            group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device))
-                              for shape, members in by_shape.items()]  # momentum buffer: (k, m, n)
+            group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device),
+                               torch.zeros(len(members), shape[0], 1, dtype=torch.float32, device=members[0].device))
+                              for shape, members in by_shape.items()]  # momentum buffer (k, m, n), row second moment (k, m, 1)
 
     @torch.no_grad()
-    def step(self, closure: Any = None) -> None:
-        assert closure is None
+    def step(self, closure: Callable[[], Tensor] | None = None) -> None:
+        assert closure is None  # the loop computes the loss itself
         for group in self.param_groups:
             lr, momentum = group["lr"], group["momentum"]
-            for members, buffer in group["banks"]:
+            for members, buffer, second_moment in group["banks"]:
                 if members[0].grad is None:
                     continue
                 G = torch.stack([member.grad for member in members]).float()  # (k, m, n)
                 buffer.lerp_(G, 1 - momentum)  # (k, m, n)
-                U = polar_express(G.lerp(buffer, momentum))  # (k, m, n), Nesterov
+                U = polar_express(G.lerp(buffer, momentum)).float()  # (k, m, n), Nesterov
+                second_moment.lerp_(U.square().mean(dim=2, keepdim=True), 1 - NORMUON_BETA)  # (k, m, 1)
+                normalized = U / (second_moment.sqrt() + 1e-8)  # (k, m, n)
+                U = normalized * (U.flatten(1).norm(dim=1) / normalized.flatten(1).norm(dim=1).clamp(min=1e-8)).view(-1, 1, 1)  # (k, m, n), each matrix's norm restored
                 scale = max(1, members[0].shape[0] / members[0].shape[1]) ** 0.5
                 if group["weight_decay"]:
                     torch._foreach_mul_(members, 1 - lr * group["weight_decay"])
@@ -302,8 +311,12 @@ def train_step(model: nn.Module, corrupted: Tensor, labels: Tensor, block_mask: 
     """One forward and backward; returns the summed loss and the masked count, both on the device."""
     # corrupted, labels: (b, l).
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        logits = model(corrupted, block_mask=block_mask) if block_mask is not None else model(corrupted, attention_mask=None) \
-            if dense_mask is None else _dense_forward(model, corrupted, dense_mask)  # (b, l, v)
+        if block_mask is not None:
+            logits = model(corrupted, block_mask=block_mask)  # (b, l, v)
+        elif dense_mask is not None:
+            logits = _dense_forward(model, corrupted, dense_mask)  # (b, l, v)
+        else:
+            logits = model(corrupted, attention_mask=None)  # (b, l, v)
     count = (labels != benchmark.IGNORE_LABEL).sum()  # ()
     loss = benchmark.masked_cross_entropy(logits, labels)  # ()
     (loss / count.clamp(min=1)).backward()
@@ -475,7 +488,7 @@ def main() -> None:
     model.load_state_dict(best_state)
     model.eval()
     torch.save({name: tensor.to(torch.bfloat16) for name, tensor in best_state.items()}, output_dir / "best.pt")
-    metrics: dict[str, dict[str, object]] = {}
+    metrics: dict[str, dict[str, Any]] = {}
     final_eval_seconds = 0.0
     if not arguments.skip_final_evals:
         for split in ("val_select", "validation", "test"):

@@ -80,6 +80,9 @@ on sit beside it.
 | 014 | the local bias on six heads, six free | reverted: loses most of 012's gain | 2.7548 | 2.7515 |
 | 015 | NorMuon | kept: ahead from 180 s | 2.7495 | 2.7457 |
 | 016 | cautious weight decay 0.1 on the block matrices | reverted: behind from 180 s | 2.7564 | 2.7535 |
+| 017 | embedding lr 3e-3, head lr 1e-3 | reverted: within noise of 015 | 2.7527 | 2.7495 |
+| 018 | Muon lr 0.06 | reverted: behind from 270 s | 2.7551 | 2.7521 |
+| 019 | cooldown over the last 60 percent of the clock | reverted: within noise of 015 | 2.7534 | 2.7498 |
 | pilot | the MLP's matmuls in FP8 (`torch._scaled_mm`, per-tensor scales) | not run: 0.284 s a step against 0.276 in bf16 | | |
 
 What the campaign has learned so far:
@@ -126,6 +129,14 @@ A run writes `result.json` (the metrics, the clock and architecture receipts, th
 `best.pt` (the selected weights). `record.py` appends a run to a campaign ledger with its verdict; `plots.py` draws
 the figures above from the ledger and the result files. `program.md` is the brief an agent follows to run the loop.
 
+## Contributing
+
+A contribution is a candidate: one change to `train.py`, a one-sentence hypothesis, a run on the clock, and the
+verdict recorded. `AGENTS.md` is the short form of the loop; `CODING_STANDARDS.md` is how the Python is written
+(import order, precise types, intent comments, a shape trace on every tensor line), and `python -m pytest -q` checks
+the fixed parts and the working candidate on the CPU. The benchmark modules change only with a reason, in their own
+commit.
+
 ## Layout
 
 ```
@@ -137,9 +148,9 @@ baselines.py         the reference models through the same evaluator and probe
 probe.py             the 3Di probe on a run's selected weights
 record.py, plots.py  the campaign ledger and its figures
 run_gh200.sh         the Docker entrypoint on the GPU machine; queue.sh runs queued candidates
-program.md           the brief an agent follows
+program.md           the brief an agent follows; AGENTS.md its short form; CODING_STANDARDS.md how the Python is written
 src/speedrunning_plms/benchmark/   data, tokens, evaluator, clock, shape rule, result schema, probe (fixed)
-src/speedrunning_plms/optim/       Muon with Newton-Schulz or Polar Express orthogonalization
+src/speedrunning_plms/optim/       the per-matrix Muon (Newton-Schulz or Polar Express) the candidate's banked one is checked against
 tests/               CPU tests of every fixed part and of the candidate
 ```
 

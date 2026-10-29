@@ -1,1 +1,0 @@
-Cooldown over the last 60 percent of the clock instead of 40: a longer anneal in a short run

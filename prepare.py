@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import pandas as pd
 import re
 
 from pathlib import Path
+from huggingface_hub import HfApi, snapshot_download
 
 from speedrunning_plms import benchmark
 from speedrunning_plms.benchmark.data import SOURCE_REPO, SOURCE_REVISION
@@ -33,10 +35,7 @@ def split_of(path: str) -> str | None:
 
 
 def download(source_dir: Path) -> None:
-    import pandas as pd
-
-    from huggingface_hub import HfApi, snapshot_download
-
+    """Fetch the pinned revision's parquet files and join each split into one file; skip splits already present."""
     source_dir.mkdir(parents=True, exist_ok=True)
     missing = [split for split in SPLITS if not (source_dir / f"{split}.parquet").exists()]
     if not missing:

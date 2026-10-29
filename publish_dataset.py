@@ -13,13 +13,14 @@ import argparse
 import json
 
 from pathlib import Path
-
+from typing import Any
 from huggingface_hub import HfApi
 
 from speedrunning_plms import benchmark
 
 
-def card(manifest: dict[str, object], benchmark_id: str) -> str:
+def card(manifest: dict[str, Any], benchmark_id: str) -> str:
+    """The dataset card, from the manifest's counts."""
     source = manifest["source"]
     train = manifest["train"]
     splits = manifest["splits"]

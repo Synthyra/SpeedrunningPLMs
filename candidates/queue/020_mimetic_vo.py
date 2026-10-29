@@ -60,7 +60,7 @@ class Recipe:
     adam_betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.0
     warmup_fraction: float = 0.02
-    cooldown_fraction: float = 0.6
+    cooldown_fraction: float = 0.4
     final_lr_ratio: float = 0.0
     eval_interval_seconds: float = 90.0  # about 4 s each on the GH200, under the 60 s cap with room
     warmup_steps: int = 3  # compile warmup on synthetic windows, outside the clock
@@ -69,6 +69,9 @@ class Recipe:
 def norm(X: Tensor) -> Tensor:
     # X: (..., k); RMS normalization over the last dimension, no affine.
     return F.rms_norm(X, (X.shape[-1],))
+
+
+MIMETIC_ALPHA = 0.25  # W_O W_V = alpha I at initialization; a block starts as X + alpha * attention-average(X)
 
 
 class Rotary(nn.Module):
@@ -169,7 +172,9 @@ class Candidate(nn.Module):
         for block in self.blocks:
             for linear in (block.attention.query, block.attention.key, block.attention.value, block.mlp.up):
                 nn.init.normal_(linear.weight, std=0.02)
-            nn.init.zeros_(block.attention.output.weight)  # (d, d): a block starts as the identity
+            nn.init.orthogonal_(block.attention.value.weight)  # (d, d)
+            with torch.no_grad():
+                block.attention.output.weight.copy_(MIMETIC_ALPHA * block.attention.value.weight.T)  # (d, d): O V = alpha I
             nn.init.zeros_(block.mlp.down.weight)  # (d, f)
 
     def _states(self, input_ids: Tensor, block_mask: BlockMask | None, dense_mask: Tensor | None) -> list[Tensor]:
@@ -251,6 +256,9 @@ def polar_express(G: Tensor, safety_factor: float = 0.02, epsilon: float = 1e-6)
     return X.mT if transposed else X  # (k, m, n)
 
 
+NORMUON_BETA = 0.95  # EMA rate of the per-row second moment of the orthogonalized update
+
+
 class Muon(torch.optim.Optimizer):
     """Muon with Polar Express, one batched orthogonalization per parameter shape.
 
@@ -267,20 +275,24 @@ class Muon(torch.optim.Optimizer):
             by_shape: dict[tuple[int, ...], list[Tensor]] = {}
             for parameter in group["params"]:
                 by_shape.setdefault(tuple(parameter.shape), []).append(parameter)
-            group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device))
-                              for shape, members in by_shape.items()]  # momentum buffer: (k, m, n)
+            group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device),
+                               torch.zeros(len(members), shape[0], 1, dtype=torch.float32, device=members[0].device))
+                              for shape, members in by_shape.items()]  # momentum buffer (k, m, n), row second moment (k, m, 1)
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> None:
         assert closure is None
         for group in self.param_groups:
             lr, momentum = group["lr"], group["momentum"]
-            for members, buffer in group["banks"]:
+            for members, buffer, second_moment in group["banks"]:
                 if members[0].grad is None:
                     continue
                 G = torch.stack([member.grad for member in members]).float()  # (k, m, n)
                 buffer.lerp_(G, 1 - momentum)  # (k, m, n)
-                U = polar_express(G.lerp(buffer, momentum))  # (k, m, n), Nesterov
+                U = polar_express(G.lerp(buffer, momentum)).float()  # (k, m, n), Nesterov
+                second_moment.lerp_(U.square().mean(dim=2, keepdim=True), 1 - NORMUON_BETA)  # (k, m, 1)
+                normalized = U / (second_moment.sqrt() + 1e-8)  # (k, m, n)
+                U = normalized * (U.flatten(1).norm(dim=1) / normalized.flatten(1).norm(dim=1).clamp(min=1e-8)).view(-1, 1, 1)
                 scale = max(1, members[0].shape[0] / members[0].shape[1]) ** 0.5
                 if group["weight_decay"]:
                     torch._foreach_mul_(members, 1 - lr * group["weight_decay"])

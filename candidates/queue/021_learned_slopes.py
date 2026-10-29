@@ -54,8 +54,8 @@ class Recipe:
     muon_momentum: float = 0.95
     muon_momentum_start: float = 0.85
     muon_momentum_warmup: float = 0.15  # share of the budget
-    embed_lr: float = 3e-3
-    head_lr: float = 1e-3
+    embed_lr: float = 1e-3
+    head_lr: float = 3e-4
     logit_softcap: float = 30.0  # tanh cap on the head's logits, modded-nanogpt records 9 and 18
     adam_betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.0
@@ -98,8 +98,12 @@ class Attention(nn.Module):
         self.value = nn.Linear(d, d, bias=False)
         self.output = nn.Linear(d, d, bias=False)
         self.rotary = rotary
-        slopes = 2.0 ** (-8.0 * torch.arange(1, heads + 1) / heads)  # (h,), ALiBi's geometric slopes
-        self.register_buffer("slopes", slopes, persistent=False)
+        slopes = 2.0 ** (-8.0 * torch.arange(1, heads + 1) / heads)  # (h,), ALiBi's geometric slopes at the start
+        self.log_slopes = nn.Parameter(slopes.log())  # (h,), learned
+
+    @property
+    def slopes(self) -> Tensor:
+        return self.log_slopes.exp()  # (h,)
 
     def score_mod(self) -> Any:
         slopes = self.slopes
@@ -251,6 +255,9 @@ def polar_express(G: Tensor, safety_factor: float = 0.02, epsilon: float = 1e-6)
     return X.mT if transposed else X  # (k, m, n)
 
 
+NORMUON_BETA = 0.95  # EMA rate of the per-row second moment of the orthogonalized update
+
+
 class Muon(torch.optim.Optimizer):
     """Muon with Polar Express, one batched orthogonalization per parameter shape.
 
@@ -267,20 +274,24 @@ class Muon(torch.optim.Optimizer):
             by_shape: dict[tuple[int, ...], list[Tensor]] = {}
             for parameter in group["params"]:
                 by_shape.setdefault(tuple(parameter.shape), []).append(parameter)
-            group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device))
-                              for shape, members in by_shape.items()]  # momentum buffer: (k, m, n)
+            group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device),
+                               torch.zeros(len(members), shape[0], 1, dtype=torch.float32, device=members[0].device))
+                              for shape, members in by_shape.items()]  # momentum buffer (k, m, n), row second moment (k, m, 1)
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> None:
         assert closure is None
         for group in self.param_groups:
             lr, momentum = group["lr"], group["momentum"]
-            for members, buffer in group["banks"]:
+            for members, buffer, second_moment in group["banks"]:
                 if members[0].grad is None:
                     continue
                 G = torch.stack([member.grad for member in members]).float()  # (k, m, n)
                 buffer.lerp_(G, 1 - momentum)  # (k, m, n)
-                U = polar_express(G.lerp(buffer, momentum))  # (k, m, n), Nesterov
+                U = polar_express(G.lerp(buffer, momentum)).float()  # (k, m, n), Nesterov
+                second_moment.lerp_(U.square().mean(dim=2, keepdim=True), 1 - NORMUON_BETA)  # (k, m, 1)
+                normalized = U / (second_moment.sqrt() + 1e-8)  # (k, m, n)
+                U = normalized * (U.flatten(1).norm(dim=1) / normalized.flatten(1).norm(dim=1).clamp(min=1e-8)).view(-1, 1, 1)
                 scale = max(1, members[0].shape[0] / members[0].shape[1]) ** 0.5
                 if group["weight_decay"]:
                     torch._foreach_mul_(members, 1 - lr * group["weight_decay"])
@@ -291,7 +302,8 @@ def build_optimizers(model: Candidate, recipe: Recipe) -> list[torch.optim.Optim
     block_matrices = [parameter for block in model.blocks for parameter in block.parameters() if parameter.ndim == 2]
     return [
         Muon(block_matrices, lr=recipe.muon_lr, momentum=recipe.muon_momentum, weight_decay=recipe.weight_decay),
-        torch.optim.AdamW([{"params": [model.embedding.weight], "lr": recipe.embed_lr},
+        torch.optim.AdamW([{"params": [block.attention.log_slopes for block in model.blocks], "lr": recipe.embed_lr},
+                           {"params": [model.embedding.weight], "lr": recipe.embed_lr},
                            {"params": [model.head.weight], "lr": recipe.head_lr}],
                           betas=recipe.adam_betas, weight_decay=recipe.weight_decay, fused=model.embedding.weight.is_cuda),
     ]

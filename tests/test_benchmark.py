@@ -6,7 +6,7 @@ import json
 import numpy as np
 import pytest
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # the reference the collapse-free cross entropy is checked against, away from the collapse margin
 
 from pathlib import Path
 from sklearn.metrics import f1_score, matthews_corrcoef, precision_score, recall_score

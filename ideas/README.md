@@ -34,6 +34,11 @@ always the same: `val_select.loss` of the selected weights against the incumbent
 | 012 | A15: fixed ALiBi-style per-head local bias on the scores beside RoPE | kept: ahead at every eval from 90 s, 4 percent fewer steps; the first gain beyond noise since 001 | 2.7531 | 2.7501 |
 | 013 | A14: one protein per family per pass, packed contiguously | reverted: the same curve as 012 within noise; the budget is not family-limited | 2.7532 | 2.7502 |
 | 014 | A16: the local bias on six heads, six free | reverted: loses most of 012's gain; the prior is wanted on every head | 2.7548 | 2.7515 |
+| 015 | B1: NorMuon on 012 | kept: ahead from 180 s; the second gain beyond noise | 2.7495 | 2.7457 |
+| 016 | A3: cautious weight decay 0.1 on the Muon banks, on 012 | reverted: behind from 180 s | 2.7564 | 2.7535 |
+| 017 | A1: embedding lr 3e-3, head lr 1e-3, on 012 | reverted: inside the noise band of 012; retried on 015 | 2.7527 | 2.7495 |
+| 018 | A1: Muon lr 0.06, on 012 | reverted: behind from 270 s; past the optimum | 2.7551 | 2.7521 |
+| 019 | A1: cooldown over the last 60 percent, on 012 | reverted: the same within noise; ahead mid-run, level at the end | 2.7534 | 2.7498 |
 | pilot | B7: the MLP's matmuls in FP8 (e4m3, per-tensor dynamic scales, `torch._scaled_mm`) | not run: 0.284 s a step against 0.276 in bf16 in a 60 s pilot; the quantization overhead exceeds the saving at 768 x 2,048 | | |
 
 A second profile of the incumbent (after 001) puts the step at 0.276 s, all of it GPU time: matmuls 109 ms at about

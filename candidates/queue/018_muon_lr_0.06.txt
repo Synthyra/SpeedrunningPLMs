@@ -1,1 +1,0 @@
-Muon lr 0.06: 0.02 to 0.04 helped a little, the optimum may be higher in a 2,000-step run
