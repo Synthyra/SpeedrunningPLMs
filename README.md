@@ -102,7 +102,7 @@ What the campaign has learned so far:
 
 | Rule | What it is |
 |---|---|
-| Data | `Synthyra/plm_speedrun_afdb_v6`: 1,754,034 training proteins (392.6M tokens) from the AlphaFold DB family split of the Alignment Atlas, 25,459 validation and 25,778 test proteins. No held-out protein has a training relative at 30 percent identity over 80 percent coverage by sequence (MMseqs2) or by structure (Foldseek). Lengths 50 to 2,046 residues. ESM2 alphabet. |
+| Data | [`Synthyra/SpeedrunningPLMs`](https://huggingface.co/datasets/Synthyra/SpeedrunningPLMs): 1,754,034 training proteins (392.6M tokens) from the AlphaFold DB family split of the Alignment Atlas, 25,459 validation and 25,778 test proteins. No held-out protein has a training relative at 30 percent identity over 80 percent coverage by sequence (MMseqs2) or by structure (Foldseek). Lengths 50 to 2,046 residues. ESM2 alphabet. |
 | Objective | 15 percent of standard residues replaced by MASK, nothing else; collapse-free cross entropy ([arXiv 2610.31642](https://arxiv.org/abs/2610.31642)) on the masked residues over the 20 standard residues. Training uses the same corruption. |
 | Clock | 10 minutes of applied training steps on one GPU, measured with device synchronization; the overrunning step is discarded. Compile warmup is outside the clock, capped at 3 minutes; in-run validation is outside the clock, capped at 60 seconds in total. A broken cap makes the run `invalid`. |
 | Selection | The weights with the lowest loss on `val_select` (one protein per validation family, 4,751 proteins, at most 1,024 tokens, fixed masks) are scored once on the full validation and test splits at full length (at most 2,048 tokens, fixed masks). The headline is the test loss, in nats per masked residue. |

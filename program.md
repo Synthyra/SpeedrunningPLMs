@@ -6,7 +6,7 @@ else is fixed and audited.
 
 ## The benchmark (fixed, `src/speedrunning_plms/benchmark/`)
 
-- **Data.** `Synthyra/plm_speedrun_afdb_v6`, built by `prepare.py` from the family-disjoint AlphaFold DB split: no
+- **Data.** `Synthyra/SpeedrunningPLMs` (public), built by `prepare.py` from the family-disjoint AlphaFold DB split: no
   held-out protein has a training relative at 30 percent identity over 80 percent coverage by sequence (MMseqs2) or
   structure (Foldseek). Train: 1,754,034 proteins as one shuffled uint8 token stream in the ESM2 alphabet (33 tokens:
   CLS, residues, EOS; MASK is 32). Held out: `val_select` (one protein per validation family, 4,751 proteins, at most
