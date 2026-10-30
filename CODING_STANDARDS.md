@@ -1,7 +1,7 @@
 # Coding standards
 
-Every Python file in this repository follows these rules, `train.py` first: it is the file a contributor edits and the
-example the others copy. The rules keep the data flow visible, so a reader can audit a candidate without running it.
+Every Python file in this repository follows these rules, `train.py` and the strategy modules first: they are what a
+contributor edits and the example the others copy. The rules keep the data flow visible, so a reader can audit a candidate without running it.
 `candidates/` holds frozen snapshots of past record holders: their bytes identify runs in the ledger, so they are never
 edited and are exempt.
 
@@ -93,7 +93,8 @@ comment of the body when the signature does not say them.
 ## Structure
 
 - One module, one responsibility. `benchmark/` holds the fixed parts (data, tokens, evaluator, clock, shape rule,
-  result schema, probe); `optim/` the per-matrix Muon; `train.py` everything a run may change.
+  result schema, probe); `optim/` the per-matrix Muon; `strategies/` one module per family a genome chooses from;
+  `train.py` the skeleton and the loop.
 - Helpers live beside the feature that owns them. There is no `utils`, `helpers`, `common` or `misc` module, and no
   second copy of something that exists: search before adding.
 - The cross entropy everywhere, training included, is the collapse-free one from `foundry.layers.cross_entropy`;
@@ -101,7 +102,10 @@ comment of the body when the signature does not say them.
 
 ## What a change may touch
 
-`train.py` is the only file a run edits. The modules under `src/speedrunning_plms/benchmark/`, `prepare.py`,
+A run changes a genome. A new idea is a new module under `src/speedrunning_plms/strategies/` (a config dataclass with
+the record's defaults and a strategy that overrides only the hooks it needs), listed in the registry; `train.py`
+changes only when the skeleton must offer a new hook point, and then the default genome must still equal the record
+bit for bit on a CPU smoke. The modules under `src/speedrunning_plms/benchmark/`, `prepare.py`,
 `baselines.py`, `probe.py`, `record.py` and `plots.py` define the benchmark; a change to them changes what every result
 means and is a separate, deliberate commit with its reason. `AGENTS.md` and `program.md` say how a candidate is tried,
 kept, reverted and recorded.
@@ -113,5 +117,6 @@ pip install -e ".[test]"
 python -m pytest -q
 ```
 
-The tests cover every fixed part on the CPU, run the working `train.py` for one step on synthetic data, and check that
-its banked optimizer matches the per-matrix one. A candidate that fails them is not shipped.
+The tests cover every fixed part on the CPU, build every variant of every family and train it one CPU step, check
+that the default genome reproduces the record's frozen `train.py` exactly, check the banked optimizer against the
+per-matrix one, and run each search proposer on a toy objective. A candidate that fails them is not shipped.

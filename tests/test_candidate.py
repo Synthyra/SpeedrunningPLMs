@@ -1,9 +1,10 @@
-"""The baseline candidate against the fixed benchmark: the shape rule, the forward contracts, and one end-to-end run."""
+"""The record's candidate against the fixed benchmark: the shape rule, the forward contracts, and one end-to-end run."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import subprocess
 import sys
 import torch
@@ -12,6 +13,9 @@ from pathlib import Path
 from types import ModuleType
 
 from speedrunning_plms import benchmark
+from speedrunning_plms.strategies import default_genome
+from speedrunning_plms.strategies.attention import document_dense_mask
+from speedrunning_plms.strategies.optimizer import Muon, polar_express
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -28,7 +32,7 @@ def load_candidate() -> ModuleType:
 
 def test_baseline_candidate_passes_the_shape_rule() -> None:
     candidate = load_candidate()
-    model = candidate.Candidate(candidate.Recipe(), max_tokens=64)
+    model = candidate.build_candidate(default_genome(), max_tokens=64)
     receipt = benchmark.check_architecture(model)
     assert receipt["blocks"] == 36 and receipt["parameters"] > 190_000_000
     assert receipt["block_shapes"][0]["mlp"] == [(768, 2048), (2048, 768)]
@@ -54,12 +58,12 @@ def test_shape_rule_refuses_other_shapes() -> None:
             continue
         raise AssertionError(f"{blocks} blocks, {hidden} wide, {intermediate} intermediate was accepted")
     benchmark.check_architecture(Wrong(36, 768, 2048))
-    assert candidate.Recipe().window > 0
+    assert candidate.Strategies(default_genome()).batch.config.window > 0
 
 
 def test_candidate_forward_contracts() -> None:
     candidate = load_candidate()
-    model = candidate.Candidate(candidate.Recipe(), max_tokens=32).eval()
+    model = candidate.build_candidate(default_genome(), max_tokens=32).eval()
     input_ids = torch.randint(4, 24, (2, 12))
     input_ids[:, 0] = benchmark.CLS_ID
     input_ids[0, 9:] = benchmark.PAD_ID
@@ -70,7 +74,7 @@ def test_candidate_forward_contracts() -> None:
     assert logits.shape == (2, 12, benchmark.VOCAB_SIZE)
     assert len(states) == benchmark.BLOCKS + 1 and states[-1].shape == (2, 12, benchmark.HIDDEN)
     assert torch.equal(model.residue_columns, benchmark.ESM2_RESIDUE_COLUMNS)
-    dense = candidate.document_dense_mask(torch.tensor([[0, 5, 5, 0, 6, 6]]))  # (1, 1, 6, 6)
+    dense = document_dense_mask(torch.tensor([[0, 5, 5, 0, 6, 6]]))  # (1, 1, 6, 6)
     assert dense[0, 0, 1, 2] and not dense[0, 0, 1, 4] and dense[0, 0, 4, 5]
 
 
@@ -79,14 +83,13 @@ def test_candidate_muon_banks_match_the_per_matrix_update() -> None:
     batched Polar Express equals the package's per-matrix one."""
     from speedrunning_plms.optim.muon import zeropower_via_polar_express
 
-    candidate = load_candidate()
     torch.manual_seed(0)
     G = torch.randn(96, 48)  # (m, n)
-    assert torch.allclose(candidate.polar_express(G[None])[0], zeropower_via_polar_express(G), atol=1e-5)
+    assert torch.allclose(polar_express(G[None])[0], zeropower_via_polar_express(G), atol=1e-5)
     banked = [torch.nn.Parameter(torch.randn(shape) * 0.02) for shape in ((48, 48), (48, 48), (96, 48), (48, 96))]
     alone = [torch.nn.Parameter(parameter.detach().clone()) for parameter in banked]
-    optimizers = [candidate.Muon(banked, lr=0.02, momentum=0.9, weight_decay=0.0),
-                  *(candidate.Muon([parameter], lr=0.02, momentum=0.9, weight_decay=0.0) for parameter in alone)]
+    optimizers = [Muon(banked, lr=0.02, momentum=0.9, weight_decay=0.0),
+                  *(Muon([parameter], lr=0.02, momentum=0.9, weight_decay=0.0) for parameter in alone)]
     for _ in range(2):
         gradients = [torch.randn_like(parameter) for parameter in banked]
         for parameters in (banked, alone):
@@ -110,4 +113,14 @@ def test_end_to_end_cpu_run_writes_a_result(tiny_data: Path, tmp_path: Path) -> 
     assert run_result["architecture"]["blocks"] == 36 and run_result["clock"]["steps"] == 1
     assert run_result["selected_step"] == 1 and run_result["curve"] and (output / "best.pt").exists()
     assert run_result["comparison_key"] == benchmark.comparison_key(run_result["benchmark_id"], run_result["evaluator_sha256"], run_result["clock"])
-    assert run_result["candidate_sha256"] == benchmark.candidate_sha256(PROJECT / "train.py")
+    assert run_result["candidate_parts"]["train.py"] == benchmark.candidate_sha256(PROJECT / "train.py")
+    assert run_result["genome_changes"] == {"batch": {"window": 128, "windows_per_step": 2}}
+
+
+def test_eval_spacing_keeps_the_record_and_fits_slow_evals_under_the_cap() -> None:
+    candidate = load_candidate()
+    assert candidate.eval_interval(4.2, 600.0) == 90.0 and candidate.eval_interval(4.2, 180.0) == 90.0
+    interval = candidate.eval_interval(12.0, 600.0)  # evals at 90, 260, 430 and the final one: 48 s
+    evals = 1 + math.ceil((600.0 - 90.0) / interval)  # the first, the spaced ones before the end, and the final one
+    assert interval == 170.0 and 12.0 * evals <= candidate.EVAL_TARGET_SECONDS
+    assert candidate.eval_interval(30.0, 600.0) == math.inf

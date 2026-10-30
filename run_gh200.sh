@@ -4,7 +4,7 @@
 #   bash run_gh200.sh build                      build the image from the Dockerfile (aarch64, CUDA 12.8)
 #   bash run_gh200.sh prepare                    build the benchmark data (HF_TOKEN from the launcher's environment)
 #   bash run_gh200.sh pilot                      a 60 s clock run of the working train.py, no final evals
-#   bash run_gh200.sh train --name 000_baseline  a full run; result in ~/speedrun/runs/<name>/result.json
+#   bash run_gh200.sh train --name 000_baseline [--genome g.json]  a full run; result in ~/speedrun/runs/<name>/result.json
 #   bash run_gh200.sh probe --run-dir /state/runs/000_baseline
 #   bash run_gh200.sh baselines [--models ...]   the reference models, results in ~/speedrun/runs/baselines
 #   bash run_gh200.sh shell                      an interactive shell in the image
@@ -55,6 +55,13 @@ case "$command" in
   train)
     [ "${1:-}" = "--name" ] && [ -n "${2:-}" ] || { echo "train: --name <name> comes first" >&2; exit 2; }
     sudo mkdir -p "$STATE/runs/$2" && sudo cp "$PROJECT/train.py" "$STATE/runs/$2/train.py"  # the candidate's bytes, before the run
+    sudo cp -r "$PROJECT/src/speedrunning_plms/strategies" "$STATE/runs/$2/strategies"  # the modules a genome builds from
+    for ((index = 1; index < $#; index++)); do  # and the genome itself, when there is one
+      if [ "${!index}" = "--genome" ]; then
+        next=$((index + 1))
+        sudo cp "$PROJECT/${!next}" "$STATE/runs/$2/genome.json"
+      fi
+    done
     docker_run "$IMAGE" python train.py --data-dir /state/data/afdb_v6 --output-dir "/state/runs/$2" "$@"
     ;;
   probe)

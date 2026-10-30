@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Run queued candidates one after another on the box, so the GPU never waits for the laptop.
 #
-#   bash queue.sh                      every candidates/queue/<name>.py in order, each with its <name>.txt hypothesis
+#   bash queue.sh                      every candidates/queue/<name>.py or <name>.json in order, each with its <name>.txt
+#                                      hypothesis
 #   bash queue.sh 015_normuon 016_cautious_wd   only these
-#   An optional <name>.args holds extra train.py arguments on one line, such as `--seed 1` for a confirmation run.
+#   A <name>.json is a genome: the shipped train.py runs it with --genome. A <name>.py is a complete train.py.
+#   An optional <name>.args holds extra train.py arguments on one line, such as `--seed 1` for a confirmation run or
+#   `--budget 180 --final-splits val_select` for a search's short rung.
 #   bash queue.sh --wait --probe 015_normuon --reprobe-baselines
 #       wait for the GPU, probe a kept run first, run the queue, then re-probe the reference models
 #
@@ -28,6 +31,8 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+exec 9>"$STATE/queue.lock"
+flock 9  # one queue at a time: a later shipment waits here until the earlier one has finished
 if [ "$wait_for_gpu" = 1 ]; then
   while pgrep -f "[t]rain.py|[p]robe.py|[b]aselines.py" >/dev/null; do sleep 30; done
   echo "queue: gpu free $(date -u +%H:%M:%S)" >&2
@@ -41,8 +46,11 @@ if [ $# -gt 0 ]; then
   names=("$@")
 else
   names=()
-  for file in candidates/queue/*.py; do names+=("$(basename "$file" .py)"); done
+  for file in candidates/queue/*.py candidates/queue/*.json; do
+    [ -e "$file" ] && names+=("$(basename "${file%.*}")")
+  done
 fi
+cp train.py .shipped_train.py  # a genome runs on the shipped train.py, whatever a .py entry copied over it
 
 for name in "${names[@]}"; do
   if [ -f "$STATE/runs/$name/result.json" ]; then
@@ -50,10 +58,15 @@ for name in "${names[@]}"; do
     continue
   fi
   hypothesis="$(cat "candidates/queue/$name.txt")"
-  cp "candidates/queue/$name.py" train.py
-  echo "queue: $name starts $(date -u +%H:%M:%S)" >&2
   extra=()
   [ -f "candidates/queue/$name.args" ] && read -r -a extra < "candidates/queue/$name.args"  # e.g. --seed 1
+  if [ -f "candidates/queue/$name.json" ]; then
+    cp .shipped_train.py train.py
+    extra+=(--genome "candidates/queue/$name.json")
+  else
+    cp "candidates/queue/$name.py" train.py
+  fi
+  echo "queue: $name starts $(date -u +%H:%M:%S)" >&2
   bash run_gh200.sh train --name "$name" --hypothesis "$hypothesis" "${extra[@]}" || echo "queue: $name failed" >&2
 done
 if [ "$reprobe_baselines" = 1 ]; then

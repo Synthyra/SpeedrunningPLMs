@@ -1,0 +1,8 @@
+{
+  "families": {
+    "gates": {
+      "variant": "residual_channels"
+    }
+  },
+  "schema": 1
+}

@@ -46,7 +46,15 @@ def load(folder: Path, ledger: Path | None) -> tuple[list[dict[str, Any]], list[
         for line in ledger.read_text(encoding="utf-8").splitlines():
             row = json.loads(line)
             verdicts[row["name"]] = row.get("verdict") or ""
+        order = {name: index for index, name in enumerate(verdicts)}  # the ledger's order is the campaign's
+        runs.sort(key=lambda run: order.get(run["name"], len(order)))
     return runs, references, verdicts
+
+
+def record_name(runs: list[dict[str, Any]], verdicts: dict[str, str]) -> str | None:
+    """The kept run with the lowest `val_select` loss: the selection rule's record holder."""
+    kept = [run for run in runs if verdicts.get(run["name"]) == "keep"]
+    return min(kept, key=lambda run: run["metrics"]["val_select"]["loss"])["name"] if kept else None
 
 
 def letter(axis: plt.Axes, text: str) -> None:
@@ -55,8 +63,7 @@ def letter(axis: plt.Axes, text: str) -> None:
 
 def selection_curves(runs: list[dict[str, Any]], verdicts: dict[str, str], output: Path) -> None:
     figure, (left, right) = plt.subplots(1, 2, figsize=(11, 4.2), gridspec_kw={"width_ratios": [1.3, 1]})
-    kept = [run for run in runs if verdicts.get(run["name"]) == "keep"]
-    record = kept[-1]["name"] if kept else None
+    record = record_name(runs, verdicts)
     for run in runs:
         seconds = [point["train_seconds"] for point in run["curve"]]
         losses = [point["loss"] for point in run["curve"]]
@@ -86,8 +93,9 @@ def selection_curves(runs: list[dict[str, Any]], verdicts: dict[str, str], outpu
     right.scatter([], [], color=KEPT_COLOR, label="kept")
     right.scatter([], [], color=REVERTED_COLOR, label="reverted")
     right.set_xticks(positions)
-    right.set_xticklabels([name.split("_")[0] for name in names], fontsize=7)
-    right.set_xlabel("candidate")
+    right.set_xticklabels([name if name.split("_")[0].isdigit() is False else name.split("_")[0] for name in names],
+                          fontsize=5.5, rotation=90)
+    right.set_xlabel("candidate, in campaign order")
     right.set_ylabel("test loss (nats per masked residue)")
     low, high = min(tests), max(tests)
     right.set_ylim(low - 0.003, high + 0.003)
@@ -101,8 +109,8 @@ def selection_curves(runs: list[dict[str, Any]], verdicts: dict[str, str], outpu
 
 def references_figure(runs: list[dict[str, Any]], references: list[dict[str, Any]], verdicts: dict[str, str], output: Path) -> None:
     figure, (left, right) = plt.subplots(1, 2, figsize=(11, 4.2))
-    kept = [run for run in runs if verdicts.get(run["name"]) == "keep"]
-    record = kept[-1] if kept else runs[-1]
+    name = record_name(runs, verdicts)
+    record = next(run for run in runs if run["name"] == name) if name else runs[-1]
     unigram = next((reference for reference in references if reference["model_id"] == "unigram"), None)
     for reference in references:
         if reference["model_id"] == "unigram":

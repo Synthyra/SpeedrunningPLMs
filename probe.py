@@ -2,9 +2,10 @@
 
     python probe.py --data-dir /data/afdb_v6 --run-dir runs/000_baseline
 
-Rebuilds the candidate from the run's `train.py` snapshot (or the working `train.py` when the run holds none), loads
-`best.pt`, trains the probe head on the fixed subset and scores it on the full validation and test splits. Writes
-`probe.json` beside `result.json`; never changes the result.
+Rebuilds the candidate from the run's `train.py` snapshot (or the working `train.py` when the run holds none) and,
+for a genome run, the genome in its `result.json` with the working strategy modules, which must be the ones the run
+used; loads `best.pt`, trains the probe head on the fixed subset and scores it on the full validation and test splits.
+Writes `probe.json` beside `result.json`; never changes the result.
 """
 
 from __future__ import annotations
@@ -45,15 +46,24 @@ def main() -> None:
         raise FileExistsError(f"{output} exists")
     candidate_path = arguments.candidate or next(path for path in (arguments.run_dir / "train.py", Path(__file__).parent / "train.py") if path.exists())
     run_result = json.loads((arguments.run_dir / "result.json").read_text(encoding="utf-8"))
-    if benchmark.candidate_sha256(candidate_path) != run_result["candidate_sha256"]:
+    parts = run_result.get("candidate_parts", {"train.py": run_result["candidate_sha256"]})  # runs before the genome had one file
+    if benchmark.candidate_sha256(candidate_path) != parts["train.py"]:
         raise ValueError(f"{candidate_path} is not the candidate that produced {arguments.run_dir}")
 
     device = torch.device(arguments.device)
     candidate = load_candidate_module(candidate_path)
     manifest = benchmark.load_manifest(arguments.data_dir)
-    model = candidate.Candidate(candidate.Recipe(), max(manifest["max_tokens"].values())).to(device)
+    max_tokens = max(manifest["max_tokens"].values())
+    if "genome" in run_result:
+        from speedrunning_plms.strategies import sources_sha256
+
+        if sources_sha256() != parts["strategies"]:
+            raise ValueError(f"the strategy modules changed since {arguments.run_dir} ran; its snapshot is in strategies/ there")
+        model = candidate.build_candidate(run_result["genome"], max_tokens).to(device)
+    else:
+        model = candidate.Candidate(candidate.Recipe(), max_tokens).to(device)
     state = torch.load(arguments.run_dir / "best.pt", map_location=device)
-    model.load_state_dict({name: tensor.to(torch.float32) for name, tensor in state.items()})
+    model.load_state_dict({name: tensor.to(torch.float32) if tensor.is_floating_point() else tensor for name, tensor in state.items()})
     model.eval()
 
     stream = benchmark.load_train(arguments.data_dir)
