@@ -24,6 +24,12 @@ Two numbers act under every kernel, both off (0) in the record:
   function as a constant; capping the full score would floor far tokens' penalty at -cap and erase the slopes). With
   unit-RMS q and k the scaled score lies in [-sqrt(d_h), sqrt(d_h)], 8 at 12 heads, so a cap of 3 to 8 binds. The
   dense path (CPU and evaluation) computes the capped scores explicitly instead of SDPA.
+- `local_every` (ModernBERT, arXiv 2412.13663; Gemma 3; `ideas/2026-10-30_long_protein_attention.md` idea 4): in
+  blocks whose index modulo `local_every` is not 0, a query sees only keys of its own protein within LOCAL_REACH
+  positions on either side (a 511-token window); the other blocks stay global. `training_masks` builds the local
+  masks once per step beside the document masks and appends them, so a local block takes the second half of the tuple;
+  the dense path ands the same band into its mask, so evaluation sees what training saw. Only proteins longer than
+  LOCAL_REACH change.
 
 Symbols: b windows or proteins, l tokens, d = 768, h heads, d_h per-head width, q query heads, p = h / 2 pairs.
 """
@@ -33,6 +39,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar
 from torch import Tensor, nn
@@ -45,6 +52,8 @@ from speedrunning_plms.strategies.strategy import ForwardContext, ParameterGroup
 
 DIFFERENTIAL = ("differential", "triangle_differential")
 TRIANGLE = ("triangle", "triangle_differential")
+LOCAL_REACH = 256  # a local block's query sees keys fewer than this many positions away
+MaskMod = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]  # flex's (batch, head, query, key) -> allowed
 
 
 @dataclass(frozen=True)
@@ -53,9 +62,10 @@ class AttentionConfig(StrategyConfig):
     heads: int = 12
     key_offset: float = 0.0  # share of each head's key pairs from the previous token, and as many from the next
     score_cap: float = 0.0  # tanh cap on the scaled scores; 0 is off
+    local_every: int = 0  # blocks whose index modulo this is not 0 attend locally; 0 is all global
     VARIANTS: ClassVar[tuple[str, ...]] = ("standard", "differential", "triangle", "triangle_differential", "paired")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"heads": (6, 12), "key_offset": (0.0, 0.5),  # d_h of 128 to 64
-                                                        "score_cap": (0.0, 8.0)}
+                                                        "score_cap": (0.0, 8.0), "local_every": (0, 3)}
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -63,6 +73,12 @@ class AttentionConfig(StrategyConfig):
             raise ValueError(f"heads must be 6 or 12 (d_h 128 or 64), not {self.heads}")
         if self.score_cap != 0.0 and self.score_cap < 3.0:
             raise ValueError(f"score_cap is 0 (off) or 3 to 8, not {self.score_cap}")
+        if self.local_every not in (0, 2, 3):
+            raise ValueError(f"local_every is 0 (off), 2 or 3, not {self.local_every!r}")
+
+    def local(self, index: int) -> bool:
+        """True for a block that attends within LOCAL_REACH only."""
+        return self.local_every > 0 and index % self.local_every != 0
 
 
 def split_rotation_pairs(X: Tensor) -> tuple[Tensor, Tensor]:
@@ -133,6 +149,8 @@ class Attention(nn.Module):
             self.slopes = None
         self.positional = positional
         self.score_cap = config.score_cap
+        self.split_masks = config.local_every > 0  # the training masks hold global then local halves
+        self.local = config.local(index)
         self.kernel_options = kernel_options
         self.key_hooks = key_hooks
         self.query_hooks = query_hooks
@@ -186,26 +204,45 @@ class Attention(nn.Module):
 
     def _full(self, Q: Tensor, K: Tensor, V: Tensor, context: ForwardContext) -> Tensor:
         # Q: (b, q, l, d_h); K, V: (b, h, l, d_h); returns (b, q, l, d_h).
-        block_mask = context.block_masks[0] if context.block_masks is not None else None
-        return self._attend(Q, K, V, block_mask, context.dense_mask)  # (b, q, l, d_h)
+        masks = self._block_masks(context)
+        return self._attend(Q, K, V, masks[0] if masks is not None else None, self._dense_mask(context, Q.shape[2]))  # (b, q, l, d_h)
+
+    def _block_masks(self, context: ForwardContext) -> tuple[BlockMask, ...] | None:
+        """This block's training masks: the global half, or the local half in a local block."""
+        masks = context.block_masks
+        if masks is None or not self.split_masks:
+            return masks
+        half = len(masks) // 2
+        return masks[half:] if self.local else masks[:half]
+
+    def _dense_mask(self, context: ForwardContext, length: int) -> Tensor | None:
+        """The dense path's mask, with the local band anded in for a local block."""
+        # Returns (b, 1, l or 1, l) bool, (b, 1, l, l) in a local block, or None in training on flex.
+        if context.dense_mask is None or not self.local:
+            return context.dense_mask
+        positions = torch.arange(length, device=context.dense_mask.device)  # (l,)
+        band = (positions[:, None] - positions[None, :]).abs() < LOCAL_REACH  # (l, l)
+        return context.dense_mask & band  # (b, 1, l, l)
 
     def _triangle(self, Q: Tensor, K: Tensor, V: Tensor, context: ForwardContext) -> Tensor:
         # Q: (b, q, l, d_h); K, V: (b, h, l, d_h); returns (b, q, l, d_h), the down and up halves side by side.
         Q_down, Q_up = split_rotation_pairs(Q)  # each (b, q, l, d_h / 2)
         K_down, K_up = split_rotation_pairs(K)  # each (b, h, l, d_h / 2)
         V_down, V_up = V.chunk(2, dim=-1)  # each (b, h, l, d_h / 2); values carry no rotation
-        if context.block_masks is not None:
-            down, up = context.block_masks
+        masks = self._block_masks(context)
+        if masks is not None:
+            down, up = masks
             Y_down = self._attend(Q_down, K_down, V_down, down, None)  # (b, q, l, d_h / 2)
             Y_up = self._attend(Q_up, K_up, V_up, up, None)  # (b, q, l, d_h / 2)
         else:
-            assert context.dense_mask is not None
             l = Q.shape[2]
+            dense = self._dense_mask(context, l)  # (b, 1, l or 1, l)
+            assert dense is not None
             positions = torch.arange(l, device=Q.device)  # (l,)
             lower = positions[:, None] >= positions[None, :]  # (l, l)
             diagonal = positions[:, None] == positions[None, :]  # (l, l); every row keeps its own entry, padding too
-            Y_down = self._attend(Q_down, K_down, V_down, None, (context.dense_mask & lower) | diagonal)  # (b, q, l, d_h / 2)
-            Y_up = self._attend(Q_up, K_up, V_up, None, (context.dense_mask & ~lower) | diagonal)  # (b, q, l, d_h / 2)
+            Y_down = self._attend(Q_down, K_down, V_down, None, (dense & lower) | diagonal)  # (b, q, l, d_h / 2)
+            Y_up = self._attend(Q_up, K_up, V_up, None, (dense & ~lower) | diagonal)  # (b, q, l, d_h / 2)
         return torch.cat((Y_down, Y_up), dim=-1)  # (b, q, l, d_h)
 
     def _paired(self, Q: Tensor, K: Tensor, V: Tensor, context: ForwardContext) -> Tensor:
@@ -216,11 +253,13 @@ class Attention(nn.Module):
             # X: (b, l, h, d_h); the two heads of a pair alternate along the sequence.
             return X.view(b, l, h // 2, 2, d_h).permute(0, 2, 1, 3, 4).reshape(b, h // 2, 2 * l, d_h)  # (b, p, 2l, d_h)
 
-        block_mask = context.block_masks[0] if context.block_masks is not None else None
+        masks = self._block_masks(context)
+        block_mask = masks[0] if masks is not None else None
         allowed = None
         if block_mask is None:
-            assert context.dense_mask is not None
-            allowed = context.dense_mask.repeat_interleave(2, dim=-1)  # (b, 1, l or 1, 2l)
+            dense = self._dense_mask(context, l)  # (b, 1, l or 1, l)
+            assert dense is not None
+            allowed = dense.repeat_interleave(2, dim=-1)  # (b, 1, l or 1, 2l)
             if allowed.shape[2] > 1:
                 allowed = allowed.repeat_interleave(2, dim=2)  # (b, 1, 2l, 2l)
         Y = self._attend(interleave(Q), interleave(K), interleave(V), block_mask, allowed, pair_positions=True)  # (b, p, 2l, d_h)
@@ -264,17 +303,19 @@ class AttentionKernel(Strategy):
 
     def training_masks(self, input_ids: Tensor) -> tuple[BlockMask, ...]:
         """The flex block masks of one training batch: tokens attend within their own protein, and the kernel's own
-        rule on top (directional halves for the triangle, interleaved positions for paired heads)."""
+        rule on top (directional halves for the triangle, interleaved positions for paired heads). With `local_every`,
+        the same rules within LOCAL_REACH follow, one more mask per rule, built once per step."""
         # input_ids: (b, l) of packed windows.
         document = documents(input_ids)  # (b, l)
         b, l = input_ids.shape
-        if self.variant == "paired":
+        paired = self.variant == "paired"
+        if paired:
             def same_document_paired(batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
                 # batch, head, query, key: () each, one attention entry; returns ().
                 return document[batch, query // 2] == document[batch, key // 2]  # ()
 
-            return (create_block_mask(same_document_paired, b, None, 2 * l, 2 * l, device=input_ids.device, _compile=True),)
-        if self.variant in TRIANGLE:
+            rules: tuple[MaskMod, ...] = (same_document_paired,)
+        elif self.variant in TRIANGLE:
             def down(batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
                 # batch, head, query, key: () each, one attention entry; returns ().
                 return (document[batch, query] == document[batch, key]) & (query >= key)  # ()
@@ -283,13 +324,28 @@ class AttentionKernel(Strategy):
                 # batch, head, query, key: () each, one attention entry; returns ().
                 return (document[batch, query] == document[batch, key]) & (query <= key)  # ()
 
-            return tuple(create_block_mask(rule, b, None, l, l, device=input_ids.device, _compile=True) for rule in (down, up))
+            rules = (down, up)
+        else:
+            def same_document(batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
+                # batch, head, query, key: () each, one attention entry; returns ().
+                return document[batch, query] == document[batch, key]  # ()
 
-        def same_document(batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
-            # batch, head, query, key: () each, one attention entry; returns ().
-            return document[batch, query] == document[batch, key]  # ()
+            rules = (same_document,)
+        if self.config.local_every:
+            rules = (*rules, *(within_reach(rule, paired) for rule in rules))
+        size = 2 * l if paired else l
+        return tuple(create_block_mask(rule, b, None, size, size, device=input_ids.device, _compile=True) for rule in rules)
 
-        return (create_block_mask(same_document, b, None, l, l, device=input_ids.device, _compile=True),)
+
+def within_reach(rule: MaskMod, paired: bool) -> MaskMod:
+    """A mask rule restricted to keys fewer than LOCAL_REACH protein positions from the query."""
+
+    def local(batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
+        # batch, head, query, key: () each, one attention entry; returns ().
+        distance = (query // 2 - key // 2).abs() if paired else (query - key).abs()  # ()
+        return rule(batch, head, query, key) & (distance < LOCAL_REACH)  # ()
+
+    return local
 
 
 def documents(input_ids: Tensor) -> Tensor:

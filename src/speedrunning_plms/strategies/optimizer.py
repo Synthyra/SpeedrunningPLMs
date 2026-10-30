@@ -30,12 +30,25 @@ and scalars.
 `cautious_weight_decay` decays a Muon weight only where the update and the weight share a sign (016, A3; modded-
 nanogpt records 43 and 50); `weight_decay` is the plain decoupled decay on both optimizers (0 in the record).
 
+Three numbers act on the schedule of the update rather than its form, all off at their defaults:
+- `adam_beta2_end`: AdamW's beta2 moves linearly from `adam_beta2` to it over the schedule's cooldown (Dremov et al.,
+  arXiv 2508.01483: higher beta2 in the cooldown helps). The betas are plain floats set on the param groups each step
+  before the optimizers step, outside any compiled graph, as the learning rate is.
+- `decay_timescale` (Power Lines, arXiv 2505.13738): weight decay on the Muon banks with a constant timescale of
+  `decay_timescale` total runs, lambda_t = 1 / (timescale x total_steps x lr_t), so each step shrinks the weights by
+  1 / (timescale x total_steps) whatever the learning rate. The run's total steps are estimated each step as
+  (step + 1) / progress. When on, it replaces `cautious_weight_decay` on the banks.
+- `fused_polar`: Polar Express under `torch.compile(dynamic=False)`, one graph per bank shape, so its elementwise
+  parts fuse around the bf16 matmuls; the same iteration and coefficients, so the update matches up to the compiler's
+  reordering. CUDA only: on the CPU the loop never compiles (the model's rule), and Windows CPU inductor needs MSVC.
+
 Symbols: k matrices in a bank, m and n a matrix's dimensions, r = min(m, n), s = max(m, n).
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import torch
 
 from collections.abc import Callable, Iterable, Iterator
@@ -44,7 +57,7 @@ from typing import ClassVar
 from torch import Tensor, nn
 
 from speedrunning_plms.optim.muon import POLAR_EXPRESS_COEFFICIENTS
-from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import ParameterGroup, StepState, Strategy, StrategyConfig
 
 
 NORMUON_BETA = 0.95  # EMA rate of the per-row second moment of the orthogonalized update
@@ -70,18 +83,26 @@ class OptimizerConfig(StrategyConfig):
     anvil_fast_weight: float = 0.4385  # anvil: the fast rail's share of the blend
     amuse_beta: float = 0.6  # amuse: the interpolation toward the average through the warmup
     amuse_rho: float = 0.8  # amuse: how fast beta_t rises toward 1 after it
+    adam_beta2_end: float = 0.95  # AdamW's beta2 at the end of the cooldown
+    decay_timescale: float = 0.0  # the Muon banks' decay timescale in total runs; 0 is off
+    fused_polar: int = 0  # 1 compiles Polar Express per bank shape
     VARIANTS: ClassVar[tuple[str, ...]] = ("muon", "normuon", "muon_plus", "anvil", "amuse")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {
         "muon_lr": (0.005, 0.12), "embed_lr": (3e-4, 3e-2), "head_lr": (1e-4, 1e-2), "scalar_lr": (3e-4, 3e-2),
         "adam_beta1": (0.7, 0.95), "adam_beta2": (0.9, 0.999), "weight_decay": (0.0, 0.2),
         "cautious_weight_decay": (0.0, 0.2), "anvil_slow_beta": (0.9, 0.995), "anvil_fast_weight": (0.1, 0.9),
-        "amuse_beta": (0.2, 0.8), "amuse_rho": (0.0, 1.0),
+        "amuse_beta": (0.2, 0.8), "amuse_rho": (0.0, 1.0), "adam_beta2_end": (0.9, 0.9995), "decay_timescale": (0.0, 10.0),
+        "fused_polar": (0, 1),
     }
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.plus_axis not in PLUS_AXES:
             raise ValueError(f"plus_axis must be one of {PLUS_AXES}, not {self.plus_axis!r}")
+        if self.decay_timescale != 0.0 and self.decay_timescale < 0.1:
+            raise ValueError(f"decay_timescale is 0 (off) or 0.1 to 10, not {self.decay_timescale}")
+        if self.fused_polar not in (0, 1):
+            raise ValueError(f"fused_polar is 0 or 1, not {self.fused_polar!r}")
 
 
 def amuse_beta(step: int, beta: float, rho: float) -> float:
@@ -116,6 +137,12 @@ def polar_express(G: Tensor, safety_factor: float = 0.02, epsilon: float = 1e-6)
     return X.mT if transposed else X  # (k, m, n)
 
 
+@functools.cache
+def compiled_polar_express() -> Callable[[Tensor], Tensor]:
+    """Polar Express under the compiler, one static graph per bank shape (three in the record)."""
+    return torch.compile(polar_express, dynamic=False)  # type: ignore[return-value]
+
+
 class Muon(torch.optim.Optimizer):
     """Muon with Polar Express, one batched orthogonalization per parameter shape.
 
@@ -126,7 +153,8 @@ class Muon(torch.optim.Optimizer):
 
     def __init__(self, params: Iterable[Tensor], lr: float, momentum: float, weight_decay: float,
                  normalize_rows: bool = True, cautious_weight_decay: float = 0.0, plus_axis: str | None = None,
-                 rails: tuple[float, float] | None = None, schedule_free: tuple[float, float] | None = None) -> None:
+                 rails: tuple[float, float] | None = None, schedule_free: tuple[float, float] | None = None,
+                 fused_polar: bool = False) -> None:
         # rails: ANVIL's (slow beta, fast weight); schedule_free: AMUSE's (beta, rho); None for the record's Muon.
         # params: (m, n) each, the matrices Muon updates.
         parameters = list(params)
@@ -137,6 +165,8 @@ class Muon(torch.optim.Optimizer):
         self.plus_axis = plus_axis
         self.rails = rails
         self.schedule_free = schedule_free
+        self.fused_polar = fused_polar
+        self.decay_per_step = 0.0  # the constant-timescale decay, set each step by the strategy; 0 is off
         self.steps = 0
         for group in self.param_groups:
             by_shape: dict[tuple[int, ...], list[Tensor]] = {}
@@ -163,14 +193,15 @@ class Muon(torch.optim.Optimizer):
                 if members[0].grad is None:
                     continue
                 G = torch.stack([member.grad for member in members]).float()  # (k, m, n)
+                polar = self._polar(G.device)
                 if self.schedule_free is not None:
-                    self._amuse_update(members, G, buffer, *group["amuse"][bank], lr, momentum)
+                    self._amuse_update(members, G, buffer, *group["amuse"][bank], lr, momentum, polar)
                     continue
                 if self.rails is not None:
-                    U = self._anvil_update(G, buffer, *group["anvil"][bank], momentum)  # (k, m, n)
+                    U = self._anvil_update(G, buffer, *group["anvil"][bank], momentum, polar)  # (k, m, n)
                 else:
                     buffer.lerp_(G, 1 - momentum)  # (k, m, n)
-                    U = polar_express(G.lerp(buffer, momentum)).float()  # (k, m, n), Nesterov
+                    U = polar(G.lerp(buffer, momentum)).float()  # (k, m, n), Nesterov
                 if self.normalize_rows:
                     second_moment.lerp_(U.square().mean(dim=2, keepdim=True), 1 - NORMUON_BETA)  # (k, m, 1)
                     normalized = U / (second_moment.sqrt() + 1e-8)  # (k, m, n)
@@ -181,19 +212,26 @@ class Muon(torch.optim.Optimizer):
                 scale = max(1, members[0].shape[0] / members[0].shape[1]) ** 0.5
                 if group["weight_decay"]:
                     torch._foreach_mul_(members, 1 - lr * group["weight_decay"])
-                if self.cautious_weight_decay:  # decay only where the update and the weight share a sign (record 43)
+                if self.decay_per_step:  # the constant timescale, in place of the cautious decay
+                    torch._foreach_mul_(members, 1 - self.decay_per_step)
+                elif self.cautious_weight_decay:  # decay only where the update and the weight share a sign (record 43)
                     P = torch.stack(members)  # (k, m, n)
                     torch._foreach_sub_(members, list((P * (U * P >= 0)).unbind(0)), alpha=lr * self.cautious_weight_decay)
                 torch._foreach_add_(members, list(U.to(members[0].dtype).unbind(0)), alpha=-lr * scale)
 
-    def _amuse_update(self, members: list[Tensor], G: Tensor, M: Tensor, Z: Tensor, X: Tensor, lr: float, momentum: float) -> None:
+    def _polar(self, device: torch.device) -> Callable[[Tensor], Tensor]:
+        """Polar Express, compiled when `fused_polar` is on and the banks are on CUDA."""
+        return compiled_polar_express() if self.fused_polar and device.type == "cuda" else polar_express
+
+    def _amuse_update(self, members: list[Tensor], G: Tensor, M: Tensor, Z: Tensor, X: Tensor, lr: float, momentum: float,
+                      polar: Callable[[Tensor], Tensor]) -> None:
         """AMUSE: Muon steps the base iterate, the average follows it, the weights move to their interpolation."""
         # G, M, Z, X: (k, m, n); the gradient was taken at the weights, Y.
         assert self.schedule_free is not None
         beta, rho = self.schedule_free
         M.lerp_(G, 1 - momentum)  # (k, m, n), mu M + (1 - mu) G
         scale = max(1, members[0].shape[0] / members[0].shape[1]) ** 0.5
-        Z.add_(polar_express(M).float(), alpha=-lr * scale)  # (k, m, n)
+        Z.add_(polar(M).float(), alpha=-lr * scale)  # (k, m, n)
         X.lerp_(Z, 1 / (self.steps + 1))  # (k, m, n), the uniform average of the Z iterates
         Y = torch.lerp(Z, X, amuse_beta(self.steps, beta, rho))  # (k, m, n), (1 - beta_t) Z + beta_t X
         torch._foreach_copy_(members, list(Y.to(members[0].dtype).unbind(0)))
@@ -211,7 +249,8 @@ class Muon(torch.optim.Optimizer):
         finally:
             torch._foreach_copy_(live, saved)
 
-    def _anvil_update(self, G: Tensor, fast: Tensor, slow: Tensor, lane: Tensor, momentum: float) -> Tensor:
+    def _anvil_update(self, G: Tensor, fast: Tensor, slow: Tensor, lane: Tensor, momentum: float,
+                      polar: Callable[[Tensor], Tensor]) -> Tensor:
         """ANVIL: two rails blended into the lookahead, Polar Express, then each lane equalized by its energy EMA."""
         # G, fast, slow: (k, m, n); lane: (k, m, 1) or (k, 1, n); returns (k, m, n).
         assert self.rails is not None
@@ -219,7 +258,7 @@ class Muon(torch.optim.Optimizer):
         fast.lerp_(G, 1 - ANVIL_FAST_BETA)  # (k, m, n)
         slow.lerp_(G, 1 - slow_beta)  # (k, m, n)
         blend = fast_weight * fast + (1 - fast_weight) * slow  # (k, m, n)
-        U = polar_express(G.lerp(blend, momentum)).float()  # (k, m, n)
+        U = polar(G.lerp(blend, momentum)).float()  # (k, m, n)
         lanes = 2 if lane.shape[2] == 1 else 1  # the reduction runs along the longer dimension
         lane.lerp_(U.square().mean(dim=lanes, keepdim=True), 1 - ANVIL_LANE_BETA)  # (k, m, 1) or (k, 1, n)
         equalized = U * lane.clamp(min=1e-10).rsqrt()  # (k, m, n)
@@ -258,12 +297,23 @@ class OptimizerChoice(Strategy):
                          normalize_rows=self.variant == "normuon", cautious_weight_decay=self.config.cautious_weight_decay,
                          plus_axis=self.config.plus_axis if self.variant == "muon_plus" else None,
                          rails=(self.config.anvil_slow_beta, self.config.anvil_fast_weight) if self.variant == "anvil" else None,
-                         schedule_free=(self.config.amuse_beta, self.config.amuse_rho) if self.variant == "amuse" else None)
-        return [
-            self.muon,
-            torch.optim.AdamW(adam_groups, betas=(self.config.adam_beta1, self.config.adam_beta2),
-                              weight_decay=self.config.weight_decay, fused=model.embedding.weight.is_cuda),  # type: ignore[union-attr]
-        ]
+                         schedule_free=(self.config.amuse_beta, self.config.amuse_rho) if self.variant == "amuse" else None,
+                         fused_polar=bool(self.config.fused_polar))
+        self.adam = torch.optim.AdamW(adam_groups, betas=(self.config.adam_beta1, self.config.adam_beta2),
+                                      weight_decay=self.config.weight_decay, fused=model.embedding.weight.is_cuda)  # type: ignore[union-attr]
+        return [self.muon, self.adam]
+
+    def after_backward(self, state: StepState) -> None:
+        """AdamW's beta2 along the cooldown and the banks' constant-timescale decay, before the optimizers step."""
+        config = self.config
+        if config.adam_beta2_end != config.adam_beta2:
+            share = state.model.strategies.schedule.config.cooldown_share(state.progress)  # type: ignore[union-attr]
+            beta2 = config.adam_beta2 + share * (config.adam_beta2_end - config.adam_beta2)
+            for group in self.adam.param_groups:
+                group["betas"] = (group["betas"][0], beta2)
+        if config.decay_timescale:
+            total_steps = (state.step + 1) / state.progress if state.progress > 0 else 0.0  # the run's length, estimated
+            self.muon.decay_per_step = 1 / (config.decay_timescale * total_steps) if total_steps else 0.0
 
     @property
     def schedule_free(self) -> bool:
@@ -271,6 +321,8 @@ class OptimizerChoice(Strategy):
         return self.variant == "amuse"
 
     def overrides(self, hook: str) -> bool:
+        if hook == "after_backward":
+            return self.config.adam_beta2_end != self.config.adam_beta2 or self.config.decay_timescale > 0
         return hook == "evaluation_weights" and self.schedule_free
 
     @contextlib.contextmanager

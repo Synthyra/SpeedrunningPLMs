@@ -18,6 +18,12 @@ constant inside the score function, as the slopes' rule is, never a captured par
 `score_cap` enters the same function: cap tanh(s / cap) on the scaled q.k before the distance terms, so far tokens
 keep their full penalty. At periodic_scale 0 and no cap the function is the record's.
 
+`length_bins` (`ideas/2026-10-30_protein_input_priors.md` 2; 0 is off, else 8 or 16) adds to every token's embedding a
+learned vector for its protein's log-length bin, through `embed`: the protein's non-padding tokens in the window,
+binned over log2 from 32 to 2,048 tokens. A protein the window cuts counts its visible part, which is what attention
+can reach; the evaluator's proteins are whole. The table starts at zero and is built from zeros, so step 0 and the
+record's initialization are unchanged; AdamW at the embedding rate. The idea's terminus-distance tables are left out.
+
 Symbols: b windows or proteins, l tokens, h heads, d_h per-head width, k attention heads a kernel runs.
 """
 
@@ -32,10 +38,11 @@ from typing import ClassVar
 from torch import Tensor, nn
 
 from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import Strategy, StrategyConfig, extension
+from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig, extension
 
 
 ScoreMod = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
+LENGTH_OCTAVES = (5.0, 11.0)  # the length bins span log2 of 32 to 2,048 tokens
 HELIX_FREQUENCY = 2 * math.pi / 3.6  # radians per residue: the alpha helix's 3.6 residues a turn
 STRAND_FREQUENCY = math.pi  # the beta strand's side-chain alternation, every 2 residues
 
@@ -48,15 +55,30 @@ class PositionalConfig(StrategyConfig):
     rope_fraction: float = 1.0  # share of each head's rotation pairs RoPE turns
     nope_every: int = 0  # every k-th block skips RoPE; 0 rotates every block
     periodic_scale: float = 0.0  # the helix and strand term's weight on the scores; 0 is off
+    length_bins: int = 0  # log-length bins of the protein added to its embeddings; 0 is off
     VARIANTS: ClassVar[tuple[str, ...]] = ("none", "alibi")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"rope_base": (1_000.0, 1_000_000.0), "slope_scale": (0.25, 4.0),
                                                         "rope_fraction": (0.1, 1.0), "nope_every": (0, 6),
-                                                        "periodic_scale": (0.0, 1.0)}
+                                                        "periodic_scale": (0.0, 1.0), "length_bins": (0, 16)}
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if not isinstance(self.nope_every, int):
             raise ValueError(f"nope_every must be an integer, not {self.nope_every!r}")
+        if self.length_bins not in (0, 8, 16):
+            raise ValueError(f"length_bins is 0 (off), 8 or 16, not {self.length_bins!r}")
+
+
+def length_bins(input_ids: Tensor, bins: int) -> Tensor:
+    """Each token's protein log-length bin: the protein's non-padding tokens in the window, over LENGTH_OCTAVES."""
+    # input_ids: (b, l); returns (b, l) in [0, bins).
+    b, l = input_ids.shape
+    document = (input_ids == benchmark.CLS_ID).cumsum(dim=1)  # (b, l) in [0, l]
+    real = (input_ids != benchmark.PAD_ID).float()  # (b, l)
+    counts = torch.zeros(b, l + 1, device=input_ids.device).scatter_add_(1, document, real)  # (b, l + 1)
+    tokens = counts.gather(1, document).clamp(min=1)  # (b, l)
+    low, high = LENGTH_OCTAVES
+    return ((tokens.log2() - low) * (bins / (high - low))).floor().clamp(0, bins - 1).long()  # (b, l)
 
 
 def rotated_pairs(d_h: int, fraction: float) -> int:
@@ -102,7 +124,24 @@ class Positional(Strategy):
         if self.variant == "alibi":
             holder.register_buffer("slopes", geometric_slopes(attention.slope_heads(), self.config.slope_scale),
                                    persistent=False)  # (k,), one slope per attention head the kernel runs
+        bins = self.config.length_bins
+        if bins:
+            holder.length_table = nn.Embedding(bins, benchmark.HIDDEN, _weight=torch.zeros(bins, benchmark.HIDDEN))  # (bins, d)
         model.extensions[self.family] = holder  # type: ignore[index]
+
+    def overrides(self, hook: str) -> bool:
+        return hook == "embed" and self.config.length_bins > 0
+
+    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+        if not self.config.length_bins:
+            return []
+        table = extension(model, self.family).length_table.weight  # (bins, d)
+        return [ParameterGroup("length_table", [table], "adam", model.strategies.optimizer.config.embed_lr)]  # type: ignore[union-attr]
+
+    def embed(self, model: nn.Module, input_ids: Tensor, X: Tensor) -> Tensor:
+        # input_ids: (b, l); X: (b, l, d).
+        table = extension(model, self.family).length_table  # (bins, d)
+        return X + table(length_bins(input_ids, self.config.length_bins))  # (b, l, d)
 
     def rotary(self, model: nn.Module) -> Rotary:
         return extension(model, self.family).rotary  # type: ignore[return-value]

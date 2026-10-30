@@ -22,8 +22,8 @@ from torch.nn.attention.flex_attention import BlockMask
 
 
 HOOKS = ("embed", "block_input", "normalized_input", "keys", "queries", "values", "attention_output", "mlp_hidden",
-         "sublayer_output", "updated_stream", "head_input", "logits", "auxiliary_loss", "after_backward", "after_step",
-         "evaluation_weights")
+         "sublayer_output", "updated_stream", "head_input", "logits", "auxiliary_loss", "training_loss", "after_backward",
+         "after_step", "evaluation_weights")
 
 
 @dataclass(frozen=True)
@@ -169,6 +169,12 @@ class Strategy:
         the forward's context (what the hooks stored)."""
         # states: (b, l, d) each, 37 of them; labels: (b, l); returns ().
         raise NotImplementedError
+
+    def training_loss(self, logits: Tensor, labels: Tensor, loss: Tensor) -> Tensor:
+        """The summed objective the step differentiates, from the record's summed masked cross entropy `loss`; called
+        outside the compiled model on both training paths. The logged loss stays the record's."""
+        # logits: (b, l, v); labels: (b, l) with IGNORE_LABEL where unscored; loss: (); returns ().
+        return loss  # ()
 
     # Training callbacks.
     def after_backward(self, state: StepState) -> None:

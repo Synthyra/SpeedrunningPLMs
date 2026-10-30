@@ -15,9 +15,11 @@
   so every depth gets a direct signal early. This is Boost's per-block shared readout trained by backprop, not its
   orthogonal-nudge estimator: the estimator's 36-block cost is unmeasured and its one comparison trails backprop.
 - `readout_boost` (`backprop_free.md` 3.2 and 3.7): Boost's readout sites, read by backprop. The shared head reads the
-  stream right after every attention update and every MLP update (Boost's xmid and xout, 72 readouts, captured by the
-  `updated_stream` hook in a training forward), and their mean masked loss, times `readout_weight`, joins the training
-  loss for the first `switch` share of the clock (Boost's phase switch, 0.3), then stops. The weight lives in a 0-d
+  stream right after the attention update and the MLP update (Boost's xmid and xout, captured by the `updated_stream`
+  hook in a training forward) of every `stride`-th block before the last (blocks 5, 11, 17, 23, 29 at stride 6: 10
+  readouts), and their mean masked loss, times `readout_weight`, joins the training loss for the first `switch` share of
+  the clock (Boost's phase switch, 0.3), then stops. Readouts at all 72 sites compiled in 419.8 s against the 180 s
+  cap (pilot5_03), so the sites follow the warm start's stride. The weight lives in a 0-d
   buffer that `after_step` refills from the clock's progress, so the compiled graph never sees a changing Python float.
 - `unit_route` (`backprop_free.md` 3.4 and 3.8): Cut's routes as a gradient mask. In each forward, each token's
   `route_k` units per block with the largest relu^2(pre-activation) times the norm of the unit's down-projection
@@ -143,9 +145,13 @@ class BackpropFree(Strategy):
     # Boost readouts.
     def updated_stream(self, index: int, sublayer: str, X: Tensor, context: ForwardContext) -> Tensor:
         # X: (b, l, d); kept for the readouts in a training forward only, so evaluation holds no extra streams.
-        if context.labels is not None:
+        if context.labels is not None and index in self._boost_blocks():
             context.stored[f"readout_{index}_{sublayer}"] = X
         return X  # (b, l, d)
+
+    def _boost_blocks(self) -> range:
+        """The blocks Boost's readouts read: every `stride`-th, the last one left to the training loss itself."""
+        return range(self.config.stride - 1, benchmark.BLOCKS - 1, self.config.stride)
 
     def _rank_units(self, model: nn.Module) -> None:
         masks = self.holder.masks  # (36, f)
@@ -170,7 +176,7 @@ class BackpropFree(Strategy):
     def auxiliary_loss(self, model: nn.Module, states: list[Tensor], labels: Tensor, context: ForwardContext) -> Tensor:
         # states: (b, l, d) each, 37 of them; labels: (b, l); returns (), the readouts' summed loss averaged over readouts.
         if self.variant == "readout_boost":
-            streams = [context.stored[f"readout_{index}_{sublayer}"] for index in range(benchmark.BLOCKS) for sublayer in SUBLAYERS]
+            streams = [context.stored[f"readout_{index}_{sublayer}"] for index in self._boost_blocks() for sublayer in SUBLAYERS]
         else:
             streams = [states[index] for index in range(self.config.stride, benchmark.BLOCKS, self.config.stride)]
         total = sum(benchmark.masked_cross_entropy(model.logits(X), labels) for X in streams)  # ()

@@ -17,6 +17,11 @@ weights stay live for training.
   scores both on val_select (the loop's `evaluation_options`), and the lower one is the pass's point and what selection
   keeps, so the choice reads validation only, never test; the final selected weights are whichever average scored
   lowest at the best pass. A pass costs two evaluations.
+- `plateau_restart` (EWA, arXiv 2306.03241, and PMA, arXiv 2505.12082; `2026-10-30_regularization_and_averaging.md`
+  idea 3): the `latest_k` ring of LAWA_SNAPSHOTS snapshots over the last `window` steps, and once, at the first step at
+  or after `start` of the clock (0.6, the record's cooldown start), the live weights are replaced by the ring's
+  uniform mean and training continues from there; the optimizers' moments carry on. Validation scores the live
+  weights throughout. EWA's own protocol (Section 3) was not read.
 
 The rings empty at the first applied step, so the compile warmup's steps never enter them.
 """
@@ -46,7 +51,7 @@ class EmaConfig(StrategyConfig):
     window: int = 400  # latest_k and drift_leap: steps the snapshots span
     leap: float = 0.2  # drift_leap: the move back toward the earlier weights
     decay_fast: float = 0.95  # two_decay: the second, shorter average
-    VARIANTS: ClassVar[tuple[str, ...]] = ("none", "tail", "latest_k", "drift_leap", "two_decay")
+    VARIANTS: ClassVar[tuple[str, ...]] = ("none", "tail", "latest_k", "drift_leap", "two_decay", "plateau_restart")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"start": (0.3, 0.95), "decay": (0.9, 0.999), "window": (100, 1000),
                                                         "leap": (0.05, 0.5), "decay_fast": (0.9, 0.99)}
 
@@ -65,16 +70,25 @@ class Ema(Strategy):
         super().__init__(config)
         self.averaged: list[Tensor] | None = None  # tail and two_decay: one tensor per parameter, from `start` on
         self.averaged_fast: list[Tensor] | None = None  # two_decay: the shorter average
-        self.snapshots: list[list[Tensor]] = []  # latest_k and drift_leap: the ring, oldest first
+        self.snapshots: list[list[Tensor]] = []  # latest_k, drift_leap and plateau_restart: the ring, oldest first
+        self.restarted = False  # plateau_restart: the weights were replaced by the plateau mean
 
     @property
     def evaluation_options(self) -> int:
         return 2 if self.variant == "two_decay" and self.averaged is not None else 1
 
+    def overrides(self, hook: str) -> bool:
+        if self.variant == "plateau_restart":
+            return hook == "after_step"  # validation scores the live weights
+        return super().overrides(hook)
+
     def after_step(self, state: StepState) -> None:
         live = [parameter.detach() for parameter in state.model.parameters()]
         if self.variant in ("latest_k", "drift_leap"):
             self._record_snapshot(live, state.step, LAWA_SNAPSHOTS if self.variant == "latest_k" else DRIFT_SNAPSHOTS)
+            return
+        if self.variant == "plateau_restart":
+            self._plateau_restart(live, state)
             return
         if state.progress < self.config.start:
             return
@@ -99,6 +113,27 @@ class Ema(Strategy):
         else:
             self.snapshots.append([parameter.clone() for parameter in live])
 
+    def _plateau_restart(self, live: list[Tensor], state: StepState) -> None:
+        """Snapshots until `start`, then the live weights become their mean, once."""
+        if state.step == 0:
+            self.restarted = False
+        if self.restarted:
+            return
+        if state.progress >= self.config.start and self.snapshots:
+            torch._foreach_copy_(live, self._mean())
+            self.snapshots.clear()  # the ring's memory goes back
+            self.restarted = True
+            return
+        self._record_snapshot(live, state.step, LAWA_SNAPSHOTS)
+
+    def _mean(self) -> list[Tensor]:
+        """The uniform mean of the ring's snapshots."""
+        mean = [parameter.clone() for parameter in self.snapshots[0]]
+        for snapshot in self.snapshots[1:]:
+            torch._foreach_add_(mean, snapshot)
+        torch._foreach_div_(mean, len(self.snapshots))
+        return mean
+
     def _scored(self, live: list[Tensor]) -> list[Tensor] | None:
         """The weights a validation pass scores, or None to score the live weights."""
         if self.variant == "tail":
@@ -112,11 +147,7 @@ class Ema(Strategy):
             leaped = [parameter.clone() for parameter in live]
             torch._foreach_lerp_(leaped, earlier, self.config.leap)  # w + leap (w_earlier - w)
             return leaped
-        mean = [parameter.clone() for parameter in self.snapshots[0]]
-        for snapshot in self.snapshots[1:]:
-            torch._foreach_add_(mean, snapshot)
-        torch._foreach_div_(mean, len(self.snapshots))
-        return mean
+        return self._mean()
 
     @contextlib.contextmanager
     def evaluation_weights(self, model: nn.Module) -> Iterator[None]:

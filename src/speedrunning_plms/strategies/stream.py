@@ -9,6 +9,14 @@
   only. Block i reads sum_j w_ij(X_i) X_j over the embedding and the `span` latest states, with w = a static row plus,
   when `dynamic`, a per-token term GELU(norm(X_i) W1_i) W2_i whose W2 starts at zero. The static row starts one-hot on
   the latest state, so the network starts as the record's. A last row reads the final state for the head.
+- `attention_residual`: Attention Residuals, the block form (arXiv 2603.15031; `ideas/2026-10-30_long_protein_attention.md`
+  idea 6). The values are the embedding and every earlier block's update (its output minus its input). Block i reads
+  n softmax(w_i) . values over its n = i + 1 values, with w_i a learned row of static logits per block (a last row for
+  the head), in fp32. The logits start at zero, so every weight is n x 1/n, exactly 1 in fp32 for n up to 37: the
+  plain residual sum, and step 0 is the record's forward (the updates are zero there), while the weights can then move
+  off the plain sum. The fixed factor n keeps the stream's scale where the record's is; a plain softmax would start
+  at the mean, not the sum. The updates are held in bf16 for the weighted sums' backward: 36 of (b, l, 768), 3.6 GB at
+  65,536 tokens a step; the embedding stays fp32.
 
 Symbols: b windows or proteins, l tokens, d = 768, n streams, k states a dense block reads.
 """
@@ -35,7 +43,7 @@ class StreamConfig(StrategyConfig):
     streams: int = 2  # hyper: n
     span: int = 8  # dense: the latest states each block reads, beside the embedding
     dynamic: int = 1  # dense: 1 adds MUDD's per-token weights to the static ones
-    VARIANTS: ClassVar[tuple[str, ...]] = ("single", "hyper", "dense")
+    VARIANTS: ClassVar[tuple[str, ...]] = ("single", "hyper", "dense", "attention_residual")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"streams": (2, 4), "span": (1, 36), "dynamic": (0, 1)}
 
 
@@ -70,6 +78,11 @@ class StreamMixer(Strategy):
             model.extensions[self.family] = holder  # type: ignore[index]
             self.holder = holder
             self.span = k
+        elif self.variant == "attention_residual":
+            holder = nn.Module()
+            holder.logits = nn.Parameter(torch.zeros(blocks + 1, blocks + 1))  # (37, 37): row i reads its first i + 1
+            model.extensions[self.family] = holder  # type: ignore[index]
+            self.holder = holder
 
     def initialize(self, model: nn.Module) -> None:
         if self.variant == "dense" and self.config.dynamic:
@@ -86,6 +99,8 @@ class StreamMixer(Strategy):
         # X: (b, l, d), the embedding.
         if self.variant == "hyper":
             return (X,) * int(self.config.streams)  # n of (b, l, d)
+        if self.variant == "attention_residual":
+            return (X, X)  # the values so far, then the latest block output, each (b, l, d)
         return (X,)  # one (b, l, d), or the dense history so far
 
     def read(self, stream: Stream, index: int) -> Tensor:
@@ -95,6 +110,8 @@ class StreamMixer(Strategy):
         if self.variant == "hyper":
             weights = self.holder.read[index]  # (n,)
             return sum(weights[s].to(H.dtype) * H for s, H in enumerate(stream))  # (b, l, d)
+        if self.variant == "attention_residual":
+            return self._attention_residual(stream[:-1], index)  # (b, l, d)
         return self._dense(stream, index)  # (b, l, d)
 
     def write(self, stream: Stream, index: int, X_in: Tensor, X_out: Tensor) -> Stream:
@@ -103,6 +120,8 @@ class StreamMixer(Strategy):
             return (X_out,)
         if self.variant == "dense":
             return (*stream, X_out)  # 2 + index of (b, l, d)
+        if self.variant == "attention_residual":
+            return (*stream[:-1], (X_out - X_in).to(torch.bfloat16), X_out)  # 2 + index values, then the output
         delta = X_out - X_in  # (b, l, d)
         mix, write = self.holder.mix[index], self.holder.write[index]  # (n, n), (n,)
         return tuple(sum(mix[s, t].to(H.dtype) * H for t, H in enumerate(stream)) + write[s].to(delta.dtype) * delta
@@ -112,6 +131,8 @@ class StreamMixer(Strategy):
         # Returns the state the head reads, (b, l, d).
         if self.variant == "dense":
             return self._dense(stream, benchmark.BLOCKS)  # (b, l, d)
+        if self.variant == "attention_residual":
+            return self._attention_residual(stream[:-1], benchmark.BLOCKS)  # (b, l, d)
         return self.view(stream)  # (b, l, d)
 
     def view(self, stream: Stream) -> Tensor:
@@ -119,6 +140,15 @@ class StreamMixer(Strategy):
         if self.variant == "hyper":
             return sum(stream) / len(stream)  # (b, l, d)
         return stream[-1]  # (b, l, d)
+
+    def _attention_residual(self, values: Stream, row: int) -> Tensor:
+        """n softmax(w_row) over the n values: the plain sum while the logits are equal."""
+        # values: the embedding (b, l, d) in fp32, then each earlier block's update (b, l, d) in bf16; returns (b, l, d).
+        if len(values) == 1:
+            return values[0]  # (b, l, d), the embedding
+        n = len(values)
+        weights = n * torch.softmax(self.holder.logits[row, :n].float(), dim=0)  # (n,), fp32
+        return sum(weights[j] * V.float() for j, V in enumerate(values))  # (b, l, d)
 
     def _dense(self, history: Stream, row: int) -> Tensor:
         # history: the embedding and every block output so far, each (b, l, d); returns (b, l, d).

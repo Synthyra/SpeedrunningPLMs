@@ -6,6 +6,10 @@
 `one_sqrt`: the same with the 1-sqrt cooldown (Hagele et al. 2024, arXiv 2405.18392): over the cooldown the multiplier
 falls as 1 - sqrt(share of the cooldown spent), to `final_lr_ratio`. A schedule-free optimizer (`optimizer.amuse`)
 turns the cooldown off: the loop asks for the multiplier without it, so the plateau runs to the end.
+
+Muon's momentum ends its warmup at `momentum` (0.95 in the record; the short-run file's `momentum_end`, Kosson et al.
+2024, arXiv 2410.23922, holds 0.98 there) and moves linearly to `momentum_cooldown_end` over the cooldown, so a high
+plateau can taper back before the end; at the record's 0.95 for both, nothing changes.
 """
 
 from __future__ import annotations
@@ -25,11 +29,17 @@ class ScheduleConfig(StrategyConfig):
     momentum: float = 0.95
     momentum_start: float = 0.85
     momentum_warmup: float = 0.15  # share of the budget
+    momentum_cooldown_end: float = 0.95  # Muon's momentum at the end of the cooldown
     VARIANTS: ClassVar[tuple[str, ...]] = ("trapezoid", "one_sqrt")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {
         "warmup_fraction": (0.0, 0.1), "cooldown_fraction": (0.1, 0.8), "final_lr_ratio": (0.0, 0.3),
-        "momentum": (0.85, 0.98), "momentum_start": (0.7, 0.98), "momentum_warmup": (0.01, 0.4),
+        "momentum": (0.85, 0.99), "momentum_start": (0.7, 0.98), "momentum_warmup": (0.01, 0.4),
+        "momentum_cooldown_end": (0.85, 0.995),
     }
+
+    def cooldown_share(self, progress: float) -> float:
+        """The share of the cooldown spent at this share of the clock: 0 before it, 1 at the end."""
+        return min(1.0, max(0.0, (progress - (1 - self.cooldown_fraction)) / self.cooldown_fraction))
 
 
 class Schedule(Strategy):
@@ -50,7 +60,9 @@ class Schedule(Strategy):
         return 1.0
 
     def momentum(self, progress: float) -> float:
-        """Muon's momentum, rising from the start value over the momentum warmup."""
+        """Muon's momentum, rising from the start value over the momentum warmup, then to the cooldown's end value."""
         config = self.config
+        if config.momentum_cooldown_end != config.momentum and progress > 1 - config.cooldown_fraction:
+            return config.momentum + config.cooldown_share(progress) * (config.momentum_cooldown_end - config.momentum)
         phase = min(1.0, progress / config.momentum_warmup)
         return config.momentum_start + phase * (config.momentum - config.momentum_start)

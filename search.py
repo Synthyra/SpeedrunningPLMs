@@ -85,9 +85,11 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("positional.nope_every", low=0, high=6, integer=True),
     # Numbers whose 0 is off, as choices with 0 first, so a draw can leave them off.
     Dimension("positional.periodic_scale", (0.0, 0.25, 0.5, 1.0)),
+    Dimension("positional.length_bins", (0, 8, 16)),
+    Dimension("attention.local_every", (0, 2, 3)),
     Dimension("attention.key_offset", (0.0, 0.125, 0.25, 0.5)),
     Dimension("attention.score_cap", (0.0, 4.0, 5.0, 6.0, 8.0)),
-    Dimension("kernel.variant", ("default", "flash")),
+    Dimension("kernel.variant", ("default", "flash", "cudagraphs")),
     Dimension("head.variant", ("linear", "two_layer")),
     Dimension("logit_scale.variant", ("none", "ssmax")),
     Dimension("logit_scale.initial_scale", low=0.5, high=2.0, log=True),
@@ -100,12 +102,14 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("latent.variant", ("none", "next_layer", "neighbors")),
     Dimension("latent.source_block", low=6, high=30, integer=True),
     Dimension("latent.weight", low=0.01, high=0.5, log=True),
-    Dimension("stream.variant", ("single", "hyper", "dense")),
+    Dimension("stream.variant", ("single", "hyper", "dense", "attention_residual")),
     Dimension("stream.streams", low=2, high=4, integer=True),
     Dimension("unet.variant", ("none", "mirrored")),
     Dimension("embedding_mix.variant", ("none", "every_block")),
     Dimension("embedding_mix.initial_share", low=0.0, high=0.3),
-    Dimension("neighbor.variant", ("none", "pair_table")),
+    Dimension("neighbor.variant", ("none", "pair_table", "bigram_table", "trigram_table")),
+    Dimension("loss.variant", ("plain", "entropy_weighted")),
+    Dimension("loss.z_weight", (0.0, 1e-4, 1e-3, 1e-2)),
     Dimension("value_embeddings.variant", ("none", "ends")),
     Dimension("value_embeddings.blocks_each_end", low=1, high=6, integer=True),
     Dimension("value_residual.variant", ("none", "first_block")),
@@ -126,17 +130,25 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("optimizer.head_lr", low=3e-4, high=3e-3, log=True),
     Dimension("optimizer.scalar_lr", low=1e-3, high=1e-2, log=True),
     Dimension("optimizer.cautious_weight_decay", low=0.0, high=0.1),
+    Dimension("optimizer.adam_beta2_end", low=0.95, high=0.9995),
+    Dimension("optimizer.decay_timescale", (0.0, 0.1, 0.3, 1.0, 3.0, 10.0)),  # in total runs, log-spaced
+    Dimension("optimizer.fused_polar", (0, 1)),
     Dimension("schedule.variant", ("trapezoid", "one_sqrt")),
     Dimension("schedule.warmup_fraction", low=0.0, high=0.05),
     Dimension("schedule.cooldown_fraction", low=0.25, high=0.65),
     Dimension("schedule.momentum_start", low=0.85, high=0.95),
+    Dimension("schedule.momentum", low=0.95, high=0.99),  # the momentum at the end of its warmup ramp
+    Dimension("schedule.momentum_cooldown_end", low=0.95, high=0.995),
     Dimension("batch.variant", ("packed", "whole")),
     Dimension("batch.window", (1024, 2048)),  # the count follows (`batch.windows_per_step` 0): 65,536 tokens a step
+    Dimension("regularization.variant", ("none", "early_dropout")),
+    Dimension("regularization.rate", low=0.05, high=0.2, log=True),
+    Dimension("regularization.until", low=0.05, high=0.3, log=True),
     Dimension("curriculum.variant", ("none", "short_first", "family_tempered", "length_tempered")),
     Dimension("curriculum.fraction", low=0.2, high=0.6),
     Dimension("curriculum.alpha", low=0.0, high=1.0),
     Dimension("curriculum.beta", low=-0.5, high=0.5),
-    Dimension("ema.variant", ("none", "tail", "latest_k", "drift_leap", "two_decay")),
+    Dimension("ema.variant", ("none", "tail", "latest_k", "drift_leap", "two_decay", "plateau_restart")),
     Dimension("ema.start", low=0.4, high=0.9),
     Dimension("ema.decay", low=0.98, high=0.998),
     Dimension("ema.window", low=100, high=1000, log=True, integer=True),
@@ -212,6 +224,23 @@ SWITCHES: dict[str, dict[str, dict[str, Any]]] = {
     "drift_leap": {"ema": {"variant": "drift_leap"}},
     "two_decay": {"ema": {"variant": "two_decay"}},
     "flash": {"kernel": {"variant": "flash"}},
+    # Round 4: the cooldown's Muon momentum and AdamW beta2, the constant-timescale decay, the selective losses, the
+    # context tables, the compiled Polar Express.
+    "momentum_0.98": {"schedule": {"momentum_cooldown_end": 0.98}},
+    "beta2_0.999": {"optimizer": {"adam_beta2_end": 0.999}},
+    "decay_timescale": {"optimizer": {"decay_timescale": 1.0}},
+    "entropy_weighted": {"loss": {"variant": "entropy_weighted"}},
+    "z_loss": {"loss": {"z_weight": 1e-3}},
+    "bigram_table": {"neighbor": {"variant": "bigram_table"}},
+    "trigram_table": {"neighbor": {"variant": "trigram_table"}},
+    "fused_polar": {"optimizer": {"fused_polar": 1}},
+    # Round 5: Attention Residuals, local blocks, CUDA graphs, the plateau restart, early dropout, the length table.
+    "attention_residual": {"stream": {"variant": "attention_residual"}},
+    "local_3": {"attention": {"local_every": 3}},
+    "cudagraphs": {"kernel": {"variant": "cudagraphs"}},
+    "plateau_restart": {"ema": {"variant": "plateau_restart"}},
+    "early_dropout": {"regularization": {"variant": "early_dropout"}},
+    "length_bins": {"positional": {"length_bins": 16}},
 }
 BACKPROP_FREE_SWITCHES = ("residual_es", "readout_warmstart", "unit_select", "readout_boost", "unit_route")
 
@@ -245,12 +274,14 @@ COMPILE_SECONDS: dict[str, float] = {
     "logit_scale.variant=ssmax": 10.0,  # pilot4_02: 132 s
     "residual.variant=perinorm": 16.0,  # pilot4_03: 138 s
     "residual.variant=ln_scaling": 10.0,
-    "activation.variant=xielu": 10.0,
-    "latent.variant=next_layer": 20.0,
+    "activation.variant=xielu": 19.0,  # pilot4_04: 140.6 s
+    "latent.variant=next_layer": 1.0,  # pilot4_06: 123.3 s
     "gates.variant=head_sigmoid": 25.0,
     "residual.branch_multiplier!=1.0": 10.0,  # `!=`: any value but the record's adds the hook
     "residual.branch_ramp!=0.0": 10.0,
-    "backprop_free.variant=readout_boost": 30.0,  # 72 head readouts in the graph; the warm start's few cost 7 s
+    # pilot5_03: all 72 readouts compiled in 419.8 s (300 s over the record); now 10 readouts, at every sixth block, the
+    # warm start's 5 cost 7 s and the 72 about 4 s each, so 40 s until a pilot measures the 10.
+    "backprop_free.variant=readout_boost": 40.0,
     "backprop_free.variant=unit_route": 25.0,  # a top-k and a scatter in every block
     "latent.variant=neighbors": 10.0,
     "head.variant=two_layer": 10.0,
@@ -258,6 +289,19 @@ COMPILE_SECONDS: dict[str, float] = {
     "attention.score_cap!=0.0": 10.0,  # a tanh inside the flex score function
     "positional.periodic_scale!=0.0": 10.0,  # two cosines inside the flex score function
     "kernel.variant=flash": 30.0,  # the CuTe kernels' JIT; no published compile time, the pilot measures it
+    "neighbor.variant=bigram_table": 10.0,  # a gather, a sigmoid and an add after the last block
+    "neighbor.variant=trigram_table": 10.0,
+    "optimizer.fused_polar=1": 20.0,  # Polar Express compiled at the three bank shapes, outside the model's graph
+    # Round 5. Attention Residuals: 666 weighted terms over the 37 values, elementwise and fused, in forward and backward.
+    "stream.variant=attention_residual": 25.0,
+    # The local blocks' second flex kernel pair (a mask rule traced into the kernel) and the local mask's build; the
+    # catalog's second-mask cost is 20 to 50 s, the triangle's two masks with its other changes 46 s.
+    "attention.local_every!=0": 30.0,
+    "kernel.variant=cudagraphs": 10.0,  # graph-tree recording of the forward, backward and no-grad forward a shape
+    "regularization.variant=early_dropout": 10.0,  # a draw, a compare and a scale on each sublayer output
+    "positional.length_bins!=0": 5.0,  # a scatter, a gather and a table add once, at the embedding
+    # No entry, since they run eagerly outside any compiled graph: the loss family (`training_loss`), the cooldown's
+    # momentum and beta2 (floats on the param groups), and the constant-timescale decay (a foreach multiply).
 }
 # A number that matters only under some of its family's variants; the rest follow `dimension_active`'s rule.
 NUMBER_VARIANTS: dict[str, tuple[str, ...]] = {
@@ -270,14 +314,15 @@ NUMBER_VARIANTS: dict[str, tuple[str, ...]] = {
     "residual.branch_ramp": ("prenorm", "ln_scaling"),
     "residual.branch_start": ("prenorm", "ln_scaling"),
     "latent.source_block": ("next_layer",),
+    "stream.streams": ("hyper",),
     "optimizer.cautious_weight_decay": ("muon", "normuon", "muon_plus", "anvil"),  # amuse takes no decay
     "optimizer.anvil_slow_beta": ("anvil",),
     "optimizer.anvil_fast_weight": ("anvil",),
     "optimizer.amuse_beta": ("amuse",),
     "optimizer.amuse_rho": ("amuse",),
-    "ema.start": ("tail", "two_decay"),
+    "ema.start": ("tail", "two_decay", "plateau_restart"),
     "ema.decay": ("tail", "two_decay"),
-    "ema.window": ("latest_k", "drift_leap"),
+    "ema.window": ("latest_k", "drift_leap", "plateau_restart"),
     "ema.leap": ("drift_leap",),
     "ema.decay_fast": ("two_decay",),
     "backprop_free.readout_weight": ("readout_boost",),
@@ -672,6 +717,9 @@ class GeneticProposer:
             child, from_second = crossover(first.genome, second.genome, rng)
             child, mutated = mutate(child, self.space, rng, rate=1.5 / len(self.space))
             child = within(child, self.space)
+            repaired = not fits_warmup(child)  # parents over the cap breed children over it; repair as the Bayes pool does
+            if repaired:
+                child = warmup_repaired(child, rng)
             digest = genome_sha256(child)
             if digest in seen or not fits_warmup(child):
                 continue
@@ -680,7 +728,7 @@ class GeneticProposer:
             proposals.append(Proposal(child, [first.name, second.name],
                                       f"child of {first.name} ({first.value:.4f}) and {second.name} ({second.value:.4f}); "
                                       f"families from {second.name}: {', '.join(from_second) or 'none'}; mutated {', '.join(mutated)}; "
-                                      f"changes {json.dumps(changes, sort_keys=True)}"))
+                                      f"{'repaired to the warmup cap; ' if repaired else ''}changes {json.dumps(changes, sort_keys=True)}"))
         if len(proposals) < count:
             raise RuntimeError(f"{len(proposals)} new children within the warmup cap after {1000 * count} tries; widen the space")
         return proposals

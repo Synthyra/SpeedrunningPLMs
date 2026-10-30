@@ -202,8 +202,9 @@ def windows(steps: Iterator[np.ndarray], step_tokens: int, window_of_step: Calla
 
 
 def train_step(model: nn.Module, corrupted: Tensor, labels: Tensor, block_masks: tuple[BlockMask, ...] | None,
-               dense_mask: Tensor | None, device: torch.device, auxiliary: bool) -> tuple[Tensor, Tensor]:
-    """One forward and backward; returns the summed masked loss (without auxiliary terms) and the masked count."""
+               dense_mask: Tensor | None, device: torch.device, auxiliary: bool, loss_hooks: list[Strategy]) -> tuple[Tensor, Tensor]:
+    """One forward and backward; returns the summed masked loss (without auxiliary terms or the loss hooks' changes)
+    and the masked count. The loss hooks turn that loss into the objective the backward differentiates."""
     # corrupted, labels: (b, l); dense_mask: (b, 1, l, l) or None.
     extra: Tensor | None = None
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -216,7 +217,10 @@ def train_step(model: nn.Module, corrupted: Tensor, labels: Tensor, block_masks:
             logits = _dense_forward(model, corrupted, dense_mask)  # (b, l, v)
     count = (labels != benchmark.IGNORE_LABEL).sum()  # ()
     loss = benchmark.masked_cross_entropy(logits, labels)  # ()
-    total = loss if extra is None else loss + extra  # ()
+    objective = loss  # ()
+    for hook in loss_hooks:
+        objective = hook.training_loss(logits, labels, objective)  # ()
+    total = objective if extra is None else objective + extra  # ()
     (total / count.clamp(min=1)).backward()
     return loss.detach(), count  # (), ()
 
@@ -315,11 +319,14 @@ def main() -> None:
 
     model = Candidate(strategies, max_tokens).to(device)
     architecture = benchmark.check_architecture(model)
-    compiled = model if arguments.no_compile or device.type == "cpu" else torch.compile(model, **curriculum.compile_options())
+    compile_options = {**curriculum.compile_options(), **strategies.kernel.compile_options()}
+    compiled = model if arguments.no_compile or device.type == "cpu" else torch.compile(model, **compile_options)
+    mark_steps = compiled is not model and strategies.kernel.marks_steps  # CUDA graph trees need each step's start
     use_flex = device.type == "cuda"
     clock = benchmark.Clock(device, budget=arguments.budget)
     generator = torch.Generator(device=device).manual_seed(arguments.seed)
     auxiliary = bool(strategies.hooked("auxiliary_loss"))
+    loss_hooks = strategies.hooked("training_loss")
     backward_hooks, step_hooks = strategies.hooked("after_backward"), strategies.hooked("after_step")
     evaluation_hooks = strategies.hooked("evaluation_weights")
 
@@ -362,7 +369,9 @@ def main() -> None:
                 synthetic[:, 0] = benchmark.CLS_ID
                 corrupted, labels = benchmark.corrupt(synthetic, generator)
                 block_masks, dense_mask = masks_of(corrupted)
-                train_step(compiled, corrupted, labels, block_masks, dense_mask, device, auxiliary)
+                if mark_steps:
+                    torch.compiler.cudagraph_mark_step_begin()
+                train_step(compiled, corrupted, labels, block_masks, dense_mask, device, auxiliary, loss_hooks)
                 state = step_state(warmup_step, 0.0, 1.0, corrupted, labels, block_masks, dense_mask)
                 for hook in backward_hooks:
                     hook.after_backward(state)
@@ -431,7 +440,9 @@ def main() -> None:
         input_ids = window_batch.to(device, non_blocking=True).long()  # (b, l)
         corrupted, labels = benchmark.corrupt(input_ids, generator)  # each (b, l)
         block_masks, dense_mask = masks_of(corrupted)
-        loss, count = train_step(compiled, corrupted, labels, block_masks, dense_mask, device, auxiliary)
+        if mark_steps:
+            torch.compiler.cudagraph_mark_step_begin()
+        loss, count = train_step(compiled, corrupted, labels, block_masks, dense_mask, device, auxiliary, loss_hooks)
         if clock.expired():
             model.zero_grad(set_to_none=True)
             break

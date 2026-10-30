@@ -38,9 +38,10 @@ proposers run between your interventions. Everything outside the modules is fixe
 Every choice the search makes lives in a family under `src/speedrunning_plms/strategies/`, one module each: a frozen
 config dataclass (`variant` plus numbers, each defaulting to the record) and a strategy class that may add modules at
 construction, initialize them, claim optimizer parameter groups, transform tensors at the forward's hook points
-(`embed`, `block_input`, `normalized_input`, `queries`, `values`, `attention_output`, `mlp_hidden`, `sublayer_output`,
-`updated_stream`, `logits`, `auxiliary_loss`)
-and act through callbacks (`after_backward`, `after_step`, `evaluation_weights`). A genome is a JSON document,
+(`embed`, `block_input`, `normalized_input`, `keys`, `queries`, `values`, `attention_output`, `mlp_hidden`,
+`sublayer_output`, `updated_stream`, `head_input`, `logits`, `auxiliary_loss`), reweight the summed training loss
+outside the compiled model (`training_loss`), and act through callbacks (`after_backward`, `after_step`,
+`evaluation_weights`). A genome is a JSON document,
 `{"families": {"attention": {"variant": "triangle"}, "optimizer": {"muon_lr": 0.05}}}`; what it leaves out takes the
 default, so `python train.py` with no `--genome` is 022, bit for bit on a CPU smoke; the record's genome is in
 `genomes/`. The families, their variants and the evidence for each are the catalog in `ideas/README.md`.
@@ -63,8 +64,9 @@ Three proposers behind one interface, and one state file beside the campaign led
   over families (a family's variant keeps its own numbers) and mutation of variants and numbers.
 - **The warmup cap.** A new graph compiles from scratch, the record's in 106 s against the 180 s cap. Each variant's
   extra seconds, measured alone, are `search.COMPILE_SECONDS`; every proposer skips a genome whose sum comes within
-  15 s of the cap, the Bayes pool first puts a draw's costly choices back at the record's until it fits (few uniform
-  draws do), and the screening refuses a design with such a row.
+  15 s of the cap, the Bayes pool and the genetic children first put a genome's costly choices back at the record's until
+  it fits (few uniform draws do; a repaired child says so in its reason), and the screening refuses a design with such
+  a row.
 - **Successive halving.** An adaptive batch runs at 180 s first (`--budget 180 --final-splits val_select`: the whole
   schedule compressed to the shorter clock, a complete valid run under its own comparison key), and only the top half
   by `val_select` runs the full 600 s. Both rungs are recorded.
