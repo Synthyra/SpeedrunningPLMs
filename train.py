@@ -235,14 +235,16 @@ def _dense_forward(model: nn.Module, corrupted: Tensor, dense_mask: Tensor) -> T
     return candidate.head(candidate.head_features(final))  # (b, l, v)
 
 
-def eval_interval(eval_seconds: float, budget: float) -> float:
+def eval_interval(eval_seconds: float, budget: float, interval: float = EVAL_INTERVAL_SECONDS,
+                  eval_cap: float = benchmark.EVAL_CAP_SECONDS) -> float:
     """The spacing of in-run evals after the first: the record's 90 s, or wider when one eval costs more, so the evals
     left and the final one stay inside EVAL_TARGET_SECONDS. A record eval costs about 4 s and keeps 90 s; a Dual
     Triangle eval cost 12 s in its pilot, and seven of them would break the 60 s cap."""
-    left = math.floor((EVAL_TARGET_SECONDS - 2 * eval_seconds) / eval_seconds)  # after the first and before the final
+    target = eval_cap * EVAL_TARGET_SECONDS / benchmark.EVAL_CAP_SECONDS  # the same share of a track's cap
+    left = math.floor((target - 2 * eval_seconds) / eval_seconds)  # after the first and before the final
     if left < 0:
         return math.inf
-    return max(EVAL_INTERVAL_SECONDS, (budget - EVAL_INTERVAL_SECONDS) / (left + 1))
+    return max(interval, (budget - interval) / (left + 1))
 
 
 def candidate_digest(genome: Genome) -> tuple[str, dict[str, str]]:
@@ -271,6 +273,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--hypothesis", default="", help="one sentence: what this candidate changes and why it should help")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--budget", type=float, default=benchmark.BUDGET_SECONDS, help="training seconds on the clock")
+    parser.add_argument("--eval-cap", type=float, default=benchmark.EVAL_CAP_SECONDS, help="the in-run evals' cap, seconds")
+    parser.add_argument("--eval-interval", type=float, default=EVAL_INTERVAL_SECONDS, help="clock seconds between in-run evals")
+    parser.add_argument("--experiment-group", default=EXPERIMENT_GROUP, help="the track's experiment id and W&B group")
     parser.add_argument("--max-steps", type=int, default=None, help="a smoke run: stop after this many applied steps")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-compile", action="store_true")
@@ -323,7 +328,7 @@ def main() -> None:
     compiled = model if arguments.no_compile or device.type == "cpu" else torch.compile(model, **compile_options)
     mark_steps = compiled is not model and strategies.kernel.marks_steps  # CUDA graph trees need each step's start
     use_flex = device.type == "cuda"
-    clock = benchmark.Clock(device, budget=arguments.budget)
+    clock = benchmark.Clock(device, budget=arguments.budget, eval_cap=arguments.eval_cap)
     generator = torch.Generator(device=device).manual_seed(arguments.seed)
     auxiliary = bool(strategies.hooked("auxiliary_loss"))
     loss_hooks = strategies.hooked("training_loss")
@@ -331,15 +336,16 @@ def main() -> None:
     evaluation_hooks = strategies.hooked("evaluation_weights")
 
     flat_genome = {f"{family}.{key}": value for family, fields in strategies.genome.items() for key, value in fields.items()}
-    config = {**flat_genome, "seed": arguments.seed, "budget": arguments.budget, "name": arguments.name,
-              "hypothesis": arguments.hypothesis, "benchmark_id": data_id, "experiment_id": EXPERIMENT_GROUP}
+    config = {**flat_genome, "seed": arguments.seed, "budget": arguments.budget, "eval_cap": arguments.eval_cap,
+              "eval_interval": arguments.eval_interval, "name": arguments.name, "hypothesis": arguments.hypothesis,
+              "benchmark_id": data_id, "experiment_id": arguments.experiment_group}
     run: Any
     if arguments.no_wandb:
         run = NullRun()
     else:
         from foundry.logging import Run
 
-        run = Run(output_dir / "wandb", config, project=WANDB_PROJECT, group=EXPERIMENT_GROUP, job_type="train", name=arguments.name)
+        run = Run(output_dir / "wandb", config, project=WANDB_PROJECT, group=arguments.experiment_group, job_type="train", name=arguments.name)
 
     def masks_of(corrupted: Tensor) -> tuple[tuple[BlockMask, ...] | None, Tensor | None]:
         # corrupted: (b, l); the kernel's flex masks on the GPU, the document mask (b, 1, l, l) otherwise.
@@ -391,7 +397,7 @@ def main() -> None:
 
     curve: list[dict[str, Any]] = []
     best_loss, best_step, best_state = math.inf, -1, None
-    next_eval = EVAL_INTERVAL_SECONDS
+    next_eval = arguments.eval_interval
 
     def evaluate_now(step: int) -> None:
         # Each evaluation option (one in the record) is scored on val_select; the lowest loss is the point and selects.
@@ -469,7 +475,8 @@ def main() -> None:
             print(json.dumps({"step": step, "loss": float(loss / count.clamp(min=1)), "train_seconds": round(clock.train_seconds, 1)}), flush=True)
         if clock.train_seconds >= next_eval:
             evaluate_now(step)
-            next_eval += eval_interval(clock.eval_seconds / clock.eval_count, arguments.budget)
+            next_eval += eval_interval(clock.eval_seconds / clock.eval_count, arguments.budget, arguments.eval_interval,
+                                       arguments.eval_cap)
     if not curve or curve[-1]["step"] != step:
         evaluate_now(step)
     if best_state is None:

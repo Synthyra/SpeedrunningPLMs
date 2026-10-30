@@ -87,6 +87,17 @@ Every proposal is in the state file the moment it is made (its genome, its paren
 ledger row, written by `collect` through `record.append_row`, carries the same fields with the verdict. A 600 s run
 that beats the best observation so far is `keep`, else `revert`; a 180 s rung is `reference`.
 
+### Two tracks
+
+A state names its track (`search.TRACKS`): `10min` (600 s, the 180 s rung, evals every 90 s under a 60 s cap) or `1h`
+(3,600 s, the 600 s rung first and the top half promoted, evals every 180 s under a 360 s cap, batch names prefixed
+`h_`, its own W&B group). `load_state` applies the track's budgets, so every command and the loop read them from the
+state; `--track` names the track of a state a command starts. The 1-hour track started on 2026-10-31 from the 000
+baseline (`genomes/000_baseline.json`) with nothing of the 10-minute track in its state: the first batches are random
+draws over the open space (`RandomProposer`) until the Bayes and genetic proposers have their three and two
+observations. Each track has its own state folder on the box (`search`, `search_1h`), its own ledger, results record
+and figure set; `plots.py` refuses a folder that mixes budgets.
+
 ## Your place in the loop
 
 Your job is to supply strategies and ideas; the genetic and Bayesian searches find the combinations and the numbers.

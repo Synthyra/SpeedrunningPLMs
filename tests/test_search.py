@@ -70,10 +70,36 @@ def test_proposers_never_propose_a_retired_choice() -> None:
     rng = np.random.default_rng(4)
     observations = [search.Observation(f"start_{index}", search.written(search.random_genome(space, rng), {"unet.variant": "mirrored"}), 2.75 - 0.001 * index)
                     for index in range(6)]  # every parent holds the retired U-net
-    for proposer in (search.BayesianProposer(space, pool=400), search.GeneticProposer(space)):
+    for proposer in (search.BayesianProposer(space, pool=400), search.GeneticProposer(space), search.RandomProposer(space)):
         for proposal in proposer.propose(observations, 4, np.random.default_rng(5)):
             assert proposal.genome["unet"]["variant"] == "none"
             assert proposal.genome["optimizer"]["muon_lr"] == default_genome()["optimizer"]["muon_lr"]
+
+
+def test_random_proposer_starts_a_track_without_observations() -> None:
+    """A fresh track has nothing the Bayes and genetic proposers can use; random draws over the open space fill the
+    first batches, distinct, inside the warmup cap, and never a genome already observed."""
+    space = search.open_space([])
+    proposals = search.RandomProposer(space).propose([], 6, np.random.default_rng(7))
+    digests = {search.genome_sha256(proposal.genome) for proposal in proposals}
+    assert len(proposals) == len(digests) == 6
+    assert all(search.fits_warmup(proposal.genome) for proposal in proposals)
+    assert all(proposal.parents == [] for proposal in proposals)
+    seen = search.Observation("seen", proposals[0].genome, 2.8)
+    again = search.RandomProposer(space).propose([seen], 3, np.random.default_rng(7))
+    assert search.genome_sha256(proposals[0].genome) not in {search.genome_sha256(proposal.genome) for proposal in again}
+    assert all(proposal.parents == ["seen"] for proposal in again)
+
+
+def test_a_state_carries_its_track(tmp_path: Path) -> None:
+    """A new state names its track and `load_state` applies the track's budgets; the 10-minute track is the default,
+    and a state written before the tracks is the 10-minute one."""
+    hour = search.load_state(tmp_path / "hour.json", "1h")
+    assert hour["track"] == "1h" and search.FULL_BUDGET == 3600 and search.RUNG_BUDGET == 600
+    assert search.run_name("h_auto01_random", 1, 600) == "h_auto01_random_01_r600"
+    (tmp_path / "old.json").write_text(json.dumps({"schema": search.STATE_SCHEMA, "batches": {}, "proposals": {}, "seeded": {}, "retired": []}), encoding="utf-8")
+    old = search.load_state(tmp_path / "old.json")
+    assert old["track"] == "10min" and search.FULL_BUDGET == 600 and search.RUNG_BUDGET == 180
 
 
 def test_proposers_keep_to_the_warmup_cap() -> None:
@@ -158,7 +184,9 @@ def test_a_batch_flows_from_proposal_to_the_ledger(tmp_path: Path, monkeypatch: 
     names = search.propose(state, search.GeneticProposer(list(search.SPACE)), "ga1", 4, 0, [search.RUNG_BUDGET, search.FULL_BUDGET])
     shipped = search.ship(state, ["ga1"], search.RUNG_BUDGET)
     assert shipped == [f"{name}_r180" for name in names]
-    assert (tmp_path / "candidates" / "queue" / f"{names[0]}_r180.args").read_text().split() == ["--budget", "180", "--final-splits", "val_select"]
+    assert (tmp_path / "candidates" / "queue" / f"{names[0]}_r180.args").read_text().split() == [
+        "--budget", "180", "--eval-cap", "60.0", "--eval-interval", "90.0", "--experiment-group", "2026-10-28_afdb_v6_speedrun",
+        "--final-splits", "val_select"]  # the track's clock rides with every queue entry
     results, ledger = tmp_path / "results", tmp_path / "runs.jsonl"
     results.mkdir()
     for index, name in enumerate(names):

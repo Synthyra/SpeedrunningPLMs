@@ -7,6 +7,8 @@ Writes, at 300 dpi and without titles (the captions live in the figure set's REA
 record's test loss by candidate), `references.png` (A: test loss against parameters for the record holder and the
 reference models; B: test loss by length bin for the same). Reads any JSON with `metrics.val_select` as a run
 (a `clock` field) or a reference model (a `model_id` field); the verdicts come from the campaign ledger when given.
+One folder is one track: every run in it must share one `clock.budget_seconds` (the 10-minute and 1-hour tracks get
+their own folders and figure sets), and the record's label and the clock axis read that budget.
 """
 
 from __future__ import annotations
@@ -51,6 +53,19 @@ def load(folder: Path, ledger: Path | None) -> tuple[list[dict[str, Any]], list[
     return runs, references, verdicts
 
 
+def track_budget(runs: list[dict[str, Any]]) -> float:
+    """The one training budget, in seconds, every run of the folder shares; raises on a folder that mixes tracks."""
+    budgets = sorted({float(run["clock"]["budget_seconds"]) for run in runs})
+    if len(budgets) != 1:
+        raise ValueError(f"a runs folder holds one track, one budget; this one holds {budgets or 'no runs'} s")
+    return budgets[0]
+
+
+def budget_label(budget: float) -> str:
+    """The budget as the figures name it: 600 s is "10 min"."""
+    return f"{budget / 60:g} min"
+
+
 def record_name(runs: list[dict[str, Any]], verdicts: dict[str, str]) -> str | None:
     """The kept run with the lowest `val_select` loss: the selection rule's record holder."""
     kept = [run for run in runs if verdicts.get(run["name"]) == "keep"]
@@ -61,7 +76,7 @@ def letter(axis: plt.Axes, text: str) -> None:
     axis.text(-0.12, 1.04, text, transform=axis.transAxes, fontsize=13, fontweight="bold", va="bottom", ha="left")
 
 
-def selection_curves(runs: list[dict[str, Any]], verdicts: dict[str, str], output: Path) -> None:
+def selection_curves(runs: list[dict[str, Any]], verdicts: dict[str, str], budget: float, output: Path) -> None:
     figure, (left, right) = plt.subplots(1, 2, figsize=(11, 4.2), gridspec_kw={"width_ratios": [1.3, 1]})
     record = record_name(runs, verdicts)
     for run in runs:
@@ -77,7 +92,7 @@ def selection_curves(runs: list[dict[str, Any]], verdicts: dict[str, str], outpu
     left.plot([], [], color=REVERTED_COLOR, linewidth=0.9, label="reverted or reference")
     left.set_xlabel("training clock (s)")
     left.set_ylabel("val_select loss (nats per masked residue)")
-    left.set_xlim(60, 620)
+    left.set_xlim(budget / 10, budget + budget / 30)  # from the first eval's neighborhood to just past the budget
     left.legend(fontsize=7.5, frameon=False, loc="upper right")
     left.grid(alpha=0.25)
     letter(left, "A")
@@ -107,8 +122,10 @@ def selection_curves(runs: list[dict[str, Any]], verdicts: dict[str, str], outpu
     plt.close(figure)
 
 
-def references_figure(runs: list[dict[str, Any]], references: list[dict[str, Any]], verdicts: dict[str, str], output: Path) -> None:
+def references_figure(runs: list[dict[str, Any]], references: list[dict[str, Any]], verdicts: dict[str, str], budget: float,
+                      output: Path) -> None:
     figure, (left, right) = plt.subplots(1, 2, figsize=(11, 4.2))
+    track = budget_label(budget)
     name = record_name(runs, verdicts)
     record = next(run for run in runs if run["name"] == name) if name else runs[-1]
     unigram = next((reference for reference in references if reference["model_id"] == "unigram"), None)
@@ -121,7 +138,7 @@ def references_figure(runs: list[dict[str, Any]], references: list[dict[str, Any
         left.annotate(REFERENCE_LABELS[reference["model_id"]], (reference["parameters"], reference["metrics"]["test"]["loss"]),
                       textcoords="offset points", xytext=offset, fontsize=7.5)
     left.scatter(record["architecture"]["parameters"], record["metrics"]["test"]["loss"], color=RECORD_COLOR, marker="*", s=140, zorder=5)
-    left.annotate(f"{record['name']}, 10 min", (record["architecture"]["parameters"], record["metrics"]["test"]["loss"]),
+    left.annotate(f"{record['name']}, {track}",(record["architecture"]["parameters"], record["metrics"]["test"]["loss"]),
                   textcoords="offset points", xytext=(6, -10), fontsize=7.5, color=RECORD_COLOR)
     if unigram is not None:
         left.axhline(unigram["metrics"]["test"]["loss"], color=REFERENCE_COLORS["unigram"], linestyle="--", linewidth=1)
@@ -145,7 +162,7 @@ def references_figure(runs: list[dict[str, Any]], references: list[dict[str, Any
                    label=REFERENCE_LABELS[reference["model_id"]])
     by_length = record["metrics"]["test"]["loss_by_length"]
     right.plot(positions, [by_length[bin_name] for bin_name in LENGTH_BINS], marker="*", markersize=9, color=RECORD_COLOR,
-               linewidth=2, label=f"{record['name']}, 10 min")
+               linewidth=2, label=f"{record['name']}, {track}")
     if unigram is not None:
         by_length = unigram["metrics"]["test"]["loss_by_length"]
         right.plot(positions, [by_length[bin_name] for bin_name in LENGTH_BINS], linestyle="--", color=REFERENCE_COLORS["unigram"],
@@ -169,10 +186,11 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     arguments = parser.parse_args()
     runs, references, verdicts = load(arguments.runs, arguments.ledger)
+    budget = track_budget(runs)  # before any filter, so no run of another track hides in the folder
     runs = [run for run in runs if run.get("seed", 0) == 0 and run["clock"]["valid"]]  # seeds are references; an invalid run is no curve
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
-    selection_curves(runs, verdicts, arguments.output_dir)
-    references_figure(runs, references, verdicts, arguments.output_dir)
+    selection_curves(runs, verdicts, budget, arguments.output_dir)
+    references_figure(runs, references, verdicts, budget, arguments.output_dir)
     print(f"{len(runs)} runs, {len(references)} reference models -> {arguments.output_dir}")
 
 

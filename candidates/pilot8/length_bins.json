@@ -1,0 +1,24 @@
+{
+  "families": {
+    "attention": {
+      "heads": 6
+    },
+    "backprop_free": {
+      "variant": "unit_select"
+    },
+    "positional": {
+      "length_bins": 16,
+      "rope_base": 100000.0
+    },
+    "softcap": {
+      "variant": "none"
+    },
+    "value_embeddings": {
+      "variant": "ends"
+    },
+    "value_residual": {
+      "variant": "first_block"
+    }
+  },
+  "schema": 1
+}

@@ -45,8 +45,19 @@ from speedrunning_plms.strategies import FAMILIES, Genome, default_genome, genom
 
 PROJECT = Path(__file__).resolve().parent
 NOISE_SD = 0.0015  # one seed's spread on val_select: 004 against 003, and 015 at seeds 0, 1 and 2
-FULL_BUDGET = 600
-RUNG_BUDGET = 180
+# The tracks: a state names one, and `load_state` applies it to the module's budgets. The 1-hour track's rungs put
+# every proposal through 600 s first; its evals are spaced and capped at six times the 10-minute track's interval
+# (Logan, 2026-10-30: good selection without spending too much time on eval). `prefix` keeps the two tracks' batch and
+# run names apart in the one runs folder; `group` is the track's W&B group and experiment id.
+TRACKS: dict[str, dict[str, Any]] = {
+    "10min": {"budget": 600, "rung": 180, "rungs": [600], "eval_cap": 60.0, "eval_interval": 90.0, "prefix": "",
+              "group": "2026-10-28_afdb_v6_speedrun"},
+    "1h": {"budget": 3600, "rung": 600, "rungs": [600, 3600], "eval_cap": 360.0, "eval_interval": 180.0, "prefix": "h_",
+           "group": "2026-10-31_afdb_v6_speedrun_1h"},
+}
+TRACK = TRACKS["10min"]  # the loaded state's track, applied by `load_state`; the 10-minute track until one is loaded
+FULL_BUDGET = TRACK["budget"]
+RUNG_BUDGET = TRACK["rung"]
 STATE_SCHEMA = 1
 DEFAULT_RECORD = "022_embed_head_lr"  # the run the default genome reproduces
 
@@ -586,6 +597,30 @@ class ManualProposer:
                 for path, hypothesis in zip(self.genomes, self.hypotheses, strict=True)]
 
 
+class RandomProposer:
+    """Uniform draws over the open space, warmup-repaired and distinct: a track's first design, before the Bayes and
+    genetic proposers have the observations they need (three and two at the full budget)."""
+
+    name = "random"
+
+    def __init__(self, space: list[Dimension]) -> None:
+        self.space = space
+
+    def propose(self, observations: list[Observation], count: int, rng: np.random.Generator) -> list[Proposal]:
+        seen = {genome_sha256(observation.genome) for observation in observations}
+        parents = [observations[0].name] if observations else []
+        proposals: list[Proposal] = []
+        while len(proposals) < count:
+            genome = warmup_repaired(within(random_genome(self.space, rng), self.space), rng)
+            digest = genome_sha256(genome)
+            if digest in seen or not fits_warmup(genome):
+                continue
+            seen.add(digest)
+            changes = genome_document(genome)["families"]
+            proposals.append(Proposal(genome, parents, f"random draw over the open space: {json.dumps(changes, sort_keys=True)}"))
+        return proposals
+
+
 def main_effects(levels: np.ndarray, values: np.ndarray) -> np.ndarray:
     """Each factor's mean response at +1 minus at -1."""
     # levels: (n, k) of +1 and -1; values: (n,); returns (k,).
@@ -736,11 +771,23 @@ class GeneticProposer:
 
 # The state file and the ledger.
 
-def load_state(path: Path) -> dict[str, Any]:
+def apply_track(state: dict[str, Any]) -> dict[str, Any]:
+    """Set the module's budgets to the state's track (states written before the tracks are the 10-minute one)."""
+    global TRACK, FULL_BUDGET, RUNG_BUDGET
+    TRACK = TRACKS[state.setdefault("track", "10min")]
+    FULL_BUDGET = TRACK["budget"]
+    RUNG_BUDGET = TRACK["rung"]
+    return TRACK
+
+
+def load_state(path: Path, track: str = "10min") -> dict[str, Any]:
+    """The state at `path`, its track applied; a path without a state starts an empty one on `track`."""
     if not path.exists():
-        return {"schema": STATE_SCHEMA, "batches": {}, "proposals": {}, "seeded": {}, "retired": []}
-    state = json.loads(path.read_text(encoding="utf-8"))
-    assert state["schema"] == STATE_SCHEMA
+        state = {"schema": STATE_SCHEMA, "track": track, "batches": {}, "proposals": {}, "seeded": {}, "retired": []}
+    else:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        assert state["schema"] == STATE_SCHEMA
+    apply_track(state)
     return state
 
 
@@ -775,7 +822,8 @@ def write_queue_entry(name: str, genome: Genome, hypothesis: str, budget: int) -
     queue.mkdir(parents=True, exist_ok=True)
     (queue / f"{name}.json").write_text(json.dumps(genome_document(genome), indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     (queue / f"{name}.txt").write_text(hypothesis.replace("\n", " ") + "\n", encoding="utf-8", newline="\n")
-    extra = "" if budget == FULL_BUDGET else f"--budget {budget} --final-splits val_select"
+    extra = (f"--budget {budget} --eval-cap {TRACK['eval_cap']} --eval-interval {TRACK['eval_interval']} "
+             f"--experiment-group {TRACK['group']}" + ("" if budget == FULL_BUDGET else " --final-splits val_select"))
     (queue / f"{name}.args").write_text(extra + "\n", encoding="utf-8", newline="\n")
 
 
@@ -941,6 +989,7 @@ def effects_table(state: dict[str, Any], batch: str) -> str:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--state", type=Path, required=True, help="the search state JSON, beside the campaign ledger")
+    parser.add_argument("--track", choices=sorted(TRACKS), default="10min", help="the track of a state started by this call")
     commands = parser.add_subparsers(dest="command", required=True)
     proposing = commands.add_parser("propose")
     proposing.add_argument("--proposer", choices=("screening", "bayes", "genetic", "manual"), required=True)
@@ -980,12 +1029,14 @@ def proposer_named(arguments: argparse.Namespace, space: list[Dimension]) -> Pro
         return BayesianProposer(space)
     if arguments.proposer == "genetic":
         return GeneticProposer(space)
+    if arguments.proposer == "random":
+        return RandomProposer(space)
     return ManualProposer(arguments.genomes, arguments.hypotheses)
 
 
 def main() -> None:
     arguments = parse_arguments()
-    state = load_state(arguments.state)
+    state = load_state(arguments.state, arguments.track)
     space = open_space(state["retired"])
     if arguments.command == "propose":
         rungs = arguments.rungs or ([FULL_BUDGET] if arguments.proposer == "screening" else [RUNG_BUDGET, FULL_BUDGET])

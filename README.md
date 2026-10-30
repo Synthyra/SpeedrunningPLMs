@@ -173,6 +173,12 @@ state and the ledger, which live beside the runs on the box while the loop runs.
 is the two proposers' to optimize. New strategy modules ship as a new tree with the same command: the new loop takes
 over at the running cycle's end, and a pilot batch of the new modules runs ahead of the backlog.
 
+A second track, the 1-hour speedrun, started on 2026-10-31: the same benchmark at 3,600 s of training (evals every
+180 s of clock under a 360 s cap, the compile cap unchanged), searched from the 000 baseline by random draws and then
+the Bayes and genetic proposers alone, with its own state, ledger and figures; nothing of the 10-minute track seeds it.
+Its first batches go through a 600 s rung and the top half on to the full hour. Its results have their own section
+once the first runs land.
+
 ## The benchmark
 
 | Rule | What it is |

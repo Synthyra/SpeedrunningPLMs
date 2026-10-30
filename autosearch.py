@@ -29,7 +29,7 @@ from typing import Any
 import search
 
 BATCH_PREFIX = "auto"
-PROPOSERS = ("bayes", "genetic")  # alternating, batch by batch
+PROPOSERS = ("bayes", "genetic")  # alternating, batch by batch; random draws until they have observations enough
 
 
 def pending_runs(state: dict[str, Any]) -> list[tuple[str, str, int]]:
@@ -68,22 +68,25 @@ def ship_runs(state: dict[str, Any], selected: list[tuple[str, str, int]]) -> li
 
 def next_batch_name(state: dict[str, Any]) -> tuple[str, str]:
     """`auto<k>_<proposer>`, the proposers alternating by k."""
-    index = 1 + sum(batch.startswith(BATCH_PREFIX) for batch in state["batches"])
+    prefix = search.TRACK["prefix"] + BATCH_PREFIX
+    index = 1 + sum(batch.startswith(prefix) for batch in state["batches"])
     proposer = PROPOSERS[(index - 1) % len(PROPOSERS)]
-    return f"{BATCH_PREFIX}{index:02d}_{proposer}", proposer
+    return f"{prefix}{index:02d}_{proposer}", proposer
 
 
 def propose_new(state: dict[str, Any], count: int, seed: int) -> list[str]:
-    """One batch from the next proposer in turn, the other proposer when it cannot propose."""
+    """One batch from the next proposer in turn, the other proposer when it cannot propose, and random draws while
+    neither has the observations it needs (a track's start)."""
     space = search.open_space(state["retired"])
     batch, proposer_name = next_batch_name(state)
-    for attempt in (proposer_name, *[other for other in PROPOSERS if other != proposer_name]):
-        proposer = search.BayesianProposer(space) if attempt == "bayes" else search.GeneticProposer(space)
+    proposers = {"bayes": search.BayesianProposer, "genetic": search.GeneticProposer, "random": search.RandomProposer}
+    for attempt in (proposer_name, *[other for other in PROPOSERS if other != proposer_name], "random"):
         try:
-            return search.propose(state, proposer, batch.replace(proposer_name, attempt), count, seed, [search.FULL_BUDGET])
+            return search.propose(state, proposers[attempt](space), batch.replace(proposer_name, attempt), count, seed,
+                                  search.TRACK["rungs"])
         except ValueError as error:
             print(f"autosearch: {attempt} could not propose: {error}")
-    raise RuntimeError("neither proposer could propose a batch")
+    raise RuntimeError("no proposer could propose a batch")
 
 
 def command_next(state: dict[str, Any], state_dir: Path, count: int) -> None:
@@ -127,10 +130,10 @@ def main() -> None:
     else:
         command_collect(state, arguments.state_dir, arguments.crashed)
     observations = search.observations_of(state)
-    best = min(observations, key=lambda observation: observation.value)
+    best = min(observations, key=lambda observation: observation.value, default=None)  # none before a track's first result
     print(json.dumps({"utc": datetime.now(UTC).isoformat(timespec="seconds"), "observations": len(observations),
-                      "incumbent": best.name, "val_select": round(best.value, 4), "batches": len(state["batches"]),
-                      "pending": len(pending_runs(state))}))
+                      "incumbent": best.name if best else None, "val_select": round(best.value, 4) if best else None,
+                      "track": state["track"], "batches": len(state["batches"]), "pending": len(pending_runs(state))}))
     search.save_state(state, state_path)
 
 
