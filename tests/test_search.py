@@ -201,3 +201,18 @@ def test_a_batch_flows_from_proposal_to_the_ledger(tmp_path: Path, monkeypatch: 
     assert [row["rung_seconds"] for row in rows] == [180] * 4 + [600]
     assert rows[-1]["verdict"] == "keep" and rows[-1]["proposer"] == "genetic" and len(rows[-1]["parents"]) == 2
     assert search.incumbent_of(state).name == promoted[0]
+
+
+def test_the_loop_ships_a_batch_whose_name_holds_the_rung_letter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 1-hour track's first batch, h_auto01_random, crashed the loop's name parse on 2026-10-31 ("_r" split)."""
+    import autosearch  # noqa: PLC0415  # the loop's driver, a script beside search.py
+
+    monkeypatch.setattr(search, "PROJECT", tmp_path)
+    monkeypatch.delenv("SPEEDRUN_LAUNCHER", raising=False)
+    monkeypatch.delenv("SPEEDRUN_FETCH", raising=False)
+    state = search.load_state(tmp_path / "search.json", track="1h")
+    names = search.propose(state, search.RandomProposer(list(search.SPACE)), "h_auto01_random", 2, 0, [600, 3600])
+    pending = autosearch.pending_runs(state)
+    assert [run for _, run, _ in pending] == [f"{name}_r600" for name in names]
+    assert autosearch.ship_runs(state, pending) == [f"{name}_r600" for name in names]
+    assert (tmp_path / "candidates" / "queue" / f"{names[0]}_r600.args").read_text().split()[:2] == ["--budget", "600"]

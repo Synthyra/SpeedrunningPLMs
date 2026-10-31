@@ -79,6 +79,13 @@ class StepState:
     corrupted: Tensor  # (b, l)
     labels: Tensor  # (b, l)
     loss_without_grad: Callable[[], Tensor]  # the summed masked loss of this batch at the current weights, ()
+    # The step's forward and backward again at the current weights, replacing every gradient (the loop's train_step on
+    # the same batch and masks); None where no loop provides one.
+    recompute_gradient: Callable[[], None] | None = None
+    # The run's budget over the 10-minute track's 600 s: a number given in steps (an averaging window, a decay's memory,
+    # a decay timescale) is read at the 10-minute track's steps and scaled by this, so one value means one share of the
+    # run on every track.
+    run_scale: float = 1.0
 
 
 class Strategy:

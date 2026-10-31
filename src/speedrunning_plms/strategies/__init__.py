@@ -22,6 +22,7 @@ from speedrunning_plms.strategies.backprop_free import BackpropFree
 from speedrunning_plms.strategies.batch import Batch
 from speedrunning_plms.strategies.curriculum import Curriculum
 from speedrunning_plms.strategies.ema import Ema
+from speedrunning_plms.strategies.deep_supervision import DeepSupervision
 from speedrunning_plms.strategies.embedding_mix import EmbeddingMix
 from speedrunning_plms.strategies.gates import Gates
 from speedrunning_plms.strategies.grouping import Grouping
@@ -36,6 +37,7 @@ from speedrunning_plms.strategies.optimizer import OptimizerChoice
 from speedrunning_plms.strategies.positional import Positional
 from speedrunning_plms.strategies.regularization import Regularization
 from speedrunning_plms.strategies.residual import Residual
+from speedrunning_plms.strategies.sam import Sam
 from speedrunning_plms.strategies.schedule import Schedule
 from speedrunning_plms.strategies.softcap import Softcap
 from speedrunning_plms.strategies.strategy import HOOKS, Strategy, StrategyConfig, config_from
@@ -47,12 +49,13 @@ from speedrunning_plms.strategies.value_residual import ValueResidual
 
 GENOME_SCHEMA = 1
 # Hook order: the embedding's table before nGPT normalizes it, the value tables before the value mix, nGPT's logit
-# scale before the softcap, nGPT's weight normalization before the average reads the weights. The activation and the
-# latent loss act alone at their points, and the logit scale is the only query hook.
+# scale before the softcap, nGPT's weight normalization before the average reads the weights, SAM's gradient before the
+# backprop-free variants edit gradients. The activation and the latent loss act alone at their points, and the logit
+# scale is the only query hook.
 FAMILIES: dict[str, type[Strategy]] = {strategy.family: strategy for strategy in (
     Positional, AttentionKernel, Kernel, LogitScale, Neighbor, ValueEmbeddings, ValueResidual, Gates, UNet, EmbeddingMix,
-    Memory, Residual, StreamMixer, Activation, Regularization, Head, Softcap, Loss, OptimizerChoice, Schedule, Batch,
-    Curriculum, Ema, BackpropFree, Latent, Grouping,
+    Memory, Residual, StreamMixer, Activation, Regularization, Head, Softcap, Loss, Sam, OptimizerChoice, Schedule, Batch,
+    Curriculum, Ema, BackpropFree, Latent, Grouping, DeepSupervision,
 )}
 
 Genome = dict[str, dict[str, Any]]  # family -> its config's fields

@@ -4,13 +4,21 @@
       "heads": 6
     },
     "backprop_free": {
-      "variant": "unit_select"
+      "switch": 0.1651,
+      "variant": "readout_warmstart"
     },
-    "ema": {
-      "variant": "plateau_restart"
+    "curriculum": {
+      "variant": "family_tempered"
+    },
+    "latent": {
+      "variant": "neighbors"
     },
     "positional": {
-      "rope_base": 100000.0
+      "rope_base": 100000.0,
+      "variant": "none"
+    },
+    "residual": {
+      "variant": "ln_scaling"
     },
     "softcap": {
       "variant": "none"

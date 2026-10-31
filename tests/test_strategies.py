@@ -27,7 +27,7 @@ from speedrunning_plms.strategies import (
 from speedrunning_plms.strategies.attention import capped_attention, document_dense_mask, documents, shift_key_pairs, within_reach
 from speedrunning_plms.strategies.batch import Batch, BatchConfig, best_fit
 from speedrunning_plms.strategies.curriculum import Curriculum, CurriculumConfig
-from speedrunning_plms.strategies.ema import Ema, EmaConfig
+from speedrunning_plms.strategies.ema import Ema, EmaConfig, scaled_decay
 from speedrunning_plms.strategies.kernel import Kernel, KernelConfig
 from speedrunning_plms.benchmark.tokens import STANDARD_RESIDUES
 from speedrunning_plms.strategies import memory as memory_module
@@ -36,8 +36,10 @@ from speedrunning_plms.strategies.loss import Loss, LossConfig, residue_scores
 from speedrunning_plms.strategies.neighbor import pair_index, trigram_index
 from speedrunning_plms.strategies.optimizer import Muon, OptimizerChoice, OptimizerConfig, amuse_beta, polar_express
 from speedrunning_plms.strategies.positional import Positional, PositionalConfig, Rotary, length_bins, periodic_term, terminus_positions
+from speedrunning_plms.strategies.residual import Residual, ResidualConfig
+from speedrunning_plms.strategies.sam import Sam, SamConfig
 from speedrunning_plms.strategies.schedule import Schedule, ScheduleConfig
-from speedrunning_plms.strategies.strategy import HOOKS, ForwardContext, StepState
+from speedrunning_plms.strategies.strategy import HOOKS, ForwardContext, StepState, norm as norm_rms
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -108,6 +110,13 @@ COMPOSED = [
      "grouping": {"variant": "physchem", "weight": 0.3}, "schedule": {"muon_late_scale": 2.0, "muon_late_start": 0.6}},
     {"attention": {"variant": "paired", "kv_share": 3}, "residual": {"variant": "ngpt"}, "value_embeddings": {"variant": "ends"},
      "memory": {"variant": "product_keys", "block": 1}},
+    {"sam": {"variant": "late", "start": 0.0, "every": 1}, "optimizer": {"variant": "adamuon", "depth_taper": 0.5},
+     "residual": {"learned_gain": 0.3, "branch_ramp": 0.1, "branch_start": 0.2}, "attention": {"kv_share": 2},
+     "grouping": {"variant": "physchem"}},
+    {"sam": {"variant": "late", "start": 0.0, "every": 2, "rho": 0.2}, "optimizer": {"variant": "amuse", "depth_taper": -0.5},
+     "residual": {"variant": "ln_scaling", "learned_gain": 1.0, "branch_multiplier": 0.5}, "ema": {"variant": "tail", "start": 0.3}},
+    {"memory": {"variant": "shared_pool"}, "deep_supervision": {"variant": "mid_heads", "weight": 0.3},
+     "ema": {"variant": "latest_k", "window": 100}, "stream": {"variant": "attention_residual"}},
 ]
 
 
@@ -124,19 +133,25 @@ def one_cpu_step(genome: dict[str, dict[str, Any]]) -> None:
     corrupted, labels = benchmark.corrupt(input_ids, torch.Generator().manual_seed(0))  # each (b, l)
     optimizers = strategies.optimizer.build_optimizers(model, strategies.schedule.config.momentum)
     before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
-    logits, auxiliary = model(corrupted, labels=labels, dense_mask=document_dense_mask(corrupted))  # (b, l, v), ()
-    loss = benchmark.masked_cross_entropy(logits, labels)  # ()
-    for hook in strategies.hooked("training_loss"):
-        loss = hook.training_loss(logits, labels, loss)  # ()
-    loss = loss + auxiliary  # ()
-    assert torch.isfinite(loss)
-    loss.backward()
+    def forward_backward() -> None:
+        logits, auxiliary = model(corrupted, labels=labels, dense_mask=document_dense_mask(corrupted))  # (b, l, v), ()
+        loss = benchmark.masked_cross_entropy(logits, labels)  # ()
+        for hook in strategies.hooked("training_loss"):
+            loss = hook.training_loss(logits, labels, loss)  # ()
+        loss = loss + auxiliary  # ()
+        assert torch.isfinite(loss)
+        loss.backward()
+
+    def recompute_gradient() -> None:
+        model.zero_grad(set_to_none=True)
+        forward_backward()
 
     def loss_without_grad() -> torch.Tensor:
         with torch.no_grad():
             return benchmark.masked_cross_entropy(model(corrupted, dense_mask=document_dense_mask(corrupted)), labels)  # ()
 
-    state = StepState(model, 0, 0.5, 1.0, corrupted, labels, loss_without_grad)
+    forward_backward()
+    state = StepState(model, 0, 0.5, 1.0, corrupted, labels, loss_without_grad, recompute_gradient)
     for hook in strategies.hooked("after_backward"):
         hook.after_backward(state)
     for optimizer in optimizers:
@@ -170,7 +185,10 @@ def test_every_variant_builds_and_trains_a_cpu_step(family: str, variant: str) -
                                                    "attention-residual-local-triangle-restart-dropout-length",
                                                    "paired-local-dropout-length-ngpt",
                                                    "differential-kv2-local-terminus-memory-grouping-muon-late",
-                                                   "paired-kv3-ngpt-value-tables-memory"])
+                                                   "paired-kv3-ngpt-value-tables-memory",
+                                                   "sam-adamuon-taper-gains-kv2-grouping",
+                                                   "sam-amuse-reverse-taper-ln-scaling-gains-tail",
+                                                   "shared-pool-mid-heads-lawa-attention-residual"])
 def test_composed_genomes_train_a_cpu_step(changes: dict[str, dict[str, Any]]) -> None:
     one_cpu_step(with_changes(changes))
 
@@ -489,6 +507,128 @@ def test_group_loss_terminus_vectors_and_muon_widening() -> None:
     record, widened = Schedule(ScheduleConfig()), Schedule(ScheduleConfig(muon_late_scale=2.0, muon_late_start=0.8))
     assert not record.widens_muon and widened.widens_muon
     assert [widened.muon_lr_factor(progress) for progress in (0.5, 0.8, 0.9, 1.0)] == pytest.approx([1.0, 1.0, 1.5, 2.0])
+
+
+def test_sam_steps_with_the_gradient_at_the_perturbed_weights_and_puts_them_back() -> None:
+    model = torch.nn.Linear(3, 1, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(torch.tensor([[1.0, -2.0, 0.5]]))
+    target = torch.tensor([[0.3, 0.1, -0.2]])  # (1, 3); loss = ||W - target||^2 / 2 * c, gradient c (W - target)
+
+    def recompute_gradient() -> None:
+        model.zero_grad(set_to_none=True)
+        (2.0 * (model.weight - target).square().sum() / 2).backward()
+
+    recompute_gradient()
+    start = model.weight.detach().clone()
+    gradient = model.weight.grad.clone()
+    sam = Sam(SamConfig(variant="late", rho=0.1, every=2, start=0.5))
+    state = lambda step, progress: StepState(model, step, progress, 1.0, torch.zeros(1), torch.zeros(1), lambda: torch.zeros(()),  # noqa: E731
+                                             recompute_gradient)
+    sam.after_backward(state(4, 0.4))  # before the start: the plain gradient stays
+    assert torch.equal(model.weight.grad, gradient)
+    sam.after_backward(state(5, 0.6))  # an odd step: off
+    assert torch.equal(model.weight.grad, gradient)
+    sam.after_backward(state(6, 0.6))
+    perturbed = start + 0.1 * gradient / gradient.norm()  # (1, 3)
+    assert torch.allclose(model.weight.grad, 2.0 * (perturbed - target)) and torch.allclose(model.weight, start)
+    assert not Sam(SamConfig()).overrides("after_backward")
+
+
+def test_adamuon_depth_taper_and_learned_gains() -> None:
+    torch.manual_seed(0)
+    weights = [torch.randn(4, 6) for _ in range(2)]
+    gradients = [torch.randn(4, 6) for _ in weights]
+
+    def one_step(**options: Any) -> tuple[torch.Tensor, Muon]:
+        members = [torch.nn.Parameter(weight.clone()) for weight in weights]
+        for member, gradient in zip(members, gradients, strict=True):
+            member.grad = gradient.clone()
+        scales = options.pop("scales", None)
+        muon = Muon(members, lr=0.05, momentum=0.95, weight_decay=0.0,
+                    member_scales=None if scales is None else {id(member): scale for member, scale in zip(members, scales, strict=True)},
+                    **options)
+        muon.step()
+        return torch.stack([member.detach() for member in members]), muon
+
+    plain, _ = one_step(normalize_rows=False)
+    adamuon, muon = one_step(normalize_rows=False, elementwise=True)
+    assert muon.param_groups[0]["banks"][0][2].shape == (2, 4, 6)  # one second moment per entry
+    start = torch.stack(weights)  # (2, 4, 6)
+    assert torch.allclose((adamuon - start).flatten(1).norm(dim=1), (plain - start).flatten(1).norm(dim=1), atol=1e-5)
+    assert not torch.allclose(adamuon, plain)
+    with pytest.raises(AssertionError):
+        one_step(normalize_rows=True, elementwise=True)
+    tapered, _ = one_step(normalize_rows=False, scales=[1.25, 0.75])
+    assert torch.allclose(tapered - start, (plain - start) * torch.tensor([1.25, 0.75]).view(-1, 1, 1), atol=1e-6)
+    config = OptimizerConfig(depth_taper=0.5)
+    assert (config.block_scale(0), config.block_scale(35)) == pytest.approx((1.25, 0.75))
+    assert sum(config.block_scale(index) for index in range(36)) == pytest.approx(36)
+    torch.manual_seed(0)
+    model = load_train().build_candidate(with_changes({"residual": {"learned_gain": 0.3}}), max_tokens=64)
+    residual = model.strategies.residual
+    assert residual.overrides("sublayer_output") and not Residual(ResidualConfig()).overrides("sublayer_output")
+    with torch.no_grad():
+        residual.holder.learned_gains[2, 1] = 2.0
+    Y = torch.randn(2, 4, benchmark.HIDDEN)  # (b, l, d)
+    assert torch.equal(residual.sublayer_output(2, "mlp", Y), Y * 2.0)
+    assert torch.allclose(residual.sublayer_output(2, "attention", Y), Y * 0.3)
+    with pytest.raises(ValueError):
+        ResidualConfig(learned_gain=0.001)
+
+
+def test_shared_pool_reads_and_intermediate_heads() -> None:
+    torch.manual_seed(0)
+    model = load_train().build_candidate(with_changes({"memory": {"variant": "shared_pool"},
+                                                       "deep_supervision": {"variant": "mid_heads", "weight": 0.2, "until": 0.5}}),
+                                         max_tokens=64)
+    memory = model.strategies.memory
+    pool = memory.memory
+    assert pool.query.shape == (3, benchmark.HIDDEN, benchmark.HIDDEN) and pool.keys.shape[0] == 3
+    X = torch.randn(1, 3, benchmark.HIDDEN)  # (1, 3, d)
+    with torch.no_grad():
+        assert torch.equal(memory.block_input(model, 18, X, []), X)  # the pool starts at zero
+        pool.values.normal_()
+        assert torch.equal(memory.block_input(model, 10, X, []), X)
+        read = memory.block_input(model, 27, X, [])[0] - X[0]  # (3, d), the third read
+        Q = norm_rms(X[0]) @ pool.query[2].T  # (3, d)
+        half = torch.einsum("nhe,hse->nhs", Q.view(3, 2, -1), pool.keys[2])  # (3, 2, s)
+        every = (half[:, 0, :, None] + half[:, 1, None, :]).flatten(1)  # (3, s^2)
+        best, rows = every.topk(memory_module.TOP, dim=-1)  # (3, t) each
+        expected = (torch.softmax(best, -1)[..., None] * pool.values[rows]).sum(1)  # (3, d)
+    assert torch.allclose(read, expected, atol=1e-4)
+    deep = model.strategies.deep_supervision
+    states = [torch.randn(1, 4, benchmark.HIDDEN) for _ in range(benchmark.BLOCKS + 1)]  # (1, 4, d) each
+    labels = torch.tensor([[benchmark.IGNORE_LABEL, 3, 7, benchmark.IGNORE_LABEL]])  # (1, 4)
+    context = ForwardContext(torch.zeros(1, 4, dtype=torch.long), None, None)
+    with torch.no_grad():
+        expected_loss = 0.2 * sum(benchmark.masked_cross_entropy(model.logits(states[block]), labels) for block in (19, 28))
+        assert torch.allclose(deep.auxiliary_loss(model, states, labels, context), expected_loss)
+    deep.after_step(StepState(model, 9, 0.25, 1.0, torch.zeros(1), torch.zeros(1), lambda: torch.zeros(())))
+    assert deep.holder.weight.item() == pytest.approx(0.1)
+
+
+def test_step_units_scale_with_the_run() -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+
+    def state(step: int, progress: float, run_scale: float) -> StepState:
+        return StepState(model, step, progress, 1.0, torch.zeros(1), torch.zeros(1), lambda: torch.zeros(()), run_scale=run_scale)
+
+    for run_scale, kept in ((1.0, [0, 50, 100]), (2.0, [0, 100])):  # window 400 over 8 snapshots: every 50 steps a 600 s run
+        lawa = Ema(EmaConfig(variant="latest_k", window=400))
+        for step in range(0, 101, 10):
+            model.weight.data.fill_(float(step))
+            lawa.after_step(state(step, 0.5, run_scale))
+        assert [snapshot[0].item() for snapshot in lawa.snapshots] == kept
+    assert scaled_decay(0.99, 1.0) == 0.99 and (1 - scaled_decay(0.99, 6.0)) == pytest.approx(0.01 / 6, rel=0.01)
+    torch.manual_seed(0)
+    candidate = load_train().build_candidate(with_changes({"optimizer": {"decay_timescale": 1.0}}), max_tokens=64)
+    choice = candidate.strategies.optimizer
+    choice.build_optimizers(candidate, 0.95)
+    for run_scale, steps in ((1.0, 2000), (6.0, 12000)):  # one per-step shrink for a run six times the steps at an hour
+        choice.after_backward(StepState(candidate, steps // 2 - 1, 0.5, 1.0, torch.zeros(1), torch.zeros(1),
+                                        lambda: torch.zeros(()), run_scale=run_scale))
+        assert choice.muon.decay_per_step == pytest.approx(1 / 2000)
 
 
 def test_neighbor_heads_score_only_visible_residues_at_masked_positions() -> None:

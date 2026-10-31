@@ -25,7 +25,8 @@ snapshotted under `candidates/`.
 | 8 | 2.7175 | 3.921 | 2.7217 | 2,147 | the first screen's best row on 7: 6 heads of 128 instead of 12 of 64, value embeddings on blocks 0 to 2 and 33 to 35, no softcap, doubled local slopes, U-net skips and a tail weight average | [`screen1_05.json`](genomes/screen1_05.json) |
 | 9 | 2.7119 | 3.912 | 2.7177 | 2,148 | the screen's five helpful switches together on 7: 6 heads of 128, value embeddings, RoPE base 100,000, unit selection (only the more active half of the MLP units get gradients each step) and no softcap | [`confirm1_01.json`](genomes/confirm1_01.json) |
 | 10 | 2.7078 | 3.907 | 2.7146 | 2,149 | 9 with the shared-head readout warm start in place of unit selection: early in the run the head also reads the stream after every sixth block, so the blocks learn from a signal that does not wait for the end-to-end gradient; the Gaussian process proposed it and the single-switch batch found the same genome at 2.7147 | [`bayes2_01.json`](genomes/bayes2_01.json) |
-| 11 | **2.7067** | 3.905 | 2.7133 | 2,104 | 10 with the third single-switch batch's three gains stacked: LN scaling (each block's normalized input scaled by 1/sqrt(block index + 1), arXiv 2502.05795), the sublayer outputs faded in over the first 10 percent of the clock, and a two-layer head; each alone was 0.0005 to 0.0009 under 10 on `val_select`, together 0.0013, all inside one seed's band and kept by the rule | [`single3_04.json`](genomes/single3_04.json) |
+| 11 | 2.7067 | 3.905 | 2.7133 | 2,104 | 10 with the third single-switch batch's three gains stacked: LN scaling (each block's normalized input scaled by 1/sqrt(block index + 1), arXiv 2502.05795), the sublayer outputs faded in over the first 10 percent of the clock, and a two-layer head; each alone was 0.0005 to 0.0009 under 10 on `val_select`, together 0.0013, all inside one seed's band and kept by the rule | [`single3_04.json`](genomes/single3_04.json) |
+| 12 | **2.7022** | 3.898 | 2.7097 | 2,152 | the Gaussian process's first unattended batch on 11: the branch ramp and the two-layer head dropped, the local attention bias off, the readout warm start ending at 16.5 percent of the clock, proteins sampled by family size to the power -0.5 (ESM-2 reads clusters uniformly) and small neighbor-prediction heads at the masked residues (each predicts the residue at a fixed offset, scored like the main loss); 0.0036 under 11, more than twice the seed band | [`auto01_bayes_02.json`](genomes/auto01_bayes_02.json) |
 
 ![The selection curves of every candidate and the record progression](assets/selection_curves.png)
 
@@ -49,7 +50,7 @@ reference models gain on long proteins, so use of context is what the short cloc
 | Model | Parameters | `val_select` | Validation | Test loss | Bits | Accuracy | F1 macro | MCC | ROC AUC | PR AUC |
 |---|---|---|---|---|---|---|---|---|---|---|
 | unigram floor | | 2.8934 | 2.8938 | 2.8933 | 4.174 | 0.098 | 0.009 | 0.000 | 0.500 | 0.050 |
-| **record, 10 min** | 198,975,780 | 2.7133 | 2.7092 | 2.7067 | 3.905 | 0.161 | 0.125 | 0.095 | 0.663 | 0.127 |
+| **record, 10 min** | 198,485,028 | 2.7097 | 2.7058 | 2.7022 | 3.898 | 0.162 | 0.127 | 0.096 | 0.665 | 0.129 |
 | ESM2 8M | 7,523,034 | 2.6393 | 2.6291 | 2.6253 | 3.788 | 0.186 | 0.157 | 0.124 | 0.695 | 0.157 |
 | ESM2 35M | 33,517,234 | 2.5164 | 2.4965 | 2.4992 | 3.606 | 0.225 | 0.206 | 0.168 | 0.735 | 0.208 |
 | ESM2 150M | 148,161,274 | 2.3490 | 2.3176 | 2.3303 | 3.362 | 0.275 | 0.267 | 0.224 | 0.780 | 0.275 |
@@ -141,7 +142,7 @@ What the campaign has learned so far:
 ## The genome and the search
 
 A genome is a JSON file of family choices; what it leaves out takes the default, so an empty genome is 022 (bit for bit
-on a CPU smoke), and the record is [`genomes/single3_04.json`](genomes/single3_04.json). A genome reads:
+on a CPU smoke), and the record is [`genomes/auto01_bayes_02.json`](genomes/auto01_bayes_02.json). A genome reads:
 
 ```json
 {"schema": 1, "families": {"attention": {"variant": "triangle"}, "stream": {"variant": "hyper"}, "optimizer": {"muon_lr": 0.05}}}
@@ -177,8 +178,11 @@ over at the running cycle's end, and a pilot batch of the new modules runs ahead
 A second track, the 1-hour speedrun, started on 2026-10-31: the same benchmark at 3,600 s of training (evals every
 180 s of clock under a 360 s cap, the compile cap unchanged), searched from the 000 baseline by random draws and then
 the Bayes and genetic proposers alone, with its own state, ledger and figures; nothing of the 10-minute track seeds it.
-Its first batches go through a 600 s rung and the top half on to the full hour. Its results have their own section
-once the first runs land.
+Its first batches go through a 600 s rung and the top half on to the full hour. The hour's model sees about 850M
+tokens, 2.2 passes over the stream under fresh masks. Its reference, the 000 baseline at 3,600 s, reaches `val_select`
+2.7049 and test loss 2.7019 in 12,952 steps, 0.0003 under the 10-minute record with none of its strategies and nearly
+flat across protein length where the 10-minute record is 0.11 better on the longest proteins than the shortest. The
+track's results are in the workspace record and come here as its figures once the search has a record of its own.
 
 ## The benchmark
 

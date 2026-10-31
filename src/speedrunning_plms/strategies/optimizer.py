@@ -37,7 +37,19 @@ Three numbers act on the schedule of the update rather than its form, all off at
 - `decay_timescale` (Power Lines, arXiv 2505.13738): weight decay on the Muon banks with a constant timescale of
   `decay_timescale` total runs, lambda_t = 1 / (timescale x total_steps x lr_t), so each step shrinks the weights by
   1 / (timescale x total_steps) whatever the learning rate. The run's total steps are estimated each step as
-  (step + 1) / progress. When on, it replaces `cautious_weight_decay` on the banks.
+  (step + 1) / progress. When on, it replaces `cautious_weight_decay` on the banks. The unit is a 10-minute run: the
+  total is divided by `StepState.run_scale` (the budget over 600 s), so one value is one per-step shrink on every track
+  (at 3,600 s the run is about six times the steps, and "in total runs" would make each value six times weaker per
+  step; the 1-hour scout file's idea 5). At the 10-minute track nothing changes.
+- `depth_taper` (`2026-10-30_short_run_schedules.md` 7; Wu et al., arXiv 2602.07494, and "Optimal Scaling Needs Optimal
+  Norm," arXiv 2510.03871, abstracts: hidden layers prefer lower rates, the rate falls with effective depth): Muon's
+  rate at block i is multiplied by 1 + taper (1/2 - i / 35), a linear grade with mean 1 (taper 0.5: 1.25 at block 0,
+  0.75 at block 35; negative reverses it), a (k, 1, 1) tensor per bank applied to the update, so no graph changes.
+  A strategy's Muon matrices outside the blocks keep 1.
+- `adamuon` (AdaMuon, arXiv 2507.11005, abstract): NorMuon's step with one second moment per entry of the
+  orthogonalized update instead of per row (beta NORMUON_BETA), each matrix's norm restored as NorMuon's is, so
+  `muon_lr` keeps its meaning; the paper's own 0.2 sqrt(mn) RMS rescale is not used for that reason. The state grows
+  from (k, m, 1) to (k, m, n): about 1 GB of fp32 for the record's block matrices.
 - `fused_polar`: Polar Express under `torch.compile(dynamic=False)`, one graph per bank shape, so its elementwise
   parts fuse around the bf16 matmuls; the same iteration and coefficients, so the update matches up to the compiler's
   reordering. CUDA only: on the CPU the loop never compiles (the model's rule), and Windows CPU inductor needs MSVC.
@@ -56,6 +68,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 from torch import Tensor, nn
 
+from speedrunning_plms import benchmark
 from speedrunning_plms.optim.muon import POLAR_EXPRESS_COEFFICIENTS
 from speedrunning_plms.strategies.strategy import ParameterGroup, StepState, Strategy, StrategyConfig
 
@@ -86,14 +99,19 @@ class OptimizerConfig(StrategyConfig):
     adam_beta2_end: float = 0.95  # AdamW's beta2 at the end of the cooldown
     decay_timescale: float = 0.0  # the Muon banks' decay timescale in total runs; 0 is off
     fused_polar: int = 0  # 1 compiles Polar Express per bank shape
-    VARIANTS: ClassVar[tuple[str, ...]] = ("muon", "normuon", "muon_plus", "anvil", "amuse")
+    depth_taper: float = 0.0  # Muon's rate at block i times 1 + taper (1/2 - i / 35); 0 is the record's flat rate
+    VARIANTS: ClassVar[tuple[str, ...]] = ("muon", "normuon", "muon_plus", "anvil", "amuse", "adamuon")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {
         "muon_lr": (0.005, 0.12), "embed_lr": (3e-4, 3e-2), "head_lr": (1e-4, 1e-2), "scalar_lr": (3e-4, 3e-2),
         "adam_beta1": (0.7, 0.95), "adam_beta2": (0.9, 0.999), "weight_decay": (0.0, 0.2),
         "cautious_weight_decay": (0.0, 0.2), "anvil_slow_beta": (0.9, 0.995), "anvil_fast_weight": (0.1, 0.9),
         "amuse_beta": (0.2, 0.8), "amuse_rho": (0.0, 1.0), "adam_beta2_end": (0.9, 0.9995), "decay_timescale": (0.0, 10.0),
-        "fused_polar": (0, 1),
+        "fused_polar": (0, 1), "depth_taper": (-1.0, 1.0),
     }
+
+    def block_scale(self, index: int) -> float:
+        """Muon's rate multiplier at block `index`: 1 + taper (1/2 - index / 35), mean 1 over the 36 blocks."""
+        return 1 + self.depth_taper * (0.5 - index / (benchmark.BLOCKS - 1))
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -154,13 +172,16 @@ class Muon(torch.optim.Optimizer):
     def __init__(self, params: Iterable[Tensor], lr: float, momentum: float, weight_decay: float,
                  normalize_rows: bool = True, cautious_weight_decay: float = 0.0, plus_axis: str | None = None,
                  rails: tuple[float, float] | None = None, schedule_free: tuple[float, float] | None = None,
-                 fused_polar: bool = False) -> None:
+                 fused_polar: bool = False, elementwise: bool = False, member_scales: dict[int, float] | None = None) -> None:
         # rails: ANVIL's (slow beta, fast weight); schedule_free: AMUSE's (beta, rho); None for the record's Muon.
+        # elementwise: AdaMuon's per-entry second moment; member_scales: a rate multiplier by parameter id, 1 if absent.
         # params: (m, n) each, the matrices Muon updates.
         parameters = list(params)
         assert all(parameter.ndim == 2 and parameter.is_floating_point() for parameter in parameters)
+        assert not (normalize_rows and elementwise), "NorMuon's rows and AdaMuon's entries are two variants"
         super().__init__(parameters, dict(lr=lr, momentum=momentum, weight_decay=weight_decay))
         self.normalize_rows = normalize_rows
+        self.elementwise = elementwise
         self.cautious_weight_decay = cautious_weight_decay
         self.plus_axis = plus_axis
         self.rails = rails
@@ -173,8 +194,13 @@ class Muon(torch.optim.Optimizer):
             for parameter in group["params"]:
                 by_shape.setdefault(tuple(parameter.shape), []).append(parameter)
             group["banks"] = [(members, torch.zeros(len(members), *shape, dtype=torch.float32, device=members[0].device),
-                               torch.zeros(len(members), shape[0], 1, dtype=torch.float32, device=members[0].device))
-                              for shape, members in by_shape.items()]  # momentum buffer (k, m, n), row second moment (k, m, 1)
+                               torch.zeros(len(members), shape[0], shape[1] if elementwise else 1, dtype=torch.float32,
+                                           device=members[0].device))
+                              for shape, members in by_shape.items()]  # momentum buffer (k, m, n), second moment (k, m, 1 or n)
+            group["depth"] = [None if member_scales is None else
+                              torch.tensor([member_scales.get(id(member), 1.0) for member in members],
+                                           device=members[0].device).view(-1, 1, 1)
+                              for members, _, _ in group["banks"]]  # (k, 1, 1) rate multipliers, or None
             if rails is not None:  # the slow rail (k, m, n) and the lane energy, (k, m, 1) tall or (k, 1, n) wide
                 group["anvil"] = [(torch.zeros_like(buffer), torch.zeros(len(members), *lane_shape(members[0].shape),
                                                                          dtype=torch.float32, device=members[0].device))
@@ -194,8 +220,9 @@ class Muon(torch.optim.Optimizer):
                     continue
                 G = torch.stack([member.grad for member in members]).float()  # (k, m, n)
                 polar = self._polar(G.device)
+                depth = group["depth"][bank]  # (k, 1, 1) or None
                 if self.schedule_free is not None:
-                    self._amuse_update(members, G, buffer, *group["amuse"][bank], lr, momentum, polar)
+                    self._amuse_update(members, G, buffer, *group["amuse"][bank], lr, momentum, polar, depth)
                     continue
                 if self.rails is not None:
                     U = self._anvil_update(G, buffer, *group["anvil"][bank], momentum, polar)  # (k, m, n)
@@ -204,6 +231,10 @@ class Muon(torch.optim.Optimizer):
                     U = polar(G.lerp(buffer, momentum)).float()  # (k, m, n), Nesterov
                 if self.normalize_rows:
                     second_moment.lerp_(U.square().mean(dim=2, keepdim=True), 1 - NORMUON_BETA)  # (k, m, 1)
+                    normalized = U / (second_moment.sqrt() + 1e-8)  # (k, m, n)
+                    U = normalized * (U.flatten(1).norm(dim=1) / normalized.flatten(1).norm(dim=1).clamp(min=1e-8)).view(-1, 1, 1)  # (k, m, n), each matrix's norm restored
+                if self.elementwise:  # AdaMuon: the same with one second moment per entry
+                    second_moment.lerp_(U.square(), 1 - NORMUON_BETA)  # (k, m, n)
                     normalized = U / (second_moment.sqrt() + 1e-8)  # (k, m, n)
                     U = normalized * (U.flatten(1).norm(dim=1) / normalized.flatten(1).norm(dim=1).clamp(min=1e-8)).view(-1, 1, 1)  # (k, m, n), each matrix's norm restored
                 if self.plus_axis is not None:
@@ -217,6 +248,8 @@ class Muon(torch.optim.Optimizer):
                 elif self.cautious_weight_decay:  # decay only where the update and the weight share a sign (record 43)
                     P = torch.stack(members)  # (k, m, n)
                     torch._foreach_sub_(members, list((P * (U * P >= 0)).unbind(0)), alpha=lr * self.cautious_weight_decay)
+                if depth is not None:
+                    U = U * depth  # (k, m, n), each block's rate
                 torch._foreach_add_(members, list(U.to(members[0].dtype).unbind(0)), alpha=-lr * scale)
 
     def _polar(self, device: torch.device) -> Callable[[Tensor], Tensor]:
@@ -224,14 +257,15 @@ class Muon(torch.optim.Optimizer):
         return compiled_polar_express() if self.fused_polar and device.type == "cuda" else polar_express
 
     def _amuse_update(self, members: list[Tensor], G: Tensor, M: Tensor, Z: Tensor, X: Tensor, lr: float, momentum: float,
-                      polar: Callable[[Tensor], Tensor]) -> None:
+                      polar: Callable[[Tensor], Tensor], depth: Tensor | None) -> None:
         """AMUSE: Muon steps the base iterate, the average follows it, the weights move to their interpolation."""
-        # G, M, Z, X: (k, m, n); the gradient was taken at the weights, Y.
+        # G, M, Z, X: (k, m, n); depth: (k, 1, 1) or None; the gradient was taken at the weights, Y.
         assert self.schedule_free is not None
         beta, rho = self.schedule_free
         M.lerp_(G, 1 - momentum)  # (k, m, n), mu M + (1 - mu) G
         scale = max(1, members[0].shape[0] / members[0].shape[1]) ** 0.5
-        Z.add_(polar(M).float(), alpha=-lr * scale)  # (k, m, n)
+        U = polar(M).float()  # (k, m, n)
+        Z.add_(U if depth is None else U * depth, alpha=-lr * scale)  # (k, m, n)
         X.lerp_(Z, 1 / (self.steps + 1))  # (k, m, n), the uniform average of the Z iterates
         Y = torch.lerp(Z, X, amuse_beta(self.steps, beta, rho))  # (k, m, n), (1 - beta_t) Z + beta_t X
         torch._foreach_copy_(members, list(Y.to(members[0].dtype).unbind(0)))
@@ -298,10 +332,16 @@ class OptimizerChoice(Strategy):
                          plus_axis=self.config.plus_axis if self.variant == "muon_plus" else None,
                          rails=(self.config.anvil_slow_beta, self.config.anvil_fast_weight) if self.variant == "anvil" else None,
                          schedule_free=(self.config.amuse_beta, self.config.amuse_rho) if self.variant == "amuse" else None,
-                         fused_polar=bool(self.config.fused_polar))
+                         fused_polar=bool(self.config.fused_polar), elementwise=self.variant == "adamuon",
+                         member_scales=self._member_scales(model) if self.config.depth_taper else None)
         self.adam = torch.optim.AdamW(adam_groups, betas=(self.config.adam_beta1, self.config.adam_beta2),
                                       weight_decay=self.config.weight_decay, fused=model.embedding.weight.is_cuda)  # type: ignore[union-attr]
         return [self.muon, self.adam]
+
+    def _member_scales(self, model: nn.Module) -> dict[int, float]:
+        """`depth_taper`'s rate multiplier for every block parameter, by id; a strategy's Muon matrices keep 1."""
+        return {id(parameter): self.config.block_scale(index) for index, block in enumerate(model.blocks)  # type: ignore[union-attr]
+                for parameter in block.parameters()}
 
     def after_backward(self, state: StepState) -> None:
         """AdamW's beta2 along the cooldown and the banks' constant-timescale decay, before the optimizers step."""
@@ -313,7 +353,8 @@ class OptimizerChoice(Strategy):
                 group["betas"] = (group["betas"][0], beta2)
         if config.decay_timescale:
             total_steps = (state.step + 1) / state.progress if state.progress > 0 else 0.0  # the run's length, estimated
-            self.muon.decay_per_step = 1 / (config.decay_timescale * total_steps) if total_steps else 0.0
+            reference_steps = total_steps / state.run_scale  # the run's length at the 10-minute track's budget
+            self.muon.decay_per_step = 1 / (config.decay_timescale * reference_steps) if total_steps else 0.0
 
     @property
     def schedule_free(self) -> bool:

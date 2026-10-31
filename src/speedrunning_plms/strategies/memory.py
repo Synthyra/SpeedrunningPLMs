@@ -14,6 +14,11 @@ draws its default initialization when built. Everything trains with AdamW at the
 (tables). Per step at 65,536 tokens: 2.1M value rows read, 6.4 GB in fp32, about 2 ms at GH200 bandwidth, and the
 backward's scatter into a dense 200 MB gradient.
 
+`shared_pool` (Memory+ in Berges et al., sections 3.1.3 and 5.4 by a fetch summary: memory layers sharing one pool,
+about three of them best; `ideas/2026-10-31_capacity_and_data_at_one_hour.md` idea 1): the same read at the inputs of
+blocks SHARED_READS (9, 18, 27), each with its own query and sub-keys, all reading one 65,536-row value pool (`block`
+is inert). Each extra read adds 0.8M parameters and the same row traffic again, three times the single read's.
+
 Symbols: b windows, l tokens, d = 768, n = b l tokens, s = SIDE sub-keys a half, t = TOP.
 """
 
@@ -33,13 +38,14 @@ from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, Stra
 SIDE = 256  # sub-keys a half; SIDE^2 value rows
 TOP = 32  # sub-keys kept a half, and rows read a token
 KEY_INIT_STD = 0.02
+SHARED_READS = (9, 18, 27)  # shared_pool: the blocks whose inputs read the one pool
 
 
 @dataclass(frozen=True)
 class MemoryConfig(StrategyConfig):
     variant: str = "none"
-    block: int = 18  # the block whose input gains the read
-    VARIANTS: ClassVar[tuple[str, ...]] = ("none", "product_keys")
+    block: int = 18  # product_keys: the block whose input gains the read
+    VARIANTS: ClassVar[tuple[str, ...]] = ("none", "product_keys", "shared_pool")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"block": (1, 35)}
 
     def __post_init__(self) -> None:
@@ -49,18 +55,21 @@ class MemoryConfig(StrategyConfig):
 
 
 class ProductKeyMemory(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, reads: int = 1) -> None:
+        # reads: 1 keeps the single read's (d, d) query and (2, s, d / 2) keys; more stacks one of each per read.
         super().__init__()
         d = benchmark.HIDDEN
-        self.query = nn.Parameter(torch.empty(d, d))  # (d, d), drawn in `initialize`
-        self.keys = nn.Parameter(torch.empty(2, SIDE, d // 2))  # (2, s, d / 2), drawn in `initialize`
-        self.values = nn.Parameter(torch.zeros(SIDE * SIDE, d))  # (s^2, d)
+        lead = () if reads == 1 else (reads,)
+        self.query = nn.Parameter(torch.empty(*lead, d, d))  # (d, d) or (r, d, d), drawn in `initialize`
+        self.keys = nn.Parameter(torch.empty(*lead, 2, SIDE, d // 2))  # (2, s, d / 2) or (r, 2, s, d / 2), likewise
+        self.values = nn.Parameter(torch.zeros(SIDE * SIDE, d))  # (s^2, d), the one pool
 
-    def forward(self, X: Tensor) -> Tensor:
-        # X: (b, l, d), the normalized stream; returns (b, l, d) in fp32.
+    def forward(self, X: Tensor, read: int = 0) -> Tensor:
+        # X: (b, l, d), the normalized stream; read: which query and keys; returns (b, l, d) in fp32.
         b, l, d = X.shape
-        Q = F.linear(X, self.query).view(b * l, 2, d // 2)  # (n, 2, d / 2)
-        scores = torch.einsum("nhe,hse->nhs", Q, self.keys.to(Q.dtype)).float()  # (n, 2, s)
+        query, keys = (self.query, self.keys) if self.query.ndim == 2 else (self.query[read], self.keys[read])  # (d, d), (2, s, d / 2)
+        Q = F.linear(X, query).view(b * l, 2, d // 2)  # (n, 2, d / 2)
+        scores = torch.einsum("nhe,hse->nhs", Q, keys.to(Q.dtype)).float()  # (n, 2, s)
         top, index = scores.topk(TOP, dim=-1)  # (n, 2, t) each
         pair = (top[:, 0, :, None] + top[:, 1, None, :]).flatten(1)  # (n, t^2)
         rows = (index[:, 0, :, None] * SIDE + index[:, 1, None, :]).flatten(1)  # (n, t^2)
@@ -78,13 +87,13 @@ class Memory(Strategy):
 
     def build(self, model: nn.Module, max_tokens: int) -> None:
         if self.active:
-            self.memory = ProductKeyMemory()
+            self.memory = ProductKeyMemory(len(SHARED_READS) if self.variant == "shared_pool" else 1)
             model.extensions[self.family] = self.memory  # type: ignore[index]
 
     def initialize(self, model: nn.Module) -> None:
         if self.active:
-            nn.init.normal_(self.memory.query, std=KEY_INIT_STD)  # (d, d), the record's linear init
-            nn.init.normal_(self.memory.keys, std=KEY_INIT_STD)  # (2, s, d / 2)
+            nn.init.normal_(self.memory.query, std=KEY_INIT_STD)  # (d, d) or (r, d, d), the record's linear init
+            nn.init.normal_(self.memory.keys, std=KEY_INIT_STD)  # (2, s, d / 2) or (r, 2, s, d / 2)
             nn.init.zeros_(self.memory.values)  # (s^2, d): the read starts at zero
 
     def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
@@ -95,6 +104,10 @@ class Memory(Strategy):
 
     def block_input(self, model: nn.Module, index: int, X: Tensor, states: list[Tensor]) -> Tensor:
         # X: (b, l, d), the stream entering block `index`.
+        if self.variant == "shared_pool":
+            if index not in SHARED_READS:
+                return X  # (b, l, d)
+            return X + self.memory(norm(X), SHARED_READS.index(index)).to(X.dtype)  # (b, l, d)
         if index != self.config.block:
             return X  # (b, l, d)
         return X + self.memory(norm(X)).to(X.dtype)  # (b, l, d)

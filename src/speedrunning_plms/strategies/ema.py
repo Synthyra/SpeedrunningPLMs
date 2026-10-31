@@ -24,6 +24,11 @@ weights stay live for training.
   weights throughout. EWA's own protocol (Section 3) was not read.
 
 The rings empty at the first applied step, so the compile warmup's steps never enter them.
+
+`window`, `decay` and `decay_fast` are in the 10-minute track's steps and scale with the run (`StepState.run_scale`,
+the budget over 600 s): a window of 400 is 400 steps at 600 s and 2,400 at 3,600 s, and a decay's memory
+1 / (1 - decay) scales the same way (decay^(1 / scale)), so one value is one share of the run on every track (the 1-hour
+scout file's idea 3). At the 10-minute track nothing changes.
 """
 
 from __future__ import annotations
@@ -61,6 +66,11 @@ class EmaConfig(StrategyConfig):
             raise ValueError(f"window must be an integer, not {self.window!r}")
 
 
+def scaled_decay(decay: float, run_scale: float) -> float:
+    """A per-step decay whose memory, 1 / (1 - decay) steps at the 10-minute track, scales with the run: decay^(1 / scale)."""
+    return decay if run_scale == 1.0 else decay ** (1 / run_scale)
+
+
 class Ema(Strategy):
     family = "ema"
     Config = EmaConfig
@@ -85,7 +95,7 @@ class Ema(Strategy):
     def after_step(self, state: StepState) -> None:
         live = [parameter.detach() for parameter in state.model.parameters()]
         if self.variant in ("latest_k", "drift_leap"):
-            self._record_snapshot(live, state.step, LAWA_SNAPSHOTS if self.variant == "latest_k" else DRIFT_SNAPSHOTS)
+            self._record_snapshot(live, state, LAWA_SNAPSHOTS if self.variant == "latest_k" else DRIFT_SNAPSHOTS)
             return
         if self.variant == "plateau_restart":
             self._plateau_restart(live, state)
@@ -96,15 +106,17 @@ class Ema(Strategy):
             self.averaged = [parameter.clone() for parameter in live]
             self.averaged_fast = [parameter.clone() for parameter in live] if self.variant == "two_decay" else None
             return
-        torch._foreach_lerp_(self.averaged, live, 1 - self.config.decay)
+        torch._foreach_lerp_(self.averaged, live, 1 - scaled_decay(self.config.decay, state.run_scale))
         if self.averaged_fast is not None:
-            torch._foreach_lerp_(self.averaged_fast, live, 1 - self.config.decay_fast)
+            torch._foreach_lerp_(self.averaged_fast, live, 1 - scaled_decay(self.config.decay_fast, state.run_scale))
 
-    def _record_snapshot(self, live: list[Tensor], step: int, count: int) -> None:
-        """A ring of `count` snapshots, one every `window` / `count` steps, reusing the oldest's memory once full."""
+    def _record_snapshot(self, live: list[Tensor], state: StepState, count: int) -> None:
+        """A ring of `count` snapshots, one every `window` / `count` steps (at the run's scale), reusing the oldest's
+        memory once full."""
+        step = state.step
         if step == 0:
             self.snapshots.clear()
-        if step % max(1, self.config.window // count) != 0:
+        if step % max(1, round(self.config.window * state.run_scale) // count) != 0:
             return
         if len(self.snapshots) == count:
             oldest = self.snapshots.pop(0)
@@ -124,7 +136,7 @@ class Ema(Strategy):
             self.snapshots.clear()  # the ring's memory goes back
             self.restarted = True
             return
-        self._record_snapshot(live, state.step, LAWA_SNAPSHOTS)
+        self._record_snapshot(live, state, LAWA_SNAPSHOTS)
 
     def _mean(self) -> list[Tensor]:
         """The uniform mean of the ring's snapshots."""

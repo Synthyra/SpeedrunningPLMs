@@ -54,7 +54,10 @@ def ship_runs(state: dict[str, Any], selected: list[tuple[str, str, int]]) -> li
     """Queue entries for the selected runs, recorded as one shipment per batch; returns the run names in order."""
     names = []
     for batch, run, rung in selected:
-        name = search.run_name(batch, int(run.split("_r")[0].rsplit("_", 1)[1]), search.FULL_BUDGET)
+        # The proposal's name is the run's without its rung suffix; a batch name may itself hold "_r" (h_auto01_random).
+        rung_suffix = "" if rung == search.FULL_BUDGET else f"_r{rung}"
+        assert run.endswith(rung_suffix) and run.startswith(f"{batch}_"), (batch, run, rung)
+        name = run[: len(run) - len(rung_suffix)]
         proposal = state["proposals"][name]
         hypothesis = f"{proposal['proposer']} proposal ({rung} s): {proposal['reason']}"
         search.write_queue_entry(run, search.resolve({"families": proposal["genome"]}), hypothesis, rung)

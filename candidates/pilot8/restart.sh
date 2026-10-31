@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# Restart 5 of 2026-10-30: the pilot of every round-5 switch alone on confirm1_01 at the 180 s rung (validity and compile
-# cost; the proposers explore them at 600 s); pilot5_01 and pilot5_02 are the 180 s references), then the loop.
-# Runs on the box from the shipped tree: `ws remote run ... -- bash candidates/pilot8/restart.sh`.
-set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-
-bash run_gh200.sh python search.py --state /state/search/search.json propose --proposer manual --batch pilot8 --rungs 180 --genomes candidates/pilot8/attention_residual.json candidates/pilot8/local_3.json candidates/pilot8/cudagraphs.json candidates/pilot8/plateau_restart.json candidates/pilot8/early_dropout.json candidates/pilot8/length_bins.json --hypotheses "confirm1_01 with Attention Residuals: each block reads a learned softmax over the embedding and every earlier block's update, from the plain sum (ideas/2026-10-30_long_protein_attention.md, idea 6)" "confirm1_01 with two of every three blocks attending within 256 positions of the query inside the protein, a second flex mask (ideas/2026-10-30_long_protein_attention.md, idea 4)" "confirm1_01 compiled with CUDA graphs (reduce-overhead), a step-time pilot (ideas/2026-10-30_step_throughput.md, idea 2)" "confirm1_01 restarted at 60 percent of the clock from the mean of the last 400 steps' snapshots, then trained on (EWA; ideas/2026-10-30_regularization_and_averaging.md, idea 3)" "confirm1_01 with dropout 0.1 on every sublayer output, falling to 0 by 15 percent of the clock (ideas/2026-10-30_regularization_and_averaging.md, idea 6)" "confirm1_01 with a learned embedding of each protein's log-length bin (16 bins) added to every residue (ideas/2026-10-30_protein_input_priors.md, idea 2)"
-exec bash autosearch.sh --until 2026-10-31T02:00:00Z --count 4

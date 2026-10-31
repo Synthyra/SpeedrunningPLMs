@@ -363,11 +363,33 @@ def main() -> None:
                     logits = _dense_forward(compiled, corrupted, dense_mask)  # (b, l, v)
             return benchmark.masked_cross_entropy(logits, labels)  # ()
 
-        return StepState(model, step, progress, lr_scale, corrupted, labels, loss_without_grad)
+        def recompute_gradient() -> None:
+            model.zero_grad(set_to_none=True)
+            if mark_steps:
+                torch.compiler.cudagraph_mark_step_begin()
+            train_step(compiled, corrupted, labels, block_masks, dense_mask, device, auxiliary, loss_hooks)
+
+        return StepState(model, step, progress, lr_scale, corrupted, labels, loss_without_grad, recompute_gradient,
+                         run_scale=arguments.budget / benchmark.BUDGET_SECONDS)
+
+    def metrics_of(split: benchmark.HeldOutSplit, keep_probabilities: bool = True) -> dict[str, Any]:
+        """The split's metrics; a genome that fills the GPU (CUDA graphs beside wide tables) is scored at a smaller eval
+        batch instead of lost, since the batch size does not enter the metrics. The tokens a batch halve down to 2,048."""
+        tokens_per_batch = arguments.eval_tokens_per_batch
+        while True:
+            try:
+                return benchmark.evaluate_split(model, split, device, tokens_per_batch=tokens_per_batch,
+                                                keep_probabilities=keep_probabilities)
+            except torch.OutOfMemoryError:
+                if tokens_per_batch <= 2048:
+                    raise
+                tokens_per_batch //= 2
+                torch.cuda.empty_cache()
+                print(json.dumps({"eval_tokens_per_batch": tokens_per_batch, "reason": "out of memory"}), flush=True)
 
     # Compile warmup on synthetic windows of every shape the run trains on, callbacks included, then back to the fresh
     # initialization and fresh optimizers.
-    initial_state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+    initial_state ={name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
     optimizers = strategies.optimizer.build_optimizers(model, schedule.config.momentum)
     with clock.warming_up():
         for window in curriculum.windows(batch.config.window):
@@ -389,7 +411,7 @@ def main() -> None:
                     hook.after_step(state)
         # The evaluation path's kernels warm once here (its first pass costs four times the later ones).
         model.eval()
-        benchmark.evaluate_split(model, val_select, device, tokens_per_batch=arguments.eval_tokens_per_batch, keep_probabilities=False)
+        metrics_of(val_select, keep_probabilities=False)
         model.train()
     model.load_state_dict(initial_state)
     optimizers = strategies.optimizer.build_optimizers(model, schedule.config.momentum)
@@ -412,8 +434,7 @@ def main() -> None:
                         hook.option = option
                         weights.enter_context(hook.evaluation_weights(model))
                     model.eval()
-                    metrics = benchmark.evaluate_split(model, val_select, device, tokens_per_batch=arguments.eval_tokens_per_batch,
-                                                       keep_probabilities=False)
+                    metrics = metrics_of(val_select, keep_probabilities=False)
                     model.train()
                     if metrics["loss"] < best_loss:  # inside the evaluation weights, which are what was scored
                         best_loss, best_step = metrics["loss"], step
@@ -495,7 +516,7 @@ def main() -> None:
         for split in arguments.final_splits:
             held_out = val_select if split == "val_select" else benchmark.load_held_out(arguments.data_dir, split)
             started = time.perf_counter()
-            metrics[split] = benchmark.evaluate_split(model, held_out, device, tokens_per_batch=arguments.eval_tokens_per_batch)
+            metrics[split] = metrics_of(held_out)
             final_eval_seconds += time.perf_counter() - started
             print(json.dumps({split: {key: metrics[split][key] for key in ("loss", "accuracy", "mcc")}}), flush=True)
     clock_receipt = clock.receipt()

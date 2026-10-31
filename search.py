@@ -111,6 +111,7 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("residual.branch_multiplier", low=0.25, high=1.0, log=True),
     Dimension("residual.branch_ramp", low=0.0, high=0.3),
     Dimension("residual.branch_start", low=0.0, high=0.5),
+    Dimension("residual.learned_gain", (0.0, 0.1, 0.3, 1.0)),  # 0 is off; the gates' start otherwise
     Dimension("activation.variant", ("relu2", "xielu")),
     Dimension("latent.variant", ("none", "next_layer", "neighbors")),
     Dimension("latent.source_block", low=6, high=30, integer=True),
@@ -118,8 +119,11 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("grouping.variant", ("none", "physchem")),
     Dimension("grouping.weight", low=0.02, high=0.5, log=True),
     Dimension("grouping.until", low=0.1, high=0.8),
-    Dimension("memory.variant", ("none", "product_keys")),
+    Dimension("memory.variant", ("none", "product_keys", "shared_pool")),
     Dimension("memory.block", low=6, high=30, integer=True),
+    Dimension("deep_supervision.variant", ("none", "mid_heads")),
+    Dimension("deep_supervision.weight", low=0.02, high=0.3, log=True),
+    Dimension("deep_supervision.until", low=0.3, high=0.8),
     Dimension("stream.variant", ("single", "hyper", "dense", "attention_residual")),
     Dimension("stream.streams", low=2, high=4, integer=True),
     Dimension("unet.variant", ("none", "mirrored")),
@@ -135,7 +139,7 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("gates.variant", ("none", "residual_channels", "head_sigmoid")),
     Dimension("softcap.variant", ("none", "tanh")),
     Dimension("softcap.cap", low=10.0, high=60.0, log=True),
-    Dimension("optimizer.variant", ("muon", "normuon", "muon_plus", "anvil", "amuse")),
+    Dimension("optimizer.variant", ("muon", "normuon", "muon_plus", "anvil", "amuse", "adamuon")),
     Dimension("optimizer.plus_axis", ("col_row", "row_col", "row", "col")),
     Dimension("optimizer.anvil_slow_beta", low=0.95, high=0.995),
     Dimension("optimizer.anvil_fast_weight", low=0.2, high=0.7),
@@ -143,17 +147,21 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("optimizer.amuse_rho", low=0.4, high=1.0),
     Dimension("optimizer.adam_beta1", low=0.7, high=0.95),
     Dimension("optimizer.adam_beta2", low=0.95, high=0.999),
-    Dimension("optimizer.muon_lr", low=0.02, high=0.08, log=True),
-    Dimension("optimizer.embed_lr", low=1e-3, high=1e-2, log=True),
-    Dimension("optimizer.head_lr", low=3e-4, high=3e-3, log=True),
-    Dimension("optimizer.scalar_lr", low=1e-3, high=1e-2, log=True),
+    # Floors halved on 2026-10-31 for the 1-hour track: the LR-against-horizon laws put six times the steps at 0.41 to
+    # 0.56 times the 10-minute rates (`2026-10-31_budget_scaling_to_one_hour.md` 1), Muon near 0.016 to 0.022 and the
+    # AdamW groups at or just above the old floors; the ceilings stay for the 10-minute track.
+    Dimension("optimizer.muon_lr", low=0.01, high=0.08, log=True),
+    Dimension("optimizer.embed_lr", low=5e-4, high=1e-2, log=True),
+    Dimension("optimizer.head_lr", low=1.5e-4, high=3e-3, log=True),
+    Dimension("optimizer.scalar_lr", low=5e-4, high=1e-2, log=True),
     Dimension("optimizer.cautious_weight_decay", low=0.0, high=0.1),
     Dimension("optimizer.adam_beta2_end", low=0.95, high=0.9995),
     Dimension("optimizer.decay_timescale", (0.0, 0.1, 0.3, 1.0, 3.0, 10.0)),  # in total runs, log-spaced
     Dimension("optimizer.fused_polar", (0, 1)),
+    Dimension("optimizer.depth_taper", low=-0.5, high=0.5),  # 0, the record's flat rate, is inside
     Dimension("schedule.variant", ("trapezoid", "one_sqrt")),
     Dimension("schedule.warmup_fraction", low=0.0, high=0.05),
-    Dimension("schedule.cooldown_fraction", low=0.25, high=0.65),
+    Dimension("schedule.cooldown_fraction", low=0.15, high=0.65),  # floor 0.25 to 0.15 for the 1-hour track (2026-10-31)
     Dimension("schedule.momentum_start", low=0.85, high=0.95),
     Dimension("schedule.momentum", low=0.95, high=0.99),  # the momentum at the end of its warmup ramp
     Dimension("schedule.momentum_cooldown_end", low=0.95, high=0.995),
@@ -171,9 +179,13 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("ema.variant", ("none", "tail", "latest_k", "drift_leap", "two_decay", "plateau_restart")),
     Dimension("ema.start", low=0.4, high=0.9),
     Dimension("ema.decay", low=0.98, high=0.998),
-    Dimension("ema.window", low=100, high=1000, log=True, integer=True),
+    Dimension("ema.window", low=100, high=1000, log=True, integer=True),  # 10-minute steps, scaled with the run (ema.py)
     Dimension("ema.leap", low=0.05, high=0.5, log=True),
     Dimension("ema.decay_fast", low=0.9, high=0.99),
+    Dimension("sam.variant", ("none", "late")),
+    Dimension("sam.rho", low=0.01, high=0.2, log=True),
+    Dimension("sam.every", low=2, high=8, integer=True),
+    Dimension("sam.start", low=0.4, high=0.9),
     Dimension("backprop_free.variant", ("none", "residual_es", "unit_select", "unit_random", "readout_warmstart",
                                         "readout_boost", "unit_route")),
     Dimension("backprop_free.readout_weight", low=0.05, high=1.0, log=True),
@@ -268,6 +280,15 @@ SWITCHES: dict[str, dict[str, dict[str, Any]]] = {
     "grouping": {"grouping": {"variant": "physchem"}},
     "terminus": {"positional": {"terminus": 1}},
     "muon_late_2": {"schedule": {"muon_late_scale": 2.0}},
+    # Round 8, for the 1-hour track's late run: SAM in the last 40 percent, AdaMuon, a depth-graded Muon rate, learned
+    # branch gains.
+    "sam_late": {"sam": {"variant": "late"}},
+    "adamuon": {"optimizer": {"variant": "adamuon"}},
+    "depth_taper": {"optimizer": {"depth_taper": 0.5}},
+    "branch_gains": {"residual": {"learned_gain": 0.3}},
+    # Round 8 from the 1-hour capacity scout: three reads of one memory pool, and intermediate heads early in the run.
+    "shared_pool": {"memory": {"variant": "shared_pool"}},
+    "mid_heads": {"deep_supervision": {"variant": "mid_heads"}},
 }
 BACKPROP_FREE_SWITCHES = ("residual_es", "readout_warmstart", "unit_select", "readout_boost", "unit_route")
 
@@ -337,6 +358,14 @@ COMPILE_SECONDS: dict[str, float] = {
     "memory.variant=product_keys": 20.0,
     "grouping.variant=physchem": 10.0,
     "positional.terminus!=0": 5.0,
+    # Round 8: the learned gains are one more multiply on each sublayer output, `branch_multiplier`'s 10 s. SAM reruns the
+    # step's own graph, and AdaMuon and the depth taper live in the eager optimizer: no entry.
+    "residual.learned_gain!=0.0": 10.0,
+    # Three memory reads: the single read's 20 s plus the scout's 10 s for the extension (the reads share one pool and
+    # differ in their queries and keys). The intermediate heads reuse the head's graph twice in the auxiliary loss: the
+    # scout's 0 to 5 s, held at the group head's 10 s.
+    "memory.variant=shared_pool": 30.0,
+    "deep_supervision.variant=mid_heads": 10.0,
     # No entry, since they run eagerly outside any compiled graph: the loss family (`training_loss`), the cooldown's
     # momentum and beta2 (floats on the param groups), and the constant-timescale decay (a foreach multiply).
 }
@@ -351,8 +380,9 @@ NUMBER_VARIANTS: dict[str, tuple[str, ...]] = {
     "residual.branch_ramp": ("prenorm", "ln_scaling"),
     "residual.branch_start": ("prenorm", "ln_scaling"),
     "latent.source_block": ("next_layer",),
+    "memory.block": ("product_keys",),  # shared_pool reads at 9, 18 and 27
     "stream.streams": ("hyper",),
-    "optimizer.cautious_weight_decay": ("muon", "normuon", "muon_plus", "anvil"),  # amuse takes no decay
+    "optimizer.cautious_weight_decay": ("muon", "normuon", "muon_plus", "anvil", "adamuon"),  # amuse takes no decay
     "optimizer.anvil_slow_beta": ("anvil",),
     "optimizer.anvil_fast_weight": ("anvil",),
     "optimizer.amuse_beta": ("amuse",),
