@@ -1,5 +1,0 @@
-include LICENSE
-include PUBLIC_README.md
-include requirements.txt
-include baselines.json
-recursive-include src *.py
