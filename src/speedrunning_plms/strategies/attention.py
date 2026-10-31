@@ -30,6 +30,13 @@ Two numbers act under every kernel, both off (0) in the record:
   masks once per step beside the document masks and appends them, so a local block takes the second half of the tuple;
   the dense path ands the same band into its mask, so evaluation sees what training saw. Only proteins longer than
   LOCAL_REACH change.
+- `kv_share` (cross-layer attention, arXiv 2405.12981; `ideas/2026-10-30_long_protein_attention.md` idea 5): blocks
+  whose index modulo `kv_share` is not 0 have no key or value projection and reuse the K and V of their group's first
+  block, taken after its key hooks and QK-norm and before RoPE and the value hooks, which each block then applies by
+  its own rule (so `nope_every`, the value residual and the value tables compose). Queries stay per block, so flex
+  runs once per block as before. A throughput change: at 2, half the blocks skip 2 of their 6 matrices (12 of 54
+  units of 768^2 x tokens, about 10 percent of the matmul work), at the risk of the capacity CLA reports as cheap in
+  decoders; it removes 1.18M parameters a borrowing block.
 
 Symbols: b windows or proteins, l tokens, d = 768, h heads, d_h per-head width, q query heads, p = h / 2 pairs.
 """
@@ -54,6 +61,7 @@ DIFFERENTIAL = ("differential", "triangle_differential")
 TRIANGLE = ("triangle", "triangle_differential")
 LOCAL_REACH = 256  # a local block's query sees keys fewer than this many positions away
 MaskMod = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]  # flex's (batch, head, query, key) -> allowed
+SHARED_KEYS, SHARED_VALUES = "shared_keys", "shared_values"  # `kv_share`'s entries in the forward's stored tensors
 
 
 @dataclass(frozen=True)
@@ -63,9 +71,10 @@ class AttentionConfig(StrategyConfig):
     key_offset: float = 0.0  # share of each head's key pairs from the previous token, and as many from the next
     score_cap: float = 0.0  # tanh cap on the scaled scores; 0 is off
     local_every: int = 0  # blocks whose index modulo this is not 0 attend locally; 0 is all global
+    kv_share: int = 0  # blocks whose index modulo this is not 0 reuse the group's first K and V; 0 shares none
     VARIANTS: ClassVar[tuple[str, ...]] = ("standard", "differential", "triangle", "triangle_differential", "paired")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"heads": (6, 12), "key_offset": (0.0, 0.5),  # d_h of 128 to 64
-                                                        "score_cap": (0.0, 8.0), "local_every": (0, 3)}
+                                                        "score_cap": (0.0, 8.0), "local_every": (0, 3), "kv_share": (0, 3)}
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -75,10 +84,16 @@ class AttentionConfig(StrategyConfig):
             raise ValueError(f"score_cap is 0 (off) or 3 to 8, not {self.score_cap}")
         if self.local_every not in (0, 2, 3):
             raise ValueError(f"local_every is 0 (off), 2 or 3, not {self.local_every!r}")
+        if self.kv_share not in (0, 2, 3):
+            raise ValueError(f"kv_share is 0 (off), 2 or 3, not {self.kv_share!r}")
 
     def local(self, index: int) -> bool:
         """True for a block that attends within LOCAL_REACH only."""
         return self.local_every > 0 and index % self.local_every != 0
+
+    def borrows_kv(self, index: int) -> bool:
+        """True for a block that reuses its group's first K and V and has no key or value projection."""
+        return self.kv_share > 0 and index % self.kv_share != 0
 
 
 def split_rotation_pairs(X: Tensor) -> tuple[Tensor, Tensor]:
@@ -136,8 +151,10 @@ class Attention(nn.Module):
         self.d_h = d // config.heads
         query_heads = 2 * config.heads if config.variant in DIFFERENTIAL else config.heads
         self.query = nn.Linear(d, query_heads * self.d_h, bias=False)
-        self.key = nn.Linear(d, d, bias=False)
-        self.value = nn.Linear(d, d, bias=False)
+        self.borrows_kv = config.borrows_kv(index)  # no key or value projection: the group's first block lends them
+        self.lends_kv = config.kv_share > 0 and not self.borrows_kv
+        self.key: nn.Linear | None = None if self.borrows_kv else nn.Linear(d, d, bias=False)
+        self.value: nn.Linear | None = None if self.borrows_kv else nn.Linear(d, d, bias=False)
         self.output = nn.Linear(d, d, bias=False)
         if config.variant in DIFFERENTIAL:
             self.differential_lambda = nn.Linear(d, config.heads, bias=False)  # zero-initialized by the strategy
@@ -161,11 +178,17 @@ class Attention(nn.Module):
         # X: (b, l, d), the normalized stream; returns (b, l, d).
         b, l, d = X.shape
         Q = norm(self.query(X).view(b, l, -1, self.d_h))  # (b, l, q, d_h)
-        K = self.key(X).view(b, l, self.heads, self.d_h)  # (b, l, h, d_h), raw
-        for hook in self.key_hooks:
-            K = hook.keys(self.index, K, context)  # (b, l, h, d_h)
-        K = norm(K)  # (b, l, h, d_h)
-        V = self.value(X).view(b, l, self.heads, self.d_h)  # (b, l, h, d_h)
+        if self.borrows_kv:
+            K, V = context.stored[SHARED_KEYS], context.stored[SHARED_VALUES]  # (b, l, h, d_h) each
+        else:
+            assert self.key is not None and self.value is not None
+            K = self.key(X).view(b, l, self.heads, self.d_h)  # (b, l, h, d_h), raw
+            for hook in self.key_hooks:
+                K = hook.keys(self.index, K, context)  # (b, l, h, d_h)
+            K = norm(K)  # (b, l, h, d_h)
+            V = self.value(X).view(b, l, self.heads, self.d_h)  # (b, l, h, d_h)
+            if self.lends_kv:  # before RoPE and the value hooks, which each block applies by its own rule
+                context.stored[SHARED_KEYS], context.stored[SHARED_VALUES] = K, V
         if self.rotate:
             Q, K = self.rotary(Q), self.rotary(K)  # (b, l, q, d_h), (b, l, h, d_h)
         for hook in self.query_hooks:

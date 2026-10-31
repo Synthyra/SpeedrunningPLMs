@@ -10,6 +10,13 @@ turns the cooldown off: the loop asks for the multiplier without it, so the plat
 Muon's momentum ends its warmup at `momentum` (0.95 in the record; the short-run file's `momentum_end`, Kosson et al.
 2024, arXiv 2410.23922, holds 0.98 there) and moves linearly to `momentum_cooldown_end` over the cooldown, so a high
 plateau can taper back before the end; at the record's 0.95 for both, nothing changes.
+
+`muon_late_scale` (1 is off; a lead from the round-7 scouts, no source read): Muon's learning rate alone gains a factor
+that rises linearly from 1 at `muon_late_start` of the clock to `muon_late_scale` at its end, on top of the shared
+schedule, so Muon's cooldown is wider than the AdamW groups' (it still ends at `final_lr_ratio` times the factor, 0 in
+the record). The factor is a Python float on Muon's param groups, set by the loop each step like the rate itself, so
+it costs no compile. The longer the run, the more of the factor falls on steps that matter, so it is aimed at the
+1-hour track.
 """
 
 from __future__ import annotations
@@ -30,11 +37,13 @@ class ScheduleConfig(StrategyConfig):
     momentum_start: float = 0.85
     momentum_warmup: float = 0.15  # share of the budget
     momentum_cooldown_end: float = 0.95  # Muon's momentum at the end of the cooldown
+    muon_late_scale: float = 1.0  # Muon's learning-rate factor at the end of the clock; 1 is off
+    muon_late_start: float = 0.8  # the share of the clock where the factor starts to rise from 1
     VARIANTS: ClassVar[tuple[str, ...]] = ("trapezoid", "one_sqrt")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {
         "warmup_fraction": (0.0, 0.1), "cooldown_fraction": (0.1, 0.8), "final_lr_ratio": (0.0, 0.3),
         "momentum": (0.85, 0.99), "momentum_start": (0.7, 0.98), "momentum_warmup": (0.01, 0.4),
-        "momentum_cooldown_end": (0.85, 0.995),
+        "momentum_cooldown_end": (0.85, 0.995), "muon_late_scale": (1.0, 3.0), "muon_late_start": (0.5, 0.95),
     }
 
     def cooldown_share(self, progress: float) -> float:
@@ -66,3 +75,14 @@ class Schedule(Strategy):
             return config.momentum + config.cooldown_share(progress) * (config.momentum_cooldown_end - config.momentum)
         phase = min(1.0, progress / config.momentum_warmup)
         return config.momentum_start + phase * (config.momentum - config.momentum_start)
+
+    @property
+    def widens_muon(self) -> bool:
+        """True when Muon's learning rate gets the late factor; the record's loop never multiplies by it."""
+        return self.config.muon_late_scale != 1.0
+
+    def muon_lr_factor(self, progress: float) -> float:
+        """Muon's extra learning-rate factor: 1 until `muon_late_start`, then linear to `muon_late_scale` at the end."""
+        config = self.config
+        share = min(1.0, max(0.0, (progress - config.muon_late_start) / (1 - config.muon_late_start)))
+        return 1 + share * (config.muon_late_scale - 1)

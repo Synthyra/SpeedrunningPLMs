@@ -164,8 +164,8 @@ class Residual(Strategy):
         reads = [model.embedding.weight, model.head.weight]  # type: ignore[union-attr]
         writes: list[Tensor] = []
         for block in model.blocks:  # type: ignore[union-attr]
-            reads += [block.attention.query.weight, block.attention.key.weight, block.attention.value.weight,
-                      block.mlp.up.weight]
+            reads += [linear.weight for linear in (block.attention.query, block.attention.key, block.attention.value,
+                                                   block.mlp.up) if linear is not None]  # no K or V under `kv_share`
             writes += [block.attention.output.weight, block.mlp.down.weight]
         for W in reads:
             unit_rows(W, dim=1)  # rows of (out, d)

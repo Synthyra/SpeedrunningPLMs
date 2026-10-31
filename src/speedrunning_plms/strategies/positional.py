@@ -24,6 +24,12 @@ binned over log2 from 32 to 2,048 tokens. A protein the window cuts counts its v
 can reach; the evaluator's proteins are whole. The table starts at zero and is built from zeros, so step 0 and the
 record's initialization are unchanged; AdamW at the embedding rate. The idea's terminus-distance tables are left out.
 
+`terminus` (the same idea's terminus tokens; 0 is off, 1 on): a learned N-terminus vector added to the embedding of a
+protein's first residue (the token after CLS) and a C-terminus vector to its last (the token before EOS), whatever
+the token there is, MASK included; a protein the window cuts gets a marker only at the end the window holds. Both
+vectors are built from zeros, AdamW at the embedding rate. Attention already reaches CLS and EOS at distance 1, so the
+prior is cheap and may be redundant.
+
 Symbols: b windows or proteins, l tokens, h heads, d_h per-head width, k attention heads a kernel runs.
 """
 
@@ -31,6 +37,7 @@ from __future__ import annotations
 
 import math
 import torch
+import torch.nn.functional as F
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -56,10 +63,11 @@ class PositionalConfig(StrategyConfig):
     nope_every: int = 0  # every k-th block skips RoPE; 0 rotates every block
     periodic_scale: float = 0.0  # the helix and strand term's weight on the scores; 0 is off
     length_bins: int = 0  # log-length bins of the protein added to its embeddings; 0 is off
+    terminus: int = 0  # 1 adds learned N- and C-terminus vectors at a protein's first and last residues
     VARIANTS: ClassVar[tuple[str, ...]] = ("none", "alibi")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"rope_base": (1_000.0, 1_000_000.0), "slope_scale": (0.25, 4.0),
                                                         "rope_fraction": (0.1, 1.0), "nope_every": (0, 6),
-                                                        "periodic_scale": (0.0, 1.0), "length_bins": (0, 16)}
+                                                        "periodic_scale": (0.0, 1.0), "length_bins": (0, 16), "terminus": (0, 1)}
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -67,6 +75,17 @@ class PositionalConfig(StrategyConfig):
             raise ValueError(f"nope_every must be an integer, not {self.nope_every!r}")
         if self.length_bins not in (0, 8, 16):
             raise ValueError(f"length_bins is 0 (off), 8 or 16, not {self.length_bins!r}")
+        if self.terminus not in (0, 1):
+            raise ValueError(f"terminus is 0 (off) or 1, not {self.terminus!r}")
+
+
+def terminus_positions(input_ids: Tensor) -> tuple[Tensor, Tensor]:
+    """Each protein's first residue (the token after CLS) and last residue (the token before EOS)."""
+    # input_ids: (b, l); returns two (b, l) bool.
+    special = (input_ids == benchmark.CLS_ID) | (input_ids == benchmark.EOS_ID) | (input_ids == benchmark.PAD_ID)  # (b, l)
+    after_cls = F.pad(input_ids[:, :-1] == benchmark.CLS_ID, (1, 0), value=False)  # (b, l)
+    before_eos = F.pad(input_ids[:, 1:] == benchmark.EOS_ID, (0, 1), value=False)  # (b, l)
+    return after_cls & ~special, before_eos & ~special  # (b, l) each
 
 
 def length_bins(input_ids: Tensor, bins: int) -> Tensor:
@@ -127,21 +146,30 @@ class Positional(Strategy):
         bins = self.config.length_bins
         if bins:
             holder.length_table = nn.Embedding(bins, benchmark.HIDDEN, _weight=torch.zeros(bins, benchmark.HIDDEN))  # (bins, d)
+        if self.config.terminus:
+            holder.terminus = nn.Parameter(torch.zeros(2, benchmark.HIDDEN))  # (2, d): the N- and C-terminus vectors
         model.extensions[self.family] = holder  # type: ignore[index]
 
     def overrides(self, hook: str) -> bool:
-        return hook == "embed" and self.config.length_bins > 0
+        return hook == "embed" and (self.config.length_bins > 0 or self.config.terminus > 0)
 
     def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
-        if not self.config.length_bins:
+        holder = extension(model, self.family)
+        tables = ([holder.length_table.weight] if self.config.length_bins else []) + ([holder.terminus] if self.config.terminus else [])
+        if not tables:
             return []
-        table = extension(model, self.family).length_table.weight  # (bins, d)
-        return [ParameterGroup("length_table", [table], "adam", model.strategies.optimizer.config.embed_lr)]  # type: ignore[union-attr]
+        return [ParameterGroup("input_priors", tables, "adam", model.strategies.optimizer.config.embed_lr)]  # type: ignore[union-attr]
 
     def embed(self, model: nn.Module, input_ids: Tensor, X: Tensor) -> Tensor:
         # input_ids: (b, l); X: (b, l, d).
-        table = extension(model, self.family).length_table  # (bins, d)
-        return X + table(length_bins(input_ids, self.config.length_bins))  # (b, l, d)
+        holder = extension(model, self.family)
+        if self.config.length_bins:
+            X = X + holder.length_table(length_bins(input_ids, self.config.length_bins))  # (b, l, d)
+        if self.config.terminus:
+            first, last = terminus_positions(input_ids)  # (b, l) each
+            N, C = holder.terminus.to(X.dtype)  # (d,) each
+            X = X + first[..., None].to(X.dtype) * N + last[..., None].to(X.dtype) * C  # (b, l, d)
+        return X  # (b, l, d)
 
     def rotary(self, model: nn.Module) -> Rotary:
         return extension(model, self.family).rotary  # type: ignore[return-value]

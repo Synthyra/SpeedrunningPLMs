@@ -97,7 +97,9 @@ SPACE: tuple[Dimension, ...] = (
     # Numbers whose 0 is off, as choices with 0 first, so a draw can leave them off.
     Dimension("positional.periodic_scale", (0.0, 0.25, 0.5, 1.0)),
     Dimension("positional.length_bins", (0, 8, 16)),
+    Dimension("positional.terminus", (0, 1)),
     Dimension("attention.local_every", (0, 2, 3)),
+    Dimension("attention.kv_share", (0, 2, 3)),
     Dimension("attention.key_offset", (0.0, 0.125, 0.25, 0.5)),
     Dimension("attention.score_cap", (0.0, 4.0, 5.0, 6.0, 8.0)),
     Dimension("kernel.variant", ("default", "flash", "cudagraphs")),
@@ -113,6 +115,11 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("latent.variant", ("none", "next_layer", "neighbors")),
     Dimension("latent.source_block", low=6, high=30, integer=True),
     Dimension("latent.weight", low=0.01, high=0.5, log=True),
+    Dimension("grouping.variant", ("none", "physchem")),
+    Dimension("grouping.weight", low=0.02, high=0.5, log=True),
+    Dimension("grouping.until", low=0.1, high=0.8),
+    Dimension("memory.variant", ("none", "product_keys")),
+    Dimension("memory.block", low=6, high=30, integer=True),
     Dimension("stream.variant", ("single", "hyper", "dense", "attention_residual")),
     Dimension("stream.streams", low=2, high=4, integer=True),
     Dimension("unet.variant", ("none", "mirrored")),
@@ -150,6 +157,8 @@ SPACE: tuple[Dimension, ...] = (
     Dimension("schedule.momentum_start", low=0.85, high=0.95),
     Dimension("schedule.momentum", low=0.95, high=0.99),  # the momentum at the end of its warmup ramp
     Dimension("schedule.momentum_cooldown_end", low=0.95, high=0.995),
+    Dimension("schedule.muon_late_scale", (1.0, 1.5, 2.0, 3.0)),  # 1 is off
+    Dimension("schedule.muon_late_start", low=0.6, high=0.95),
     Dimension("batch.variant", ("packed", "whole")),
     Dimension("batch.window", (1024, 2048)),  # the count follows (`batch.windows_per_step` 0): 65,536 tokens a step
     Dimension("regularization.variant", ("none", "early_dropout")),
@@ -252,6 +261,13 @@ SWITCHES: dict[str, dict[str, dict[str, Any]]] = {
     "plateau_restart": {"ema": {"variant": "plateau_restart"}},
     "early_dropout": {"regularization": {"variant": "early_dropout"}},
     "length_bins": {"positional": {"length_bins": 16}},
+    # Round 7, aimed at the 1-hour track: a product-key memory, cross-layer K and V, the residue-group loss, the
+    # terminus vectors, Muon's late widening.
+    "product_keys": {"memory": {"variant": "product_keys"}},
+    "kv_share_2": {"attention": {"kv_share": 2}},
+    "grouping": {"grouping": {"variant": "physchem"}},
+    "terminus": {"positional": {"terminus": 1}},
+    "muon_late_2": {"schedule": {"muon_late_scale": 2.0}},
 }
 BACKPROP_FREE_SWITCHES = ("residual_es", "readout_warmstart", "unit_select", "readout_boost", "unit_route")
 
@@ -303,14 +319,24 @@ COMPILE_SECONDS: dict[str, float] = {
     "neighbor.variant=bigram_table": 10.0,  # a gather, a sigmoid and an add after the last block
     "neighbor.variant=trigram_table": 10.0,
     "optimizer.fused_polar=1": 20.0,  # Polar Express compiled at the three bank shapes, outside the model's graph
-    # Round 5. Attention Residuals: 666 weighted terms over the 37 values, elementwise and fused, in forward and backward.
-    "stream.variant=attention_residual": 25.0,
+    # Round 5. Attention Residuals: pilot8_01 alone on confirm1_01 warmed up in 223 s against 114 to 137 s for the other
+    # pilot8 runs with fresh graphs, about 100 s of its own (the 666 weighted terms over the 37 values); 110 s keeps it
+    # out of any genome that carries another compile cost.
+    "stream.variant=attention_residual": 110.0,
     # The local blocks' second flex kernel pair (a mask rule traced into the kernel) and the local mask's build; the
     # catalog's second-mask cost is 20 to 50 s, the triangle's two masks with its other changes 46 s.
     "attention.local_every!=0": 30.0,
     "kernel.variant=cudagraphs": 10.0,  # graph-tree recording of the forward, backward and no-grad forward a shape
     "regularization.variant=early_dropout": 10.0,  # a draw, a compare and a scale on each sublayer output
-    "positional.length_bins!=0": 5.0,  # a scatter, a gather and a table add once, at the embedding
+    "positional.length_bins!=0": 5.0,  # a scatter, a gather and a table add once, at the embedding (pilot8: 119 s warmup)
+    # Round 7, estimates: the memory's query matmul, two top-k, the candidate sums and an embedding bag at one block,
+    # with its backward scatter (the idea file's 10 to 20 s, at the top); the group head is one more auxiliary graph
+    # (next_layer's measured 1 s, so 10 is conservative); the terminus vectors are two masked adds at the embedding, as
+    # cheap as the length table. `attention.kv_share` drops matmuls from an unchanged graph and `schedule.muon_late_*`
+    # is a float on Muon's groups: no entry.
+    "memory.variant=product_keys": 20.0,
+    "grouping.variant=physchem": 10.0,
+    "positional.terminus!=0": 5.0,
     # No entry, since they run eagerly outside any compiled graph: the loss family (`training_loss`), the cooldown's
     # momentum and beta2 (floats on the param groups), and the constant-timescale decay (a foreach multiply).
 }

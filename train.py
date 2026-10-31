@@ -130,7 +130,8 @@ class Candidate(nn.Module):
         nn.init.normal_(self.head.weight, std=0.02)  # (v, d)
         for block in self.blocks:
             for linear in (block.attention.query, block.attention.key, block.attention.value, block.mlp.up):
-                nn.init.normal_(linear.weight, std=0.02)  # (d or 2d, d) or (f, d)
+                if linear is not None:  # a block that borrows K and V (`attention.kv_share`) has no projections for them
+                    nn.init.normal_(linear.weight, std=0.02)  # (d or 2d, d) or (f, d)
             nn.init.zeros_(block.attention.output.weight)  # (d, d): a block starts as the identity
             nn.init.zeros_(block.mlp.down.weight)  # (d, f)
 
@@ -460,8 +461,10 @@ def main() -> None:
         for optimizer, lrs in zip(optimizers, base_lrs, strict=True):
             for group, base_lr in zip(optimizer.param_groups, lrs, strict=True):
                 group["lr"] = base_lr * scale
-                if "momentum" in group:
+                if "momentum" in group:  # Muon's groups
                     group["momentum"] = schedule.momentum(progress)
+                    if schedule.widens_muon:
+                        group["lr"] *= schedule.muon_lr_factor(progress)
         for optimizer in optimizers:
             optimizer.step()
         model.zero_grad(set_to_none=True)

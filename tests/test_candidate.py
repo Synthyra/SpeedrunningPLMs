@@ -60,7 +60,8 @@ def test_baseline_genome_is_000_with_every_strategy_off() -> None:
         ("trapezoid", recipe.warmup_fraction, recipe.cooldown_fraction, recipe.final_lr_ratio)
     assert (schedule["momentum"], schedule["momentum_start"], schedule["momentum_warmup"], schedule["momentum_cooldown_end"]) == \
         (recipe.muon_momentum, recipe.muon_momentum_start, recipe.muon_momentum_warmup, recipe.muon_momentum)
-    assert genome["attention"] == {"variant": "standard", "heads": recipe.heads, "key_offset": 0.0, "score_cap": 0.0, "local_every": 0}
+    assert genome["attention"] == {"variant": "standard", "heads": recipe.heads, "key_offset": 0.0, "score_cap": 0.0, "local_every": 0,
+                                   "kv_share": 0}
     assert batch["variant"] == "packed" and batch["window"] == recipe.window
     assert Strategies(genome).batch.step_tokens == recipe.window * recipe.windows_per_step  # 64 windows of 1,024
     switched_on = {"positional": "alibi", "attention": "standard", "kernel": "default", "residual": "prenorm", "stream": "single",
@@ -72,6 +73,7 @@ def test_baseline_genome_is_000_with_every_strategy_off() -> None:
     assert genome["residual"]["branch_multiplier"] == 1.0 and genome["residual"]["branch_ramp"] == 0.0
     assert genome["loss"]["z_weight"] == 0.0 and optimizer["cautious_weight_decay"] == 0.0 and optimizer["decay_timescale"] == 0.0
     assert genome["positional"]["periodic_scale"] == 0.0 and genome["positional"]["length_bins"] == 0
+    assert genome["positional"]["terminus"] == 0 and schedule["muon_late_scale"] == 1.0
     assert genome["positional"]["nope_every"] == 0 and genome["positional"]["rope_fraction"] == 1.0
 
 

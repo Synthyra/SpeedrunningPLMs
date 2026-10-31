@@ -24,7 +24,8 @@ snapshotted under `candidates/`.
 | 7 | 2.7291 | 3.937 | 2.7319 | 1,994 | a value residual: every block's values mixed with the first block's, V = a V_l + (1 - a) V_0 with a learned scalar a per block from 0.5 (ResFormer); the gain is on long proteins, 0.025 nats over 500 residues | [`028_value_residual.py`](candidates/028_value_residual.py) |
 | 8 | 2.7175 | 3.921 | 2.7217 | 2,147 | the first screen's best row on 7: 6 heads of 128 instead of 12 of 64, value embeddings on blocks 0 to 2 and 33 to 35, no softcap, doubled local slopes, U-net skips and a tail weight average | [`screen1_05.json`](genomes/screen1_05.json) |
 | 9 | 2.7119 | 3.912 | 2.7177 | 2,148 | the screen's five helpful switches together on 7: 6 heads of 128, value embeddings, RoPE base 100,000, unit selection (only the more active half of the MLP units get gradients each step) and no softcap | [`confirm1_01.json`](genomes/confirm1_01.json) |
-| 10 | **2.7078** | 3.907 | 2.7146 | 2,149 | 9 with the shared-head readout warm start in place of unit selection: early in the run the head also reads the stream after every sixth block, so the blocks learn from a signal that does not wait for the end-to-end gradient; the Gaussian process proposed it and the single-switch batch found the same genome at 2.7147 | [`bayes2_01.json`](genomes/bayes2_01.json) |
+| 10 | 2.7078 | 3.907 | 2.7146 | 2,149 | 9 with the shared-head readout warm start in place of unit selection: early in the run the head also reads the stream after every sixth block, so the blocks learn from a signal that does not wait for the end-to-end gradient; the Gaussian process proposed it and the single-switch batch found the same genome at 2.7147 | [`bayes2_01.json`](genomes/bayes2_01.json) |
+| 11 | **2.7067** | 3.905 | 2.7133 | 2,104 | 10 with the third single-switch batch's three gains stacked: LN scaling (each block's normalized input scaled by 1/sqrt(block index + 1), arXiv 2502.05795), the sublayer outputs faded in over the first 10 percent of the clock, and a two-layer head; each alone was 0.0005 to 0.0009 under 10 on `val_select`, together 0.0013, all inside one seed's band and kept by the rule | [`single3_04.json`](genomes/single3_04.json) |
 
 ![The selection curves of every candidate and the record progression](assets/selection_curves.png)
 
@@ -48,7 +49,7 @@ reference models gain on long proteins, so use of context is what the short cloc
 | Model | Parameters | `val_select` | Validation | Test loss | Bits | Accuracy | F1 macro | MCC | ROC AUC | PR AUC |
 |---|---|---|---|---|---|---|---|---|---|---|
 | unigram floor | | 2.8934 | 2.8938 | 2.8933 | 4.174 | 0.098 | 0.009 | 0.000 | 0.500 | 0.050 |
-| **record, 10 min** | 198,383,652 | 2.7146 | 2.7105 | 2.7078 | 3.907 | 0.160 | 0.123 | 0.094 | 0.663 | 0.126 |
+| **record, 10 min** | 198,975,780 | 2.7133 | 2.7092 | 2.7067 | 3.905 | 0.161 | 0.125 | 0.095 | 0.663 | 0.127 |
 | ESM2 8M | 7,523,034 | 2.6393 | 2.6291 | 2.6253 | 3.788 | 0.186 | 0.157 | 0.124 | 0.695 | 0.157 |
 | ESM2 35M | 33,517,234 | 2.5164 | 2.4965 | 2.4992 | 3.606 | 0.225 | 0.206 | 0.168 | 0.735 | 0.208 |
 | ESM2 150M | 148,161,274 | 2.3490 | 2.3176 | 2.3303 | 3.362 | 0.275 | 0.267 | 0.224 | 0.780 | 0.275 |
@@ -140,7 +141,7 @@ What the campaign has learned so far:
 ## The genome and the search
 
 A genome is a JSON file of family choices; what it leaves out takes the default, so an empty genome is 022 (bit for bit
-on a CPU smoke), and the record is [`genomes/bayes2_01.json`](genomes/bayes2_01.json). A genome reads:
+on a CPU smoke), and the record is [`genomes/single3_04.json`](genomes/single3_04.json). A genome reads:
 
 ```json
 {"schema": 1, "families": {"attention": {"variant": "triangle"}, "stream": {"variant": "hyper"}, "optimizer": {"muon_lr": 0.05}}}

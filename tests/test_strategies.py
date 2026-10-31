@@ -29,10 +29,13 @@ from speedrunning_plms.strategies.batch import Batch, BatchConfig, best_fit
 from speedrunning_plms.strategies.curriculum import Curriculum, CurriculumConfig
 from speedrunning_plms.strategies.ema import Ema, EmaConfig
 from speedrunning_plms.strategies.kernel import Kernel, KernelConfig
+from speedrunning_plms.benchmark.tokens import STANDARD_RESIDUES
+from speedrunning_plms.strategies import memory as memory_module
+from speedrunning_plms.strategies.grouping import GROUP_OF_CLASS, GROUPS, group_labels
 from speedrunning_plms.strategies.loss import Loss, LossConfig, residue_scores
 from speedrunning_plms.strategies.neighbor import pair_index, trigram_index
 from speedrunning_plms.strategies.optimizer import Muon, OptimizerChoice, OptimizerConfig, amuse_beta, polar_express
-from speedrunning_plms.strategies.positional import Positional, PositionalConfig, Rotary, length_bins, periodic_term
+from speedrunning_plms.strategies.positional import Positional, PositionalConfig, Rotary, length_bins, periodic_term, terminus_positions
 from speedrunning_plms.strategies.schedule import Schedule, ScheduleConfig
 from speedrunning_plms.strategies.strategy import HOOKS, ForwardContext, StepState
 
@@ -100,6 +103,11 @@ COMPOSED = [
      "positional": {"length_bins": 8}, "kernel": {"variant": "cudagraphs"}},
     {"attention": {"variant": "paired", "local_every": 3}, "regularization": {"variant": "early_dropout", "rate": 0.2},
      "positional": {"variant": "none", "length_bins": 16}, "residual": {"variant": "ngpt"}},
+    {"attention": {"variant": "differential", "kv_share": 2, "local_every": 3}, "value_residual": {"variant": "first_block"},
+     "positional": {"terminus": 1, "length_bins": 8, "nope_every": 3}, "memory": {"variant": "product_keys", "block": 5},
+     "grouping": {"variant": "physchem", "weight": 0.3}, "schedule": {"muon_late_scale": 2.0, "muon_late_start": 0.6}},
+    {"attention": {"variant": "paired", "kv_share": 3}, "residual": {"variant": "ngpt"}, "value_embeddings": {"variant": "ends"},
+     "memory": {"variant": "product_keys", "block": 1}},
 ]
 
 
@@ -160,7 +168,9 @@ def test_every_variant_builds_and_trains_a_cpu_step(family: str, variant: str) -
                                                    "differential-offset-cap-periodic-alone-leap",
                                                    "losses-trigram-timescale-beta2-momentum-hyper",
                                                    "attention-residual-local-triangle-restart-dropout-length",
-                                                   "paired-local-dropout-length-ngpt"])
+                                                   "paired-local-dropout-length-ngpt",
+                                                   "differential-kv2-local-terminus-memory-grouping-muon-late",
+                                                   "paired-kv3-ngpt-value-tables-memory"])
 def test_composed_genomes_train_a_cpu_step(changes: dict[str, dict[str, Any]]) -> None:
     one_cpu_step(with_changes(changes))
 
@@ -406,6 +416,79 @@ def test_length_bins_count_each_proteins_tokens_without_padding() -> None:
     model = load_train().build_candidate(with_changes({"positional": {"variant": "none", "length_bins": 16}}), max_tokens=64)
     assert [strategy.family for strategy in model.strategies.hooked("embed")] == ["positional"]
     assert not model.extensions["positional"].length_table.weight.any()
+
+
+def test_product_key_memory_reads_the_exact_top_rows_and_starts_silent() -> None:
+    train = load_train()
+    input_ids = torch.randint(4, 24, (2, 16))  # (b, l)
+    input_ids[:, 0] = benchmark.CLS_ID
+    mask = document_dense_mask(input_ids)  # (b, 1, l, l)
+    outputs = []
+    for genome in (default_genome(), with_changes({"memory": {"variant": "product_keys", "block": 3}})):
+        torch.manual_seed(0)
+        model = train.build_candidate(genome, max_tokens=64)
+        with torch.no_grad():
+            outputs.append(model(input_ids, dense_mask=mask))  # (b, l, v)
+    assert torch.equal(outputs[0], outputs[1])  # built empty, drawn after the record, values at zero
+    assert benchmark.check_architecture(model)["blocks"] == 36
+    memory = model.strategies.memory.memory
+    with torch.no_grad():
+        memory.values.normal_()
+        X = torch.randn(1, 3, benchmark.HIDDEN)  # (1, 3, d)
+        read = memory(X)[0]  # (3, d)
+        Q = (X[0] @ memory.query.T).view(3, 2, -1)  # (3, 2, d / 2)
+        half = torch.einsum("nhe,hse->nhs", Q, memory.keys)  # (3, 2, s)
+        every = (half[:, 0, :, None] + half[:, 1, None, :]).flatten(1)  # (3, s^2), every row's score
+        best, rows = every.topk(memory_module.TOP, dim=-1)  # (3, t) each
+        expected = (torch.softmax(best, -1)[..., None] * memory.values[rows]).sum(1)  # (3, d)
+    assert torch.allclose(read, expected, atol=1e-4)
+
+
+def test_borrowing_blocks_reuse_the_lenders_keys_and_values() -> None:
+    torch.manual_seed(0)
+    model = load_train().build_candidate(with_changes({"attention": {"kv_share": 2}}), max_tokens=64)
+    record = load_train().build_candidate(default_genome(), max_tokens=64)
+    lender, borrower = model.blocks[0].attention, model.blocks[1].attention
+    assert lender.lends_kv and borrower.borrows_kv and borrower.key is None and borrower.value is None
+    assert benchmark.check_architecture(record)["parameters"] - benchmark.check_architecture(model)["parameters"] == 18 * 2 * 768**2
+    with torch.no_grad():
+        borrower.query.weight.copy_(lender.query.weight)
+        lender.output.weight.normal_(std=0.02)
+        borrower.output.weight.copy_(lender.output.weight)
+    input_ids = torch.randint(4, 24, (2, 16))  # (b, l)
+    input_ids[:, 0] = benchmark.CLS_ID
+    context = ForwardContext(input_ids, None, document_dense_mask(input_ids))
+    X = torch.randn(2, 16, benchmark.HIDDEN)  # (b, l, d)
+    with torch.no_grad():
+        lent = lender(X, context)  # (b, l, d), stores its K and V
+        assert set(context.stored) >= {"shared_keys", "shared_values"}
+        assert torch.equal(borrower(X, context), lent)  # the same queries read the lender's K and V
+
+
+def test_group_loss_terminus_vectors_and_muon_widening() -> None:
+    assert [GROUPS[group] for group in GROUP_OF_CLASS.tolist()][STANDARD_RESIDUES.index("K")] == "KRH"
+    assert sorted("".join(GROUPS)) == sorted(STANDARD_RESIDUES)
+    labels = torch.tensor([[benchmark.IGNORE_LABEL, 0, 8, benchmark.IGNORE_LABEL]])  # (1, 4): A and K
+    assert group_labels(labels).tolist() == [[benchmark.IGNORE_LABEL, 0, 2, benchmark.IGNORE_LABEL]]
+    torch.manual_seed(0)
+    model = load_train().build_candidate(with_changes({"grouping": {"variant": "physchem", "weight": 0.2, "until": 0.5}}), max_tokens=64)
+    grouping = model.strategies.grouping
+    states = [torch.randn(1, 4, benchmark.HIDDEN)] * (benchmark.BLOCKS + 1)  # (1, 4, d) each
+    context = ForwardContext(torch.zeros(1, 4, dtype=torch.long), None, None)
+    assert torch.allclose(grouping.auxiliary_loss(model, states, labels, context), torch.tensor(0.2 * 2 * math.log(6.0)))
+    grouping.after_step(StepState(model, 9, 0.25, 1.0, torch.zeros(1), torch.zeros(1), lambda: torch.zeros(())))
+    assert grouping.holder.weight.item() == pytest.approx(0.1)
+    input_ids = torch.tensor([[benchmark.CLS_ID, 5, 6, 7, benchmark.EOS_ID, benchmark.CLS_ID, 8, benchmark.EOS_ID, 9]])  # (1, 9)
+    first, last = terminus_positions(input_ids)  # (1, 9) each
+    assert first[0].nonzero().flatten().tolist() == [1, 6] and last[0].nonzero().flatten().tolist() == [3, 6]
+    model = load_train().build_candidate(with_changes({"positional": {"terminus": 1}}), max_tokens=64)
+    with torch.no_grad():
+        model.extensions["positional"].terminus.copy_(torch.stack([torch.ones(benchmark.HIDDEN), 2 * torch.ones(benchmark.HIDDEN)]))
+    added = model.strategies.positional.embed(model, input_ids, torch.zeros(1, 9, benchmark.HIDDEN))[0, :, 0]  # (9,)
+    assert added.tolist() == [0, 1, 0, 2, 0, 0, 3, 0, 0]
+    record, widened = Schedule(ScheduleConfig()), Schedule(ScheduleConfig(muon_late_scale=2.0, muon_late_start=0.8))
+    assert not record.widens_muon and widened.widens_muon
+    assert [widened.muon_lr_factor(progress) for progress in (0.5, 0.8, 0.9, 1.0)] == pytest.approx([1.0, 1.0, 1.5, 2.0])
 
 
 def test_neighbor_heads_score_only_visible_residues_at_masked_positions() -> None:

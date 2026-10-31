@@ -24,11 +24,13 @@ from speedrunning_plms.strategies.curriculum import Curriculum
 from speedrunning_plms.strategies.ema import Ema
 from speedrunning_plms.strategies.embedding_mix import EmbeddingMix
 from speedrunning_plms.strategies.gates import Gates
+from speedrunning_plms.strategies.grouping import Grouping
 from speedrunning_plms.strategies.head import Head
 from speedrunning_plms.strategies.kernel import Kernel
 from speedrunning_plms.strategies.latent import Latent
 from speedrunning_plms.strategies.logit_scale import LogitScale
 from speedrunning_plms.strategies.loss import Loss
+from speedrunning_plms.strategies.memory import Memory
 from speedrunning_plms.strategies.neighbor import Neighbor
 from speedrunning_plms.strategies.optimizer import OptimizerChoice
 from speedrunning_plms.strategies.positional import Positional
@@ -49,8 +51,8 @@ GENOME_SCHEMA = 1
 # latent loss act alone at their points, and the logit scale is the only query hook.
 FAMILIES: dict[str, type[Strategy]] = {strategy.family: strategy for strategy in (
     Positional, AttentionKernel, Kernel, LogitScale, Neighbor, ValueEmbeddings, ValueResidual, Gates, UNet, EmbeddingMix,
-    Residual, StreamMixer, Activation, Regularization, Head, Softcap, Loss, OptimizerChoice, Schedule, Batch, Curriculum, Ema,
-    BackpropFree, Latent,
+    Memory, Residual, StreamMixer, Activation, Regularization, Head, Softcap, Loss, OptimizerChoice, Schedule, Batch,
+    Curriculum, Ema, BackpropFree, Latent, Grouping,
 )}
 
 Genome = dict[str, dict[str, Any]]  # family -> its config's fields
