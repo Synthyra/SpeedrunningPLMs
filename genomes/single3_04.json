@@ -1,0 +1,30 @@
+{
+  "families": {
+    "attention": {
+      "heads": 6
+    },
+    "backprop_free": {
+      "variant": "readout_warmstart"
+    },
+    "head": {
+      "variant": "two_layer"
+    },
+    "positional": {
+      "rope_base": 100000.0
+    },
+    "residual": {
+      "branch_ramp": 0.1,
+      "variant": "ln_scaling"
+    },
+    "softcap": {
+      "variant": "none"
+    },
+    "value_embeddings": {
+      "variant": "ends"
+    },
+    "value_residual": {
+      "variant": "first_block"
+    }
+  },
+  "schema": 1
+}

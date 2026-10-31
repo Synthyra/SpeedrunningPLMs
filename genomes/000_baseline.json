@@ -1,0 +1,17 @@
+{
+  "families": {
+    "optimizer": {
+      "embed_lr": 0.001,
+      "head_lr": 0.0003,
+      "muon_lr": 0.02,
+      "variant": "muon"
+    },
+    "positional": {
+      "variant": "none"
+    },
+    "softcap": {
+      "variant": "none"
+    }
+  },
+  "schema": 1
+}

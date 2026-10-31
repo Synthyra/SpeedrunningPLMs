@@ -1,0 +1,20 @@
+# The image holds the package and the entry points; data, runs and notes stay on the bind mounts.
+.git/
+.github/
+.gitignore
+.cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+ideas/
+candidates/
+runs/
+data/
+*.pt
+*.parquet
+*.log
+.venv/
+venv/

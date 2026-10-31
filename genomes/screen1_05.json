@@ -1,0 +1,26 @@
+{
+  "families": {
+    "attention": {
+      "heads": 6
+    },
+    "ema": {
+      "variant": "tail"
+    },
+    "positional": {
+      "slope_scale": 2.0
+    },
+    "softcap": {
+      "variant": "none"
+    },
+    "unet": {
+      "variant": "mirrored"
+    },
+    "value_embeddings": {
+      "variant": "ends"
+    },
+    "value_residual": {
+      "variant": "first_block"
+    }
+  },
+  "schema": 1
+}

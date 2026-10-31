@@ -1,0 +1,47 @@
+{
+  "esm2_8m": {
+    "repo_id": "Synthyra/ESM2-8M",
+    "revision": "94a9e24dba85e40148fde7bf6a91a25679309ccf",
+    "official_repo_id": "facebook/esm2_t6_8M_UR50D",
+    "note": "main on 2026-10-29: the earlier pin imported RotaryEmbedding from transformers 4's modeling_esm"
+  },
+  "esm2_35m": {
+    "repo_id": "Synthyra/ESM2-35M",
+    "revision": "891dc8651029d80c944549307dd7b03c349e2e02",
+    "official_repo_id": "facebook/esm2_t12_35M_UR50D",
+    "note": "main on 2026-10-29: the earlier pin imported RotaryEmbedding from transformers 4's modeling_esm"
+  },
+  "esm2_150m": {
+    "repo_id": "Synthyra/ESM2-150M",
+    "revision": "6250eaf5b12f52501f93cc0162c7ef841a3533b6",
+    "official_repo_id": "facebook/esm2_t30_150M_UR50D",
+    "note": "main on 2026-10-29: the earlier pin imported RotaryEmbedding from transformers 4's modeling_esm"
+  },
+  "esm2_650m": {
+    "repo_id": "Synthyra/ESM2-650M",
+    "revision": "d1c5b19a14d5eca86c8a53657001bdaa9a28b94b",
+    "official_repo_id": "facebook/esm2_t33_650M_UR50D",
+    "note": "main on 2026-10-29: the earlier pin imported RotaryEmbedding from transformers 4's modeling_esm"
+  },
+  "esm2_3b": {
+    "repo_id": "Synthyra/ESM2-3B",
+    "revision": "045f6c95edb447a19dc74790d78812a1bdd2b56d",
+    "official_repo_id": "facebook/esm2_t36_3B_UR50D",
+    "note": "main on 2026-10-29: the earlier pin imported RotaryEmbedding from transformers 4's modeling_esm"
+  },
+  "esmc_small": {
+    "repo_id": "Synthyra/ESMplusplus_small",
+    "revision": "46c5f7d562e47d4c14165b424c71ab7db008e6fb",
+    "official_repo_id": "biohub/ESMC-300M"
+  },
+  "esmc_large": {
+    "repo_id": "Synthyra/ESMplusplus_large",
+    "revision": "f813401638b3fddab09748aec1ad2bf537aa4208",
+    "official_repo_id": "biohub/ESMC-600M"
+  },
+  "esmc_6b": {
+    "repo_id": "Synthyra/ESMplusplus_6B",
+    "revision": "0d579cce3b0f09efa6b3baddf6cc3fd8c9b616c8",
+    "official_repo_id": "biohub/ESMC-6B"
+  }
+}
