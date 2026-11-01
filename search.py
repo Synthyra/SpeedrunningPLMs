@@ -531,8 +531,10 @@ def perturbed(dimension: Dimension, value: Any, rng: np.random.Generator) -> Any
 
 
 def mutate(genome: Genome, space: list[Dimension], rng: np.random.Generator, rate: float) -> tuple[Genome, list[str]]:
-    """Each coordinate changes with probability `rate`; at least one always does."""
-    chosen = [dimension for dimension in space if rng.random() < rate] or [space[int(rng.integers(len(space)))]]
+    """Each active coordinate changes with probability `rate`; at least one always does. A number inert under the
+    genome's variants (`dimension_active`) is never the change, since a run would not feel it."""
+    active = [dimension for dimension in space if dimension_active(genome, dimension)]
+    chosen = [dimension for dimension in active if rng.random() < rate] or [active[int(rng.integers(len(active)))]]
     changes = {dimension.key: perturbed(dimension, read(genome, dimension.key), rng) for dimension in chosen}
     return written(genome, changes), sorted(changes)
 

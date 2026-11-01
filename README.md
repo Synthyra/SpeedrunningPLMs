@@ -184,9 +184,13 @@ tokens, 2.2 passes over the stream under fresh masks. Its reference, the 000 bas
 flat across protein length where the 10-minute record is 0.11 better on the longest proteins than the shortest. The
 search's first random draw over the open space ([`genomes/h_auto01_random_01.json`](genomes/h_auto01_random_01.json):
 Muon-plus, peri-norm residuals, a mirrored U-net, a trigram table, neighbor heads, a two-layer head, a length-tempered
-curriculum, a late weight average, the entropy-weighted loss) is the hour's record at `val_select` 2.6655 and test
-2.6554, 0.047 under both the hour's baseline and the 10-minute record; the genetic and Bayes proposers search from it.
-The track's figures are its own, drawn from its own ledger:
+curriculum, a late weight average, the entropy-weighted loss) reached `val_select` 2.6655 and test 2.6554, 0.047
+under both the hour's baseline and the 10-minute record. The genetic and Bayes proposers search from it and hold its
+neighborhood: the hour's record is a Bayes child two steps from it
+([`genomes/h_auto03_bayes_02.json`](genomes/h_auto03_bayes_02.json): 6 heads of 128, the physico-chemical grouping
+loss, whole-protein packing, an embedding mix of 0.10) at `val_select` 2.6648 and test 2.6541, with the five
+full-hour runs of that family within 0.005 of each other and one run resolving about 0.003. The track's figures are
+its own, drawn from its own ledger:
 
 ![The 1-hour track's selection curves and record progression](assets/selection_curves_1h.png)
 
