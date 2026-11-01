@@ -186,13 +186,15 @@ search's first random draw over the open space ([`genomes/h_auto01_random_01.jso
 Muon-plus, peri-norm residuals, a mirrored U-net, a trigram table, neighbor heads, a two-layer head, a length-tempered
 curriculum, a late weight average, the entropy-weighted loss) reached `val_select` 2.6655 and test 2.6554, 0.047
 under both the hour's baseline and the 10-minute record. The genetic and Bayes proposers search from it and hold its
-neighborhood: the hour's record is a genetic child three steps from it
-([`genomes/h_auto10_genetic_02.json`](genomes/h_auto10_genetic_02.json): 6 heads of 128, a key offset of 0.25, a
-plateau-restart weight average, a one-sqrt schedule, an embedding mix of 0.14, no trigram table, 199M parameters) at
-`val_select` 2.6643 and test 2.6539, 0.0005 under the Bayes child before it
-([`genomes/h_auto03_bayes_02.json`](genomes/h_auto03_bayes_02.json), 2.6648 and 2.6541). One run resolves about
-0.003 at the hour, so the two are one model, and the seventeen full-hour runs of that family since the draw sit
-between 2.6643 and 2.6813 but for one clear loss (late SAM with a short decay timescale, 2.7109): dropping the
+neighborhood: the hour's record is a Bayes child four steps from it
+([`genomes/h_auto11_bayes_01.json`](genomes/h_auto11_bayes_01.json): 6 heads of 128, xIELU, a plateau-restart
+weight average, a one-sqrt schedule, an embedding mix of 0.14, no trigram table, 199M parameters) at `val_select`
+2.6625 and test 2.6525, 0.0018 under the genetic child before it
+([`genomes/h_auto10_genetic_02.json`](genomes/h_auto10_genetic_02.json), 2.6643 and 2.6539) and 0.0023 under the
+Bayes child before that ([`genomes/h_auto03_bayes_02.json`](genomes/h_auto03_bayes_02.json), 2.6648 and 2.6541).
+One run resolves about 0.003 at the hour, so the three records span one run's noise, and the nineteen full-hour runs
+of that family since the draw sit between 2.6625 and 2.6813 but for one clear loss (late SAM with a short decay
+timescale, 2.7109): dropping the
 mirrored U-net costs about 0.008, dropping whole-protein packing, the grouping loss and the two-layer head together
 costs nothing, the trigram table's 50M parameters buy nothing, and the rest moves the loss by less than one run's
 noise. The track's figures are its own, drawn from its own ledger:
