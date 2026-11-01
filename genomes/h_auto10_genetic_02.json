@@ -1,0 +1,115 @@
+{
+  "families": {
+    "attention": {
+      "heads": 6,
+      "key_offset": 0.25
+    },
+    "backprop_free": {
+      "readout_weight": 0.1928,
+      "route_k": 357,
+      "switch": 0.5396
+    },
+    "batch": {
+      "variant": "whole"
+    },
+    "curriculum": {
+      "alpha": 0.1962,
+      "beta": -0.3282,
+      "fraction": 0.3629,
+      "variant": "length_tempered"
+    },
+    "ema": {
+      "decay": 0.982,
+      "decay_fast": 0.9089,
+      "leap": 0.3404,
+      "start": 0.7019,
+      "variant": "plateau_restart",
+      "window": 105
+    },
+    "embedding_mix": {
+      "initial_share": 0.1413
+    },
+    "grouping": {
+      "until": 0.4577,
+      "variant": "physchem",
+      "weight": 0.06091
+    },
+    "head": {
+      "variant": "two_layer"
+    },
+    "latent": {
+      "source_block": 22,
+      "variant": "neighbors",
+      "weight": 0.04628
+    },
+    "logit_scale": {
+      "initial_scale": 0.6156
+    },
+    "loss": {
+      "variant": "entropy_weighted",
+      "z_weight": 0.001
+    },
+    "memory": {
+      "block": 27
+    },
+    "optimizer": {
+      "adam_beta1": 0.9155,
+      "adam_beta2": 0.9751,
+      "adam_beta2_end": 0.9668,
+      "amuse_beta": 0.5066,
+      "amuse_rho": 0.7561,
+      "anvil_fast_weight": 0.4033,
+      "anvil_slow_beta": 0.979,
+      "cautious_weight_decay": 0.06925,
+      "decay_timescale": 3.0,
+      "embed_lr": 0.01,
+      "head_lr": 0.003,
+      "muon_lr": 0.0689,
+      "plus_axis": "col",
+      "scalar_lr": 0.003148,
+      "variant": "muon_plus"
+    },
+    "positional": {
+      "nope_every": 4,
+      "rope_base": 12360.0,
+      "rope_fraction": 0.3982,
+      "slope_scale": 1.546,
+      "variant": "none"
+    },
+    "regularization": {
+      "rate": 0.1136,
+      "until": 0.1972
+    },
+    "residual": {
+      "alpha_init": 0.05416,
+      "branch_start": 0.3166,
+      "variant": "perinorm"
+    },
+    "schedule": {
+      "cooldown_fraction": 0.2654,
+      "momentum": 0.9683,
+      "momentum_cooldown_end": 0.9904,
+      "momentum_start": 0.9202,
+      "muon_late_start": 0.8923,
+      "variant": "one_sqrt",
+      "warmup_fraction": 0.005035
+    },
+    "softcap": {
+      "cap": 33.81
+    },
+    "stream": {
+      "streams": 3
+    },
+    "unet": {
+      "variant": "mirrored"
+    },
+    "value_embeddings": {
+      "blocks_each_end": 2,
+      "variant": "ends"
+    },
+    "value_residual": {
+      "initial_share": 0.3211
+    }
+  },
+  "schema": 1
+}
