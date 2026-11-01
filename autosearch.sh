@@ -4,8 +4,9 @@
 #   bash autosearch.sh --until 2026-10-31T01:30:00Z [--count 4] [--search search] [--after 2026-10-31T02:00:00Z]
 #       each cycle: `autosearch.py next` (in the image) writes the queue entries of up to --count runs, newest batch
 #       first, or of a newly proposed batch; `queue.sh --wait` runs them one after another; `autosearch.py collect`
-#       reads the results into the state and the ledger under $STATE/<--search>; a cycle starts only if its runs fit
-#       before --until (the track's minutes a run), never before --after, and never after `touch $STATE/<--search>/stop`
+#       reads the results into the state and the ledger under $STATE/<--search>; a cycle runs the prefix of its batch
+#       that ends before --until (a rung run its seconds plus three minutes, a full run the track's minutes; the rest
+#       stays pending), never before --after, and never after `touch $STATE/<--search>/stop`
 #   Each track has its own state folder (`search` for the 10-minute track, `search_1h` for the 1-hour one); the
 #   state's `track` names the clock, and the loop reads the minutes a run from it.
 #   To restart with new strategy modules, ship the tree again with the same command: the new loop records its PID,
@@ -45,6 +46,12 @@ case "$(python3 -c "import json; print(json.load(open('$SEARCH/search.json')).ge
 esac
 
 log() { echo "autosearch: $* $(date -u +%FT%TZ)" | tee -a "$SEARCH/loop.log" >&2; }
+minutes_of() {  # a run's minutes from its name: a rung run (`<name>_r<seconds>`) is its seconds plus warmup and evals
+  case "$1" in
+    *_r[0-9]*) echo $(( ${1##*_r} / 60 + 3 )) ;;
+    *) echo "$MINUTES_PER_RUN" ;;
+  esac
+}
 
 echo $$ > "$SEARCH/loop.pid"  # the newest loop owns the search: an older one ends at its next cycle
 exec 8>"$SEARCH/cycle.lock"
@@ -55,16 +62,19 @@ while :; do
   if [ -n "$after_utc" ] && [ "$(date -u +%s)" -lt "$(date -u -d "$after_utc" +%s)" ]; then
     log "waiting for $after_utc"; flock -u 8; sleep 60; continue
   fi
-  if [ -n "$until_utc" ]; then
-    now=$(date -u +%s); end=$(date -u -d "$until_utc" +%s); need=$(( (count * MINUTES_PER_RUN + 3) * 60 ))
-    if [ $((now + need)) -gt "$end" ]; then log "a batch of $count would end after $until_utc, loop ends"; break; fi
-  fi
   log "cycle starts"
   bash run_gh200.sh python autosearch.py next --state-dir "/state/$search_name" --count "$count" 2>&1 | tee -a "$SEARCH/loop.log"
   read -r -a names < "$SEARCH/queue_next.txt"
-  if [ -n "$until_utc" ]; then  # a pending batch can be longer than --count runs
-    now=$(date -u +%s); need=$(( (${#names[@]} * MINUTES_PER_RUN + 3) * 60 ))
-    if [ $((now + need)) -gt "$end" ]; then log "${#names[@]} runs would end after $until_utc, loop ends"; break; fi
+  if [ -n "$until_utc" ]; then  # run the longest prefix of the batch that ends before --until; the rest stays pending
+    now=$(date -u +%s); end=$(date -u -d "$until_utc" +%s); need=$((3 * 60)); fit=0
+    for name in "${names[@]}"; do
+      need=$((need + $(minutes_of "$name") * 60))
+      if [ $((now + need)) -gt "$end" ]; then break; fi
+      fit=$((fit + 1))
+    done
+    if [ "$fit" -eq 0 ]; then log "no run of ${names[*]} would end before $until_utc, loop ends"; break; fi
+    if [ "$fit" -lt "${#names[@]}" ]; then log "$fit of ${#names[@]} runs end before $until_utc, the rest stay pending"; fi
+    names=("${names[@]:0:$fit}")
   fi
   bash queue.sh --wait "${names[@]}" 2>&1 | tee -a "$SEARCH/loop.log"
   crashed=()

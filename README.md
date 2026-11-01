@@ -188,9 +188,11 @@ curriculum, a late weight average, the entropy-weighted loss) reached `val_selec
 under both the hour's baseline and the 10-minute record. The genetic and Bayes proposers search from it and hold its
 neighborhood: the hour's record is a Bayes child two steps from it
 ([`genomes/h_auto03_bayes_02.json`](genomes/h_auto03_bayes_02.json): 6 heads of 128, the physico-chemical grouping
-loss, whole-protein packing, an embedding mix of 0.10) at `val_select` 2.6648 and test 2.6541, with the five
-full-hour runs of that family within 0.005 of each other and one run resolving about 0.003. The track's figures are
-its own, drawn from its own ledger:
+loss, whole-protein packing, an embedding mix of 0.10) at `val_select` 2.6648 and test 2.6541. One run resolves
+about 0.003 at the hour, and the fifteen full-hour runs of that family since the draw sit between 2.6648 and 2.6741
+but for one clear loss (late SAM with a short decay timescale, 2.7109): dropping the mirrored U-net costs about
+0.008, dropping the packing, the grouping loss and the two-layer head together costs nothing, and the rest moves
+the loss by less than one run's noise. The track's figures are its own, drawn from its own ledger:
 
 ![The 1-hour track's selection curves and record progression](assets/selection_curves_1h.png)
 

@@ -18,7 +18,7 @@ from torch import nn
 __all__ = ["LayerNorm", "Linear", "LinearLayer", "ParameterLayer"]
 
 
-def LinearLayer(
+def LinearLayer(  # noqa: naming - a torch-style factory, named like the layer it builds
     input_size: int,
     output_size: int,
     bias: bool = False,
@@ -44,7 +44,7 @@ def LinearLayer(
     return layer
 
 
-def ParameterLayer(
+def ParameterLayer(  # noqa: naming - a torch-style factory, named like the parameter it builds
     size: tuple[int, ...], *, xavier_init: bool = True, **kwargs: Any
 ) -> nn.Parameter:
     """Build a free parameter of shape `size` with Xavier-normal values.
