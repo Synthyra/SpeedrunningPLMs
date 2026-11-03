@@ -192,7 +192,7 @@ weight average, a one-sqrt schedule, an embedding mix of 0.14, no trigram table,
 2.6625 and test 2.6525, 0.0018 under the genetic child before it
 ([`genomes/h_auto10_genetic_02.json`](genomes/h_auto10_genetic_02.json), 2.6643 and 2.6539) and 0.0023 under the
 Bayes child before that ([`genomes/h_auto03_bayes_02.json`](genomes/h_auto03_bayes_02.json), 2.6648 and 2.6541).
-One run resolves about 0.003 at the hour, so the three records span one run's noise, and the nineteen full-hour runs
+One run resolves about 0.003 at the hour, so the three records span one run's noise, and the twenty-one full-hour runs
 of that family since the draw sit between 2.6625 and 2.6813 but for one clear loss (late SAM with a short decay
 timescale, 2.7109): dropping the
 mirrored U-net costs about 0.008, dropping whole-protein packing, the grouping loss and the two-layer head together
