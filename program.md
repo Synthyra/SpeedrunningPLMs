@@ -11,23 +11,27 @@ proposers run between your interventions. Everything outside the modules is fixe
 - **Data.** `Synthyra/SpeedrunningPLMs` (public), built by `prepare.py` from the family-disjoint AlphaFold DB split: no
   held-out protein has a training relative at 30 percent identity over 80 percent coverage by sequence (MMseqs2) or
   structure (Foldseek). Train: 1,754,034 proteins as one shuffled uint8 token stream in the ESM2 alphabet (33 tokens:
-  CLS, residues, EOS; MASK is 32). Held out: `val_select` (one protein per validation family, 4,751 proteins, at most
-  1,024 tokens), `validation` (25,459 proteins) and `test` (25,778 proteins), both at full length (at most 2,048
-  tokens), each with fixed masks.
+  CLS, residues, EOS; MASK is 32), 392.6M tokens. Lengths run 50 to 2,046 residues. Held out: `val_select` (one protein
+  per validation family, 4,751 proteins, at most 1,024 tokens), `validation` (25,459 proteins) and `test` (25,778
+  proteins), both at full length (at most 2,048 tokens), each with fixed masks.
 - **Objective.** 15 percent of standard residues replaced by MASK, nothing else; the loss is the collapse-free cross
-  entropy (`foundry.layers.cross_entropy`) on the masked residues over the 20 standard residues. Training uses the
-  same corruption (`benchmark.corrupt`).
+  entropy ([arXiv 2610.31642](https://arxiv.org/abs/2610.31642), `foundry.layers.cross_entropy`) on the masked residues
+  over the 20 standard residues. Training uses the same corruption (`benchmark.corrupt`).
+- **Hardware.** One NVIDIA GH200 (the H100 die, 96 GB HBM3). A run on other hardware is a different clock and is
+  recorded as such.
 - **Clock.** 10 minutes of applied training steps, measured with device synchronization at step boundaries; the step
   that overruns is discarded. A compile warmup before the clock is capped at 3 minutes; in-run validation evals are
   outside the clock and capped at 60 seconds in total. Breaking a cap makes the run `invalid`.
 - **Selection.** The weights with the lowest `val_select` loss during the run are scored once on full validation and
   full test. The headline is the test loss; the weights are chosen by validation, never by test.
 - **Shape.** Exactly 36 blocks on a 768-wide residual stream, each one attention sublayer and one MLP with intermediate
-  2,048 (`benchmark.check_architecture`). Heads, grouped or differential attention, value embeddings, skips, gates,
-  scalars, normalization, tables and the optimizer are free.
+  2,048 (`benchmark.check_architecture`), about 198M parameters with the embedding and head. Heads, grouped or
+  differential attention, value embeddings, skips, gates, scalars, normalization, tables and the optimizer are free.
 - **Metrics.** Loss, bits, perplexity, accuracy, macro and weighted precision, recall and F1, MCC, macro ROC AUC and
-  PR AUC, loss by length bin. The 3Di probe (`probe.py`) reports how much structure the hidden states carry; it never
-  selects.
+  PR AUC, loss by length bin. Every model is scored on its own 20 residue columns, so ESM2 (33 tokens) and ESMC (64
+  tokens) are scored on the same problem. The 3Di probe (`probe.py`) reports how much structure the hidden states
+  carry: a softmax-weighted sum of all hidden states, each RMS-normalized, then one linear layer to the 20 Foldseek 3Di
+  states, trained on 20,000 training proteins and scored on validation and test. It never selects.
 - **Comparison.** `result.json` carries the benchmark id (the data's digests), the evaluator's source digest, the
   candidate's digest (`train.py`, the strategy modules and the genome) and the clock receipts. Two runs compare only
   when their comparison keys agree; the budget is part of the key, so a 180 s rung never compares with a 600 s run.
@@ -97,6 +101,15 @@ baseline (`genomes/000_baseline.json`) with nothing of the 10-minute track in it
 draws over the open space (`RandomProposer`) until the Bayes and genetic proposers have their three and two
 observations. Each track has its own state folder on the box (`search`, `search_1h`), its own ledger, results record
 and figure set; `plots.py` refuses a folder that mixes budgets.
+
+### The unattended loop
+
+The search runs itself on the GPU machine. `autosearch.sh` loops until a deadline or a `stop` file: `autosearch.py next`
+ships up to four runs still to do, newest batch first, else proposes four from the Bayes and genetic proposers in
+turn, straight at the full budget; `queue.sh` runs them one after another; `autosearch.py collect` reads them into the
+state and the ledger, which live beside the runs on the machine while the loop runs. New strategy modules ship as a new
+tree with the same command: the new loop takes over at the running cycle's end, and a pilot batch of the new modules
+runs ahead of the backlog.
 
 ## Your place in the loop
 

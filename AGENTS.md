@@ -12,7 +12,8 @@ Read `program.md` first: it is the brief for running the loop. The short form:
   reasons on top: reads the state and the screening effects, adds modules, retires inert ones, lets the proposers run.
 - A 600 s run is kept when its `val_select` loss is the lowest so far; seed 0 decides. Every run is recorded with its
   verdict and reason. `ideas/README.md` is the module catalog: each family's variants and evidence, and the ideas
-  not yet a module.
+  not yet a module. `results.md` holds the records and what each track learned; `README.md` only points to it, so a
+  new record changes the README's record table and `results.md`.
 - With no genome `train.py` equals 022 bit for bit on a CPU smoke (`tests/test_strategies.py`). Smoke a
   new module on the CPU before it goes to the GPU: `python train.py --data-dir <tiny> --output-dir <out> --name smoke
   --device cpu --no-compile --no-wandb --window 64 --windows-per-step 2 --max-steps 3 --skip-final-evals --genome g.json`.

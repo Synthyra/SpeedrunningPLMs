@@ -2,8 +2,8 @@
 
 Every family a genome chooses from (`src/speedrunning_plms/strategies/`, one module each), its variants, and the
 evidence for each on the 10-minute AFDB v6 speedrun; then the ideas not yet a module, and the four literature files
-beside this one (read on 2026-10-28) they draw on. The default of every family is 022's; the record is
-`genomes/confirm1_01.json`, which the defaults take once it holds across later batches. Evidence is a run in
+beside this one (read on 2026-10-28) they draw on. The default of every family is 022's; the 10-minute record is
+`genomes/auto01_bayes_02.json` and the 1-hour record `genomes/h_auto11_bayes_01.json`. Evidence is a run in
 the campaign ledger (`experiments/representation/speedrunning_plms/2026-10-28_afdb_v6_speedrun/runs.jsonl` in the
 workspace), a screening effect (`search.py effects`), or a literature number, which transfers only as a prior.
 One seed resolves about 0.0015 nats on `val_select`, so a single run inside that band is a tie.
@@ -61,6 +61,7 @@ warmup within 15 s of the 180 s cap, so a costly module rides only with cheap on
 | C3 | Fused kernels (MLP, ReLU-squared, XXT) | records 59, 69, 87 | days of work for a few percent of step time; once the recipe is stable |
 | B9 | Token drop in middle blocks: a fixed random share of unmasked residues skips blocks `first_block` to `last_block` | `2026-10-30_capacity_at_fixed_shape.md` 3; arXiv 2203.13240 | left out in round 4 (2026-10-30): one compiled shape needs per-token positions in RoPE and the slopes' score function, a second flex mask per step at the kept length, and the value residual, value embeddings, stream mixers and U-net all hold full-length state; estimated at 40 to 80 s of compile, over the 40 s limit |
 | C2 | Boost's orthogonal-nudge estimator, Dust's weight estimate | `backprop_free.md` 1, 3, 5.3 | about 90 backprop steps of compute per Dust update at 36 blocks; out of a 10-minute budget |
+| B10 | Zyphra Hierarchical Attention (ZHA): a tree of compressed key summaries that each query head descends to attend to a sparse set of chunks | `2026-11-03_zyphra_hierarchical_attention.md`; arXiv 2610.42112 | no run. The source models it as faster than dense attention only from about 48K tokens, and it converts frozen pretrained models; this benchmark stops at 2,048 tokens and trains from scratch. A sparsity measurement on the record's weights comes first |
 
 ## Tried by hand, before the registry
 
