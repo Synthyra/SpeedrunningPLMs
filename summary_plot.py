@@ -4,6 +4,8 @@
 
 Writes, at 300 dpi and without a title (the caption lives in the figure set's README): A, test loss against parameters
 for the ESM2 and ESMC reference models and each track's record; B, test loss by length bin for the same models.
+
+Symbols: B length bins.
 """
 
 from __future__ import annotations

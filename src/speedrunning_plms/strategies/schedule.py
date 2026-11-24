@@ -17,6 +17,9 @@ schedule, so Muon's cooldown is wider than the AdamW groups' (it still ends at `
 the record). The factor is a Python float on Muon's param groups, set by the loop each step like the rate itself, so
 it costs no compile. The longer the run, the more of the factor falls on steps that matter, so it is aimed at the
 1-hour track.
+
+`cooldown_power` (round 9; Prime Intellect's track 3 stack reports an LR power of 1.2, with no shape or number per change): the
+cooldown's multiplier raised to this, so above 1 the rate falls early and lingers low, below 1 it holds and drops late. 1 is the record.
 """
 
 from __future__ import annotations
@@ -39,11 +42,13 @@ class ScheduleConfig(StrategyConfig):
     momentum_cooldown_end: float = 0.95  # Muon's momentum at the end of the cooldown
     muon_late_scale: float = 1.0  # Muon's learning-rate factor at the end of the clock; 1 is off
     muon_late_start: float = 0.8  # the share of the clock where the factor starts to rise from 1
+    cooldown_power: float = 1.0  # the cooldown's multiplier raised to this; 1 is the record's line
     VARIANTS: ClassVar[tuple[str, ...]] = ("trapezoid", "one_sqrt")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {
         "warmup_fraction": (0.0, 0.1), "cooldown_fraction": (0.1, 0.8), "final_lr_ratio": (0.0, 0.3),
         "momentum": (0.85, 0.99), "momentum_start": (0.7, 0.98), "momentum_warmup": (0.01, 0.4),
         "momentum_cooldown_end": (0.85, 0.995), "muon_late_scale": (1.0, 3.0), "muon_late_start": (0.5, 0.95),
+        "cooldown_power": (0.5, 3.0),
     }
 
     def cooldown_share(self, progress: float) -> float:
@@ -65,7 +70,8 @@ class Schedule(Strategy):
             phase = (progress - (1 - config.cooldown_fraction)) / config.cooldown_fraction
             if self.variant == "one_sqrt":
                 phase = phase**0.5
-            return 1 - (1 - config.final_lr_ratio) * phase
+            multiplier = 1 - (1 - config.final_lr_ratio) * phase
+            return multiplier if config.cooldown_power == 1.0 else multiplier**config.cooldown_power
         return 1.0
 
     def momentum(self, progress: float) -> float:

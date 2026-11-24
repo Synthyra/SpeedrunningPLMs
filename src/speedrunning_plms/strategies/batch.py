@@ -17,7 +17,14 @@ window, and a hand-written genome may set the count.
 
 A curriculum's protein order (`curriculum.protein_order`) changes which proteins come first under either variant.
 
-Symbols: n proteins, t stream tokens, p pieces, s = window x windows_per_step tokens a step.
+An optimizer step may sum micro-batches, so a run's batch can change with one compiled shape, and so no compile (two shapes broke the
+warmup cap, 027; one dynamic shape was 13 percent slower a step). The compiled step holds `count // micro_divisor` windows, and each optimizer
+step sums `accumulate_early` of them before `accumulate_switch` of the clock and `accumulate_late` from it on. The evidence is this benchmark's own:
+008's 32 windows were ahead at 90 s and behind from 180 s. Two micro-batches and one update cost about as much as the record's step (2 x 0.128
+s + 26 ms of Muon against 0.276 s, from 008's rate), so a late step gives up little, and the update it saves is Muon's. Smith et al. (arXiv
+1711.00489) raise the batch in place of decaying the rate; modded-nanogpt record 46 is a batch schedule, about 2 percent of wall clock, with no ablation.
+
+Symbols: n proteins, t stream tokens, p pieces, s = window x windows a compiled step.
 """
 
 from __future__ import annotations
@@ -42,18 +49,30 @@ class BatchConfig(StrategyConfig):
     variant: str = "packed"
     window: int = 1024  # tokens a window
     windows_per_step: int = 0  # 0 ties the count to the window, STEP_TOKENS // window: 64 at 1,024, 32 at 2,048
+    micro_divisor: int = 1  # the compiled step holds count // micro_divisor windows
+    accumulate_early: int = 1  # micro-batches an optimizer step sums before `accumulate_switch` of the clock
+    accumulate_late: int = 1  # and from it on
+    accumulate_switch: float = 0.5
     VARIANTS: ClassVar[tuple[str, ...]] = ("packed", "whole")
-    BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"window": (32, 2048), "windows_per_step": (0, 256)}
+    BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"window": (32, 2048), "windows_per_step": (0, 256), "micro_divisor": (1, 8),
+                                                        "accumulate_early": (1, 8), "accumulate_late": (1, 8), "accumulate_switch": (0.0, 1.0)}
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.window & (self.window - 1) or self.windows_per_step & (self.windows_per_step - 1):
             raise ValueError(f"window {self.window} and windows_per_step {self.windows_per_step} must be powers of two")
+        if self.count % self.micro_divisor:
+            raise ValueError(f"{self.count} windows do not divide into micro-batches by {self.micro_divisor}")
 
     @property
     def count(self) -> int:
-        """Windows a step: the genome's, or STEP_TOKENS // window when it leaves the count tied."""
+        """Windows a step at a micro-divisor of 1: the genome's, or STEP_TOKENS // window when it leaves the count tied."""
         return self.windows_per_step or STEP_TOKENS // self.window
+
+    @property
+    def micro_count(self) -> int:
+        """Windows the compiled step holds."""
+        return self.count // self.micro_divisor
 
 
 @dataclass(frozen=True)
@@ -177,7 +196,12 @@ class Batch(Strategy):
 
     @property
     def step_tokens(self) -> int:
-        return self.config.window * self.config.count
+        """Tokens a compiled step reads: all of an optimizer step's in the record, a micro-batch's otherwise."""
+        return self.config.window * self.config.micro_count
+
+    def accumulation(self, progress: float) -> int:
+        """Micro-batches the optimizer step starting at this share of the clock sums; 1 in the record."""
+        return self.config.accumulate_early if progress < self.config.accumulate_switch else self.config.accumulate_late
 
     def packing(self, offsets: np.ndarray, order: np.ndarray | None, seed: int) -> Packing:
         """The `whole` variant's windows, in the curriculum's order or the stream's."""
@@ -191,7 +215,7 @@ class Batch(Strategy):
         # tokens: (t,) uint8; offsets: (n + 1,); order: (n,) or None.
         if self.variant == "whole":
             assert packing is not None and packing.window == self.config.window
-            return packed_steps(tokens, packing, self.config.count, seed)
+            return packed_steps(tokens, packing, self.config.micro_count, seed)  # (s,) each
         if order is None:
-            return contiguous_steps(tokens, self.step_tokens, seed)
-        return ordered_steps(tokens, offsets, order, self.step_tokens)
+            return contiguous_steps(tokens, self.step_tokens, seed)  # (s,) each
+        return ordered_steps(tokens, offsets, order, self.step_tokens)  # (s,) each

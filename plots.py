@@ -21,6 +21,7 @@ import numpy as np
 from pathlib import Path
 from typing import Any
 
+
 matplotlib.use("Agg")  # the backend is fixed before pyplot loads: this script only writes files
 
 import matplotlib.pyplot as plt  # noqa: E402

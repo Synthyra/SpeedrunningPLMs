@@ -67,7 +67,7 @@ class Muon(torch.optim.Optimizer):
     """
 
     def __init__(
-        self, params: Iterable[torch.Tensor], lr: float = 0.02,
+        self, params: Iterable[torch.Tensor], lr: float = 0.02,  # params: (m, n) each
         momentum: float = 0.95, nesterov: bool = True, ns_steps: int = 5,
         weight_decay: float = 0.0, orthogonalization: str = "newton_schulz",
     ) -> None:

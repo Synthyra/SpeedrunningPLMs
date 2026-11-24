@@ -28,11 +28,14 @@ import torch
 import torch.nn.functional as F
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 from torch import Tensor, nn
 
-from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig, norm
+from speedrunning_plms.strategies.strategy import CandidateModel, ParameterGroup, Strategy, StrategyConfig, norm
+
+
+if TYPE_CHECKING:  # the registry imports this module
+    from speedrunning_plms.strategies import Strategies
 
 
 SIDE = 256  # sub-keys a half; SIDE^2 value rows
@@ -47,18 +50,13 @@ class MemoryConfig(StrategyConfig):
     block: int = 18  # product_keys: the block whose input gains the read
     VARIANTS: ClassVar[tuple[str, ...]] = ("none", "product_keys", "shared_pool")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"block": (1, 35)}
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if not isinstance(self.block, int):
-            raise ValueError(f"block must be an integer, not {self.block!r}")
+    INTEGERS: ClassVar[tuple[str, ...]] = ("block",)
 
 
 class ProductKeyMemory(nn.Module):
-    def __init__(self, reads: int = 1) -> None:
-        # reads: 1 keeps the single read's (d, d) query and (2, s, d / 2) keys; more stacks one of each per read.
+    def __init__(self, d: int, reads: int = 1) -> None:
+        # d: the stream width; reads: 1 keeps the single read's (d, d) query and (2, s, d / 2) keys; more stacks one of each per read.
         super().__init__()
-        d = benchmark.HIDDEN
         lead = () if reads == 1 else (reads,)
         self.query = nn.Parameter(torch.empty(*lead, d, d))  # (d, d) or (r, d, d), drawn in `initialize`
         self.keys = nn.Parameter(torch.empty(*lead, 2, SIDE, d // 2))  # (2, s, d / 2) or (r, 2, s, d / 2), likewise
@@ -85,25 +83,30 @@ class Memory(Strategy):
     Config = MemoryConfig
     config: MemoryConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
-        if self.active:
-            self.memory = ProductKeyMemory(len(SHARED_READS) if self.variant == "shared_pool" else 1)
-            model.extensions[self.family] = self.memory  # type: ignore[index]
+    def conflicts(self, strategies: Strategies) -> list[str]:
+        blocks = strategies.shape.config.blocks
+        reads = SHARED_READS if self.variant == "shared_pool" else (self.config.block,)
+        return [f"the memory reads at blocks {reads}, past the last of {blocks}"] if self.active and max(reads) >= blocks else []
 
-    def initialize(self, model: nn.Module) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
+        if self.active:
+            self.memory = ProductKeyMemory(model.strategies.shape.config.hidden, len(SHARED_READS) if self.variant == "shared_pool" else 1)
+            model.extensions[self.family] = self.memory
+
+    def initialize(self, model: CandidateModel) -> None:
         if self.active:
             nn.init.normal_(self.memory.query, std=KEY_INIT_STD)  # (d, d) or (r, d, d), the record's linear init
             nn.init.normal_(self.memory.keys, std=KEY_INIT_STD)  # (2, s, d / 2) or (r, 2, s, d / 2)
             nn.init.zeros_(self.memory.values)  # (s^2, d): the read starts at zero
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if not self.active:
             return []
-        embed_lr = model.strategies.optimizer.config.embed_lr  # type: ignore[union-attr]
+        embed_lr = model.strategies.optimizer.config.embed_lr
         return [ParameterGroup("product_key_memory", list(self.memory.parameters()), "adam", embed_lr)]
 
-    def block_input(self, model: nn.Module, index: int, X: Tensor, states: list[Tensor]) -> Tensor:
-        # X: (b, l, d), the stream entering block `index`.
+    def block_input(self, model: CandidateModel, index: int, X: Tensor, states: list[Tensor]) -> Tensor:
+        # X: (b, l, d), the stream entering block `index`; states: (b, l, d) each, unread.
         if self.variant == "shared_pool":
             if index not in SHARED_READS:
                 return X  # (b, l, d)

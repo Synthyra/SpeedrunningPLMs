@@ -9,7 +9,12 @@ prediction and not the label, so the minimizer of the expected loss at a context
 `z_weight` (PaLM's z-loss, arXiv 2204.02311; 0 is off) adds z_weight x (log Z)^2 summed over the masked residues, with
 Z the sum of exp over the 20 residue logits: it pins the logit level and leaves every probability as it is.
 
-Both act in `training_loss`, outside the compiled model and on both training paths; the logged loss and the evaluator
+`substitution_share` (round 9, no source tests it on pretraining; 0 is off) moves that share of each masked residue's target onto what BLOSUM62
+says substitutes for the true residue (`residue_priors.substitution_targets`), falling linearly to 0 at `substitution_until` of the clock. A
+masked residue's label is a noisy draw from what its context allows, and most of a step's gradient variance is that draw, so a softer target
+may be worth more steps early; the bias it adds is gone by the end, and the logged loss and the evaluator are untouched.
+
+All act in `training_loss`, outside the compiled model and on both training paths; the logged loss and the evaluator
 stay the record's plain cross entropy. The plain variant with no z-loss adds no hook.
 
 Symbols: b windows, l tokens, v = 33 tokens, n masked residues in the step, c = 20 residues.
@@ -25,20 +30,31 @@ from torch import Tensor
 
 from foundry.layers.cross_entropy import log_softmax
 from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import Strategy, StrategyConfig
+from speedrunning_plms.strategies.residue_priors import substitution_targets
+from speedrunning_plms.strategies.strategy import StepState, Strategy, StrategyConfig
 
 
 @dataclass(frozen=True)
 class LossConfig(StrategyConfig):
     variant: str = "plain"
     z_weight: float = 0.0  # the z-loss coefficient; 0 is off
+    substitution_share: float = 0.0  # the target's share on BLOSUM62's substitutes at the start of the clock; 0 is off
+    substitution_until: float = 0.5  # the share of the clock where that reaches 0
     VARIANTS: ClassVar[tuple[str, ...]] = ("plain", "entropy_weighted")
-    BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"z_weight": (0.0, 1e-2)}
+    BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"z_weight": (0.0, 1e-2), "substitution_share": (0.0, 0.5),
+                                                        "substitution_until": (0.1, 1.0)}
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.z_weight != 0.0 and self.z_weight < 1e-4:
             raise ValueError(f"z_weight is 0 (off) or 1e-4 to 1e-2, not {self.z_weight}")
+
+
+def substitution_difference(Z: Tensor, targets: Tensor, soft: Tensor) -> Tensor:
+    """The summed cross entropy against the soft targets, less that against the true residues."""
+    # Z: (n, c) fp32; targets: (n,); soft: (c, c), row a the target for residue a; returns ().
+    log_p = log_softmax(Z, dim=-1)  # (n, c)
+    return ((log_p.gather(1, targets[:, None]).squeeze(1)) - (soft[targets] * log_p).sum(dim=-1)).sum()  # ()
 
 
 def residue_scores(logits: Tensor, labels: Tensor) -> tuple[Tensor, Tensor]:
@@ -70,8 +86,15 @@ class Loss(Strategy):
     Config = LossConfig
     config: LossConfig
 
+    def __init__(self, config: LossConfig) -> None:
+        super().__init__(config)
+        self.share = config.substitution_share  # the target's share on the substitutes now, moved by `after_step`
+        self.soft: Tensor | None = None  # (c, c), on the logits' device once a step has read it
+
     def overrides(self, hook: str) -> bool:
-        return hook == "training_loss" and (self.variant != "plain" or self.config.z_weight > 0)
+        if hook == "after_step":
+            return self.config.substitution_share > 0
+        return hook == "training_loss" and (self.variant != "plain" or self.config.z_weight > 0 or self.config.substitution_share > 0)
 
     def training_loss(self, logits: Tensor, labels: Tensor, loss: Tensor) -> Tensor:
         # logits: (b, l, v); labels: (b, l); loss: (), the record's summed masked cross entropy; returns ().
@@ -79,4 +102,11 @@ class Loss(Strategy):
         objective = entropy_weighted_cross_entropy(Z, targets) if self.variant == "entropy_weighted" else loss  # ()
         if self.config.z_weight:
             objective = objective + self.config.z_weight * z_loss(Z)  # ()
+        if self.share > 0:
+            if self.soft is None:
+                self.soft = substitution_targets().to(Z.device)  # (c, c)
+            objective = objective + self.share * substitution_difference(Z, targets, self.soft)  # ()
         return objective  # ()
+
+    def after_step(self, state: StepState) -> None:
+        self.share = self.config.substitution_share * max(0.0, 1 - state.progress / self.config.substitution_until)

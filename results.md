@@ -8,6 +8,22 @@ Losses are cross entropy in nats per masked residue, lower is better. A run keep
 `val_select` loss, and the test loss of those weights is the headline. All runs used one NVIDIA GH200 (the H100 die,
 96 GB HBM3); a run on other hardware is a different clock and is recorded as such.
 
+Since 2026-11-23 the model's shape is free and the 1-hour track is the headline
+([decision](../../../docs/decisions/representation/speedrunning_plms/2026-11-23_compute_matched_free_architecture.md)).
+The shape check became a receipt, which changed the evaluator's digest from `e4bfd3c7...` to `b8d28ad8...` and so every
+comparison key; the scoring code is unchanged and every earlier run met the looser rule, so the records below stand
+beside the runs after it.
+
+Also since 2026-11-23 runs train on `afdb_v6_minus_uniprot_2026_04`, AFDB v6 without the 2 training proteins that are
+exact copies of the new UniProt proteins of the [perplexity plot](PUBLIC_README.md)
+([decision](../../../docs/decisions/representation/speedrunning_plms/2026-11-23_temporal_benchmark_excluded.md)). The
+held-out files are the same bytes, but the benchmark id is new and the data module's change moved the evaluator digest
+again, so a record on the new data is compared with `h_auto11_bayes_01_minus_2026_04`, the 1-hour record's genome
+re-run on it; the records below ran on `afdb_v6`. That re-run (seed 0, 3,600 s, alone on the GPU, 11,824 steps,
+finished 2026-11-23 21:15 UTC, [W&B 61ea75b7](https://forge.coreweave.com/wandb/lhallee/speedrunning-plms/runs/61ea75b7))
+reads test 2.6515, `val_select` 2.6630 and validation 2.6552, against the record's 2.6525 and 2.6625 on `afdb_v6`
+(0.0010 lower on test, 0.0005 higher on `val_select`, from one seed each).
+
 ## Contents
 
 - [Reference models](#reference-models)
@@ -90,52 +106,56 @@ and 2.7437 on test), so a gain inside that band is kept by the rule but not clai
 
 ### Hand-run candidates
 
-The candidates tried one at a time on the incumbent before the search took over; a candidate is kept when its
-`val_select` loss is lower. Search runs after 028 appear above only when they took the record; the full ledger stays
-in the workspace.
+The candidates tried one at a time on the incumbent before the search took over, each one change to the incumbent's
+`train.py`; a candidate is kept when its `val_select` loss is lower. The codes (A1, B4, ...) are the ideas'
+numbers in the [module catalog](ideas/README.md) and its literature files. The genome families reproduce the ported
+changes bit for bit (queue 3's six candidates on a CPU smoke). Search runs after 028 appear above only when they took
+the record; the full ledger is not in this repository.
 
 | # | Change | Verdict | `val_select` | Test |
 |---|---|---|---|---|
-| 000 | the baseline | incumbent | 2.7680 | 2.7671 |
-| 001 | Muon banked by parameter shape (1.53 times the steps) | kept | 2.7570 | 2.7554 |
-| 002 | Muon lr 0.04 | kept, within noise | 2.7564 | 2.7546 |
-| 003 | tanh logit softcap at 30 | kept, within noise | 2.7559 | 2.7539 |
-| 004 | the incumbent at seed 1 | reference: one seed resolves about 0.0015 nats | 2.7574 | 2.7551 |
-| 005 | U-net skips with learned scalars | reverted | 2.7568 | 2.7545 |
-| 006 | weight EMA (decay 0.995) over the cooldown | reverted: led mid-cooldown, lagged at the end | 2.7578 | 2.7560 |
-| 007 | learnable exclusive self-attention | reverted: 4 percent fewer steps, behind throughout | 2.7610 | 2.7593 |
-| 008 | 32 windows a step | reverted: 1.8 times the steps, ahead at 90 s, behind from 180 s | 2.7579 | 2.7557 |
-| 009 | 512-token windows, 128 a step | reverted: 6 percent more steps, long proteins lose | 2.7600 | 2.7580 |
-| 010 | a (left, right) neighbor-pair table added to the embedding | reverted | 2.7583 | 2.7563 |
-| 011 | zero-initialized value embeddings on blocks 0 to 2 and 33 to 35 | reverted | 2.7594 | 2.7573 |
-| 012 | a fixed ALiBi-style local bias on every head beside RoPE | kept: ahead at every eval from 90 s | 2.7531 | 2.7501 |
-| 013 | one protein per family per pass (family-balanced order) | reverted: the same curve; the budget is not family-limited | 2.7532 | 2.7502 |
-| 014 | the local bias on six heads, six free | reverted: loses most of 012's gain | 2.7548 | 2.7515 |
-| 015 | NorMuon | kept: ahead from 180 s | 2.7495 | 2.7457 |
-| 016 | cautious weight decay 0.1 on the block matrices | reverted: behind from 180 s | 2.7564 | 2.7535 |
-| 017 | embedding lr 3e-3, head lr 1e-3 | reverted: within noise of 015 | 2.7527 | 2.7495 |
-| 018 | Muon lr 0.06 | reverted: behind from 270 s | 2.7551 | 2.7521 |
-| 019 | cooldown over the last 60 percent of the clock | reverted: within noise of 015 | 2.7534 | 2.7498 |
-| 015 s1, s2 | the record at seeds 1 and 2 | reference: three-seed test mean 2.7447, span 0.002 | 2.7482, 2.7480 | 2.7447, 2.7437 |
-| 020 | mimetic V and O initialization (W_O W_V = 0.25 I at the start) | reverted: the same curve | 2.7496 | 2.7453 |
-| 021 | the local-bias slopes learned per head inside the flex attention score function | invalid: compile warmup 264 s against the 180 s cap, then 28 s a step | | |
-| 022 | embedding lr 3e-3, head lr 1e-3, on 015 | kept by the rule: lower by 0.0005, as it was on 012 | 2.7490 | 2.7455 |
-| 023 | Muon momentum 0.95 from step 0, no warmup from 0.85 | reverted: lost 0.004 | 2.7527 | 2.7491 |
-| 024 | RoPE base 100,000 | reverted: under 022 by 0.0011, inside the band, not under 028 from the same queue; retest on 028 | 2.7479 | 2.7443 |
-| 025 | the local-bias slopes doubled | reverted: under 022 by 0.0005, inside the band; retest on 028 | 2.7485 | 2.7450 |
-| 026 | per-head sigmoid attention gates from the residual's first h channels | reverted: lost 0.002 | 2.7510 | 2.7476 |
-| 027 | 512-token windows for the first 40 percent of the clock, then 1,024 | invalid: two window shapes compiled twice, warmup 249 s against the 180 s cap; its 2.7479 does not count | | |
-| 028 | a value residual to the first block's values, a learned scalar per block from 0.5 | kept: lower by 0.017, eleven times the band; 0.025 nats on proteins over 500 residues | 2.7319 | 2.7291 |
-| pilot | the MLP's matmuls in FP8 (`torch._scaled_mm`, per-tensor scales) | not run: 0.284 s a step against 0.276 in bf16 | | |
+| 000 | the baseline: 36 pre-norm blocks, 12 heads of 64 with QK-norm and RoPE, ReLU-squared MLP, zero-init output projections, untied head, bf16, `torch.compile`, flex attention with a document mask over 64 packed 1,024-token windows, Muon with Polar Express, AdamW on the embedding and head, 2 percent warmup and 40 percent cooldown by clock fraction | incumbent | 2.7680 | 2.7671 |
+| 001 | Muon banked by parameter shape: one batched Polar Express per shape instead of 216 per-matrix calls; a profile had put the per-matrix loop at 76 percent of host time with the GPU idle a third of each step | kept, 1,412 to 2,157 steps | 2.7570 | 2.7554 |
+| 002 | A1: Muon lr 0.04 | kept by the rule, within noise | 2.7564 | 2.7546 |
+| 003 | A2: tanh logit softcap at 30 | kept by the rule, within noise | 2.7559 | 2.7539 |
+| 004 | the incumbent (003) at seed 1, for the noise floor | reference: one seed resolves about 0.0015 nats | 2.7574 | 2.7551 |
+| 005 | A4: U-net skips with learned scalars | reverted: not lower, 12 fewer steps | 2.7568 | 2.7545 |
+| 006 | A12: weight EMA (decay 0.995) over the cooldown, scored and selected | reverted: led mid-cooldown, lagged at the end; a shorter memory is untried | 2.7578 | 2.7560 |
+| 007 | A10: learnable exclusive self-attention | reverted: behind at every eval, 4 percent fewer steps | 2.7610 | 2.7593 |
+| 008 | A1: 32 windows a step | reverted: 1.8x the steps, ahead at 90 s, behind from 180 s | 2.7579 | 2.7557 |
+| 009 | A11 without the curriculum: 512-token windows, 128 a step | reverted: 6 percent more steps, long proteins lose | 2.7600 | 2.7580 |
+| 010 | A7 for MLM: a (left neighbor, right neighbor) pair table, 1,089 x 768, added to the embedding | reverted: level to 270 s, behind after | 2.7583 | 2.7563 |
+| 011 | A5: zero-initialized value embeddings on blocks 0 to 2 and 33 to 35 | reverted: behind at every eval from 90 s, 10 fewer steps | 2.7594 | 2.7573 |
+| 012 | A15: fixed ALiBi-style per-head local bias on the scores beside RoPE | kept: ahead at every eval from 90 s, 4 percent fewer steps; the first gain beyond noise since 001 | 2.7531 | 2.7501 |
+| 013 | A14: one protein per family per pass, packed contiguously | reverted: the same curve as 012 within noise; the budget is not family-limited | 2.7532 | 2.7502 |
+| 014 | A16: the local bias on six heads, six free | reverted: loses most of 012's gain; the prior is wanted on every head | 2.7548 | 2.7515 |
+| 015 | B1: NorMuon on 012 | kept: ahead from 180 s; the second gain beyond noise | 2.7495 | 2.7457 |
+| 016 | A3: cautious weight decay 0.1 on the Muon banks, on 012 | reverted: behind from 180 s | 2.7564 | 2.7535 |
+| 017 | A1: embedding lr 3e-3, head lr 1e-3, on 012 | reverted: inside the noise band of 012; retried on 015 | 2.7527 | 2.7495 |
+| 018 | A1: Muon lr 0.06, on 012 | reverted: behind from 270 s; past the optimum | 2.7551 | 2.7521 |
+| 019 | A1: cooldown over the last 60 percent, on 012 | reverted: the same within noise; ahead mid-run, level at the end | 2.7534 | 2.7498 |
+| 015 s1, s2 | the record (015) at seeds 1 and 2 | reference: three-seed test mean 2.7447, span 0.002; the noise band holds | 2.7482, 2.7480 | 2.7447, 2.7437 |
+| 020 | A6: mimetic V and O initialization, W_O W_V = 0.25 I at the start, on 015 | reverted: the same curve; what a block starts as is forgotten in 2,000 steps | 2.7496 | 2.7453 |
+| 021 | A16 (second form): the local-bias slopes as per-head parameters inside the flex attention score function, Adam at the embedding rate, on 015 | invalid: compile warmup 264 s against the 180 s cap, then 28 s a step for 21 steps; a captured parameter in `score_mod` takes a far slower path | | |
+| 022 | A1: embedding lr 3e-3, head lr 1e-3, on 015 | kept by the rule: lower by 0.0005, as 017 was on 012; inside one seed's band | 2.7490 | 2.7455 |
+| 023 | A1: Muon momentum 0.95 from step 0, on 022 | reverted: lost 0.004; the warmup from 0.85 earns its keep | 2.7527 | 2.7491 |
+| 024 | B4: RoPE base 100,000, on 022 | reverted: under 022 by 0.0011, inside the band, not under 028 from the same queue; retest on 028 | 2.7479 | 2.7443 |
+| 025 | A16: the local-bias slopes doubled, on 022 | reverted: under 022 by 0.0005, inside the band; retest on 028 | 2.7485 | 2.7450 |
+| 026 | A9: per-head sigmoid gates from the residual's first h channels, on 022 | reverted: lost 0.002 | 2.7510 | 2.7476 |
+| 027 | A11: 512-token windows for the first 40 percent of the clock, on 022 | invalid: two window shapes compiled twice, warmup 249 s against the 180 s cap; its 2.7479 does not count; a one-shape form (a resize without recompiling) may return | | |
+| 028 | A5: a value residual to the first block's values, a learned scalar per block from 0.5, on 022 | kept: lower by 0.017, eleven times the band; the gain grows with length (0.025 nats over 500 residues), the first record to use context | 2.7319 | 2.7291 |
+| pilot | B7: the MLP's matmuls in FP8 (e4m3, per-tensor dynamic scales, `torch._scaled_mm`) | not run: 0.284 s a step against 0.276 in bf16 in a 60 s pilot; the quantization overhead exceeds the saving at 768 x 2,048 | | |
 
 ### What it learned
 
-- **The step is GPU-bound at 0.276 s.** After the banked Muon, a profile puts matmuls at 109 ms near the bf16 peak,
-  flex attention at 80 ms, Muon at 26 ms and the host idle. More steps now come from attention or from precision,
+- **The step is GPU-bound at 0.276 s.** After the banked Muon, a profile puts matmuls at 109 ms (about 715 TFLOP/s,
+  near the bf16 peak of the GH200), flex attention at 80 ms (its backward 55), Muon at 26 ms, RMS norms at 17 ms,
+  ReLU-squared at 8 ms and the host idle. More steps now come from attention or from precision,
   not from the host; FP8 did not pay at width 768.
 - **Context use is the open gap, and the value residual opened it.** Through 022 the test loss of the ten-minute
-  model was flat from 50 to 2,046 residues, 0.15 nats under the unigram floor, while the reference models gain most
-  on long proteins. A local prior on attention (012) was the first change beyond noise after the optimizer, and
+  model was flat from 50 to 2,046 residues while the reference models gain most on long proteins: 003, the incumbent
+  when the local prior was proposed, scored 2.746 to 2.762 across the length bins, 0.14 nats under the unigram floor
+  (2.893), and 022 scored 2.737 to 2.755, 0.15 nats under it. A local prior on attention (012) was the first change beyond noise after the optimizer, and
   freeing half the heads (014) gave most of it back. Mixing the first block's values into every block's (028) is
   the first gain that grows with length: 0.004 nats under 100 residues, 0.025 over 500.
 - **The first screen found five gains on the value residual.** Twelve runs switching 11 modules on and off together

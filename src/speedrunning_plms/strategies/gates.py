@@ -20,8 +20,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 from torch import Tensor, nn
 
-from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, ParameterGroup, Strategy, StrategyConfig
 
 
 HEAD_GATE_BIAS = 4.0  # sigmoid(4) = 0.982: the gate starts near open
@@ -36,25 +35,27 @@ class GatesConfig(StrategyConfig):
 class Gates(Strategy):
     family = "gates"
     Config = GatesConfig
+    config: GatesConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         if self.variant != "head_sigmoid":
             return
-        heads = model.strategies.attention.config.heads  # type: ignore[union-attr]
-        self.projections = nn.ModuleList(nn.Linear(benchmark.HIDDEN, heads) for _ in range(benchmark.BLOCKS))
-        model.extensions[self.family] = self.projections  # type: ignore[index]
+        heads = model.strategies.attention.config.heads
+        shape = model.strategies.shape.config
+        self.projections = nn.ModuleList(nn.Linear(shape.hidden, heads) for _ in range(shape.blocks))
+        model.extensions[self.family] = self.projections
 
-    def initialize(self, model: nn.Module) -> None:
+    def initialize(self, model: CandidateModel) -> None:
         if self.variant != "head_sigmoid":
             return
         for projection in self.projections:
             nn.init.zeros_(projection.weight)  # (h, d)
             nn.init.constant_(projection.bias, HEAD_GATE_BIAS)  # (h,)
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if self.variant != "head_sigmoid":
             return []
-        scalar_lr = model.strategies.optimizer.config.scalar_lr  # type: ignore[union-attr]
+        scalar_lr = model.strategies.optimizer.config.scalar_lr
         return [ParameterGroup("head_gates", list(self.projections.parameters()), "adam", scalar_lr)]
 
     def attention_output(self, index: int, X: Tensor, Y: Tensor) -> Tensor:

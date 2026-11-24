@@ -1,6 +1,8 @@
 # The speedrun image: CUDA 12.8 (the box's driver is 570), Python 3.12 in a venv, torch 2.11 cu128 (the newest
-# aarch64 cu128 wheel), this project installed editable. Built and run through run_gh200.sh, which bind-mounts the shipped tree and the foundry import root at
-# their host paths.
+# aarch64 cu128 wheel), this project installed editable. Built and run through run_gh200.sh, which bind-mounts its root at
+# the root's host path and puts src/ first on PYTHONPATH. Shipped from the workspace, the root is the run directory, whose
+# foundry import root sits outside this build context; in a clone of the GitHub repository, the root is the clone, and
+# foundry is vendored in src/foundry, inside the context and installed with the package.
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PATH=/opt/venv/bin:$PATH

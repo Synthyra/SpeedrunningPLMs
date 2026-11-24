@@ -1,0 +1,5 @@
+# The proposer's image for the surrogate head-to-head: the speedrun image plus Kumo Tabular, so the image that trains and scores stays
+# the record's. Only `autosearch.py next` runs in it. Built through run_gh200.sh; the pin is the version the replay ran.
+FROM speedrun_plm:afdb_v6
+
+RUN pip install "structured-data-models==0.2.1"

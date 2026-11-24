@@ -59,18 +59,18 @@ class ReferenceModel:
         for residue in tokens.STANDARD_RESIDUES:
             assert ids[lookup[residue]] != self.tokenizer.unk_token_id, f"{self.model_id} lacks residue {residue}"
         assert ids[lookup["<mask>"]] == self.tokenizer.mask_token_id and ids[lookup["<pad>"]] == self.tokenizer.pad_token_id
-        return torch.tensor(ids, dtype=torch.long)
+        return torch.tensor(ids, dtype=torch.long)  # (33,)
 
     def __call__(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
         # input_ids, attention_mask: (b, l); returns (b, l, v) in the model's vocabulary.
-        return self.model(input_ids=self.id_map[input_ids], attention_mask=attention_mask).logits
+        return self.model(input_ids=self.id_map[input_ids], attention_mask=attention_mask).logits  # (b, l, v)
 
     def hidden_states(self, input_ids: Tensor, attention_mask: Tensor) -> list[Tensor]:
         # input_ids, attention_mask: (b, l); returns k tensors of (b, l, d).
         output = self.model(input_ids=self.id_map[input_ids], attention_mask=attention_mask, output_hidden_states=True)
         states = list(output.hidden_states)
         assert len(states) == self.num_hidden_states, (len(states), self.num_hidden_states)
-        return states
+        return states  # k x (b, l, d)
 
 
 class UnigramModel:
@@ -86,8 +86,8 @@ class UnigramModel:
                                   for residue in tokens.STANDARD_RESIDUES}
 
     def __call__(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
-        # input_ids: (b, l); returns (b, l, v), the same row everywhere.
-        return self.log_frequency.expand(*input_ids.shape, -1)
+        # input_ids, attention_mask: (b, l); returns (b, l, v), the same row everywhere.
+        return self.log_frequency.expand(*input_ids.shape, -1)  # (b, l, v)
 
 
 def evaluate_model(model_id: str, data_dir: Path, output_dir: Path, device: torch.device, *, tokens_per_batch: int,

@@ -6,7 +6,8 @@
 #       first, or of a newly proposed batch; `queue.sh --wait` runs them one after another; `autosearch.py collect`
 #       reads the results into the state and the ledger under $STATE/<--search>; a cycle runs the prefix of its batch
 #       that ends before --until (a rung run its seconds plus three minutes, a full run the track's minutes; the rest
-#       stays pending), never before --after, and never after `touch $STATE/<--search>/stop`
+#       stays pending), never before --after, and never after `touch $STATE/<--search>/stop`; a pick holding what no
+#       valid result has held first compiles and takes two steps, and `autosearch.py trim` drops it if that fails
 #   Each track has its own state folder (`search` for the 10-minute track, `search_1h` for the 1-hour one); the
 #   state's `track` names the clock, and the loop reads the minutes a run from it.
 #   To restart with new strategy modules, ship the tree again with the same command: the new loop records its PID,
@@ -63,8 +64,11 @@ while :; do
     log "waiting for $after_utc"; flock -u 8; sleep 60; continue
   fi
   log "cycle starts"
-  bash run_gh200.sh python autosearch.py next --state-dir "/state/$search_name" --count "$count" 2>&1 | tee -a "$SEARCH/loop.log"
+  proposer_python=python
+  if grep -q '"kumo"' "$SEARCH/search.json"; then proposer_python=python-kumo; fi  # Kumo's package lives only in its own image
+  bash run_gh200.sh "$proposer_python" autosearch.py next --state-dir "/state/$search_name" --count "$count" 2>&1 | tee -a "$SEARCH/loop.log"
   read -r -a names < "$SEARCH/queue_next.txt"
+  if [ "${#names[@]}" -eq 0 ]; then log "nothing pending and the state names no proposer, loop ends"; break; fi
   if [ -n "$until_utc" ]; then  # run the longest prefix of the batch that ends before --until; the rest stays pending
     now=$(date -u +%s); end=$(date -u -d "$until_utc" +%s); need=$((3 * 60)); fit=0
     for name in "${names[@]}"; do
@@ -76,6 +80,23 @@ while :; do
     if [ "$fit" -lt "${#names[@]}" ]; then log "$fit of ${#names[@]} runs end before $until_utc, the rest stay pending"; fi
     names=("${names[@]:0:$fit}")
   fi
+  # A pick holding what no valid result has held compiles and takes two steps first, so a run that will crash never takes a turn.
+  read -r -a unproven < "$SEARCH/preflight_next.txt"
+  kept=()
+  for name in "${names[@]}"; do
+    case " ${unproven[*]-} " in
+      *" $name "*)
+        log "preflight $name"
+        code=0
+        bash run_gh200.sh python train.py --data-dir "$(bash run_gh200.sh data-dir)" --output-dir "/state/preflight/$name" --name "$name" \
+          --genome "candidates/queue/$name.json" --max-steps 2 --skip-final-evals --no-wandb > "$SEARCH/preflight.log" 2>&1 || code=$?
+        bash run_gh200.sh python autosearch.py trim --state-dir "/state/$search_name" --run "$name" --exit-code "$code" 2>&1 | tee -a "$SEARCH/loop.log"
+        ;;
+    esac
+    if grep -qw -- "$name" "$SEARCH/queue_next.txt"; then kept+=("$name"); fi
+  done
+  names=(${kept[@]+"${kept[@]}"})
+  if [ "${#names[@]}" -eq 0 ]; then log "the preflight trimmed every pick of this cycle, proposing again"; continue; fi
   bash queue.sh --wait "${names[@]}" 2>&1 | tee -a "$SEARCH/loop.log"
   crashed=()
   for name in "${names[@]}"; do [ -f "$STATE/runs/$name/result.json" ] || crashed+=("$name"); done

@@ -7,6 +7,7 @@ import json
 import math
 import subprocess
 import sys
+import pytest
 import torch
 
 from pathlib import Path
@@ -14,7 +15,7 @@ from types import ModuleType
 
 from speedrunning_plms import benchmark
 from speedrunning_plms.strategies import Strategies, default_genome, load_genome
-from speedrunning_plms.strategies.attention import document_dense_mask
+from speedrunning_plms.strategies.attention import DEFAULT_BLOCK_SIZE, document_dense_mask
 from speedrunning_plms.strategies.optimizer import Muon, polar_express
 
 
@@ -61,11 +62,14 @@ def test_baseline_genome_is_000_with_every_strategy_off() -> None:
     assert (schedule["momentum"], schedule["momentum_start"], schedule["momentum_warmup"], schedule["momentum_cooldown_end"]) == \
         (recipe.muon_momentum, recipe.muon_momentum_start, recipe.muon_momentum_warmup, recipe.muon_momentum)
     assert genome["attention"] == {"variant": "standard", "heads": recipe.heads, "key_offset": 0.0, "score_cap": 0.0, "local_every": 0,
-                                   "kv_share": 0}
+                                   "kv_share": 0, "qk_share": 1.0, "tie_kv": 0, "exclusive": 0,
+                                   "block_size": DEFAULT_BLOCK_SIZE}  # QK as wide as V, untied, no exclusion, flex's own mask blocks
     assert batch["variant"] == "packed" and batch["window"] == recipe.window
     assert Strategies(genome).batch.step_tokens == recipe.window * recipe.windows_per_step  # 64 windows of 1,024
-    switched_on = {"positional": "alibi", "attention": "standard", "kernel": "default", "residual": "prenorm", "stream": "single",
-                   "activation": "relu2", "head": "linear", "softcap": "tanh", "loss": "plain", "optimizer": "normuon",
+    assert genome["shape"] == {"variant": "dense", "blocks": benchmark.BLOCKS, "hidden": benchmark.HIDDEN,
+                               "intermediate": benchmark.INTERMEDIATE}  # the shape the frozen baseline hard-codes
+    switched_on = {"shape": "dense", "positional": "alibi", "attention": "standard", "kernel": "default", "residual": "prenorm",
+                   "stream": "single", "activation": "relu2", "head": "linear", "softcap": "tanh", "loss": "plain", "optimizer": "normuon",
                    "schedule": "trapezoid", "batch": "packed"}  # families whose default is a choice, not "none"
     for family, fields in genome.items():
         if family not in switched_on:
@@ -77,26 +81,35 @@ def test_baseline_genome_is_000_with_every_strategy_off() -> None:
     assert genome["positional"]["nope_every"] == 0 and genome["positional"]["rope_fraction"] == 1.0
 
 
-def test_shape_rule_refuses_other_shapes() -> None:
+def test_working_code_reads_the_genomes_shape_not_the_old_constants() -> None:
+    project = Path(__file__).resolve().parents[1]
+    sources = [project / "train.py", *sorted((project / "src" / "speedrunning_plms" / "strategies").glob("*.py"))]
+    for path in sources:
+        text = path.read_text(encoding="utf-8")
+        assert not any(f"benchmark.{name}" in text for name in ("BLOCKS", "HIDDEN", "INTERMEDIATE")), path
+
+
+def test_the_architecture_receipt_takes_any_shape_and_refuses_a_missing_skeleton() -> None:
     candidate = load_candidate()
 
-    class Wrong(torch.nn.Module):
-        def __init__(self, blocks: int, hidden: int, intermediate: int) -> None:
+    class Model(torch.nn.Module):
+        def __init__(self, blocks: int, hidden: int, intermediate: int, with_mlp: bool = True) -> None:
             super().__init__()
+            self.embedding = torch.nn.Embedding(benchmark.VOCAB_SIZE, hidden)
             self.blocks = torch.nn.ModuleList()
             for _ in range(blocks):
                 block = torch.nn.Module()
                 block.attention = torch.nn.Linear(hidden, hidden, bias=False)
-                block.mlp = torch.nn.Sequential(torch.nn.Linear(hidden, intermediate, bias=False), torch.nn.Linear(intermediate, hidden, bias=False))
+                if with_mlp:
+                    block.mlp = torch.nn.Sequential(torch.nn.Linear(hidden, intermediate, bias=False), torch.nn.Linear(intermediate, hidden, bias=False))
                 self.blocks.append(block)
 
-    for blocks, hidden, intermediate in ((35, 768, 2048), (36, 512, 2048), (36, 768, 2304)):
-        try:
-            benchmark.check_architecture(Wrong(blocks, hidden, intermediate))
-        except ValueError:
-            continue
-        raise AssertionError(f"{blocks} blocks, {hidden} wide, {intermediate} intermediate was accepted")
-    benchmark.check_architecture(Wrong(36, 768, 2048))
+    for blocks, hidden, intermediate in ((35, 768, 2048), (12, 512, 2048), (36, 768, 2304)):
+        receipt = benchmark.check_architecture(Model(blocks, hidden, intermediate))
+        assert receipt["blocks"] == blocks and receipt["hidden"] == hidden and receipt["block_shapes"][0]["mlp"][0] == (hidden, intermediate)
+    for broken in (Model(0, 768, 2048), Model(4, 768, 2048, with_mlp=False)):
+        with pytest.raises(ValueError):
+            benchmark.check_architecture(broken)
     assert candidate.Strategies(default_genome()).batch.config.window > 0
 
 
@@ -143,8 +156,9 @@ def test_candidate_muon_banks_match_the_per_matrix_update() -> None:
 
 def test_end_to_end_cpu_run_writes_a_result(tiny_data: Path, tmp_path: Path) -> None:
     output = tmp_path / "run"
+    # --max-steps ends the run; the budget must not, and one CPU step of the full model takes over 30 s on a laptop
     command = [sys.executable, str(PROJECT / "train.py"), "--data-dir", str(tiny_data), "--output-dir", str(output),
-               "--name", "test", "--max-steps", "1", "--no-compile", "--no-wandb", "--budget", "30", "--device", "cpu",
+               "--name", "test", "--max-steps", "1", "--no-compile", "--no-wandb", "--budget", "600", "--device", "cpu",
                "--window", "128", "--windows-per-step", "2", "--skip-final-evals"]
     completed = subprocess.run(command, capture_output=True, text=True, cwd=PROJECT)
     assert completed.returncode == 0, completed.stderr[-3000:]

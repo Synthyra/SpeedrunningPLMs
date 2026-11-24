@@ -21,8 +21,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 from torch import Tensor, nn
 
-from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, ParameterGroup, Strategy, StrategyConfig
 
 
 XIELU_BETA = 0.5
@@ -48,20 +47,21 @@ class Activation(Strategy):
     def active(self) -> bool:
         return False  # the MLP calls `apply` directly, never as a hook
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         if self.variant != "xielu":
             return
         holder = nn.Module()
-        holder.raw_positive = nn.Parameter(torch.full((benchmark.BLOCKS,), inverse_softplus(XIELU_ALPHA_INIT)))  # (36,)
-        holder.raw_negative = nn.Parameter(torch.full((benchmark.BLOCKS,), inverse_softplus(XIELU_ALPHA_INIT - XIELU_BETA)))  # (36,)
-        model.extensions[self.family] = holder  # type: ignore[index]
+        blocks = model.strategies.shape.config.blocks
+        holder.raw_positive = nn.Parameter(torch.full((blocks,), inverse_softplus(XIELU_ALPHA_INIT)))  # (blocks,)
+        holder.raw_negative = nn.Parameter(torch.full((blocks,), inverse_softplus(XIELU_ALPHA_INIT - XIELU_BETA)))  # (blocks,)
+        model.extensions[self.family] = holder
         self.holder = holder
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if self.variant != "xielu":
             return []
         parameters = [self.holder.raw_positive, self.holder.raw_negative]
-        return [ParameterGroup("xielu", parameters, "adam", model.strategies.optimizer.config.scalar_lr)]  # type: ignore[union-attr]
+        return [ParameterGroup("xielu", parameters, "adam", model.strategies.optimizer.config.scalar_lr)]
 
     def apply(self, index: int, U: Tensor) -> Tensor:
         # U: (b, l, f), block `index`'s up projection.

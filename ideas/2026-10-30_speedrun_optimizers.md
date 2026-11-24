@@ -396,10 +396,10 @@ weight_decay = 1.0 / (lr * tau_steps)            # tau_steps in steps, searched 
 - QK-Clip and MuonClip (Kimi K2, arXiv 2507.20534): a per-head clip on the maximum attention logit with threshold 100,
   for a mixture of experts with latent attention. Our QK-norm already bounds the logits, so the clip is redundant. I
   read the section; no gain expected.
-- The n-gram hint claim: "NanoGPT Speedrun in 6.7s" (Herman Brunborg, blog and social post, 2026-10-28). It reports a
-  retrieval-augmented n-gram hint built over a 37B-token corpus from the web. That is external data, outside this
-  benchmark's fixed data. A protein version (retrieving homolog sequences) is also external data. No merged PR was
-  found. Not for this benchmark.
+- The n-gram hint claim: "NanoGPT Speedrun in 6.7s" (Herman Brunborg, blog and social post, 2026-10-28). Its 37B-token corpus
+  from the web is external data, and a protein version retrieving homolog sequences would be too. Corrected 2026-11-03: its small
+  tables come from its own training tokens, and counts over this benchmark's training stream are not external. See
+  `2026-11-03_count_hints.md`, which measures them; that idea waits on Logan's ruling.
 - FP8: the catalog's pilot (0.284 s against 0.276 s in bf16) and torchao's docs (small GEMM shapes can be slower in
   FP8 on H100 with cuBLAS). No FP8 path shows a gain at 768 width.
 - Adaptive warmup (arXiv 2602.05813, February 2026): the abstract claims it matches or beats tuned warmup for Muon and

@@ -39,9 +39,9 @@ import torch
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import ClassVar
-from torch import Tensor, nn
+from torch import Tensor
 
-from speedrunning_plms.strategies.strategy import StepState, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, StepState, Strategy, StrategyConfig
 
 
 LAWA_SNAPSHOTS = 8
@@ -59,11 +59,7 @@ class EmaConfig(StrategyConfig):
     VARIANTS: ClassVar[tuple[str, ...]] = ("none", "tail", "latest_k", "drift_leap", "two_decay", "plateau_restart")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"start": (0.3, 0.95), "decay": (0.9, 0.999), "window": (100, 1000),
                                                         "leap": (0.05, 0.5), "decay_fast": (0.9, 0.99)}
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if not isinstance(self.window, int):
-            raise ValueError(f"window must be an integer, not {self.window!r}")
+    INTEGERS: ClassVar[tuple[str, ...]] = ("window",)
 
 
 def scaled_decay(decay: float, run_scale: float) -> float:
@@ -113,6 +109,7 @@ class Ema(Strategy):
     def _record_snapshot(self, live: list[Tensor], state: StepState, count: int) -> None:
         """A ring of `count` snapshots, one every `window` / `count` steps (at the run's scale), reusing the oldest's
         memory once full."""
+        # live: (...) each, one detached tensor per model parameter in `parameters()` order.
         step = state.step
         if step == 0:
             self.snapshots.clear()
@@ -127,6 +124,7 @@ class Ema(Strategy):
 
     def _plateau_restart(self, live: list[Tensor], state: StepState) -> None:
         """Snapshots until `start`, then the live weights become their mean, once."""
+        # live: (...) each, one detached tensor per model parameter.
         if state.step == 0:
             self.restarted = False
         if self.restarted:
@@ -140,29 +138,30 @@ class Ema(Strategy):
 
     def _mean(self) -> list[Tensor]:
         """The uniform mean of the ring's snapshots."""
-        mean = [parameter.clone() for parameter in self.snapshots[0]]
+        mean = [parameter.clone() for parameter in self.snapshots[0]]  # (...) each, one per parameter
         for snapshot in self.snapshots[1:]:
             torch._foreach_add_(mean, snapshot)
         torch._foreach_div_(mean, len(self.snapshots))
-        return mean
+        return mean  # (...) each, one per parameter
 
     def _scored(self, live: list[Tensor]) -> list[Tensor] | None:
         """The weights a validation pass scores, or None to score the live weights."""
+        # live: (...) each, one detached tensor per model parameter; a returned list matches it tensor for tensor.
         if self.variant == "tail":
-            return self.averaged
+            return self.averaged  # (...) each, or None before `start`
         if self.variant == "two_decay":
-            return self.averaged if self.option == 0 else self.averaged_fast
+            return self.averaged if self.option == 0 else self.averaged_fast  # (...) each, or None before `start`
         if not self.snapshots:
             return None
         if self.variant == "drift_leap":
-            earlier = self.snapshots[0]
-            leaped = [parameter.clone() for parameter in live]
+            earlier = self.snapshots[0]  # (...) each
+            leaped = [parameter.clone() for parameter in live]  # (...) each
             torch._foreach_lerp_(leaped, earlier, self.config.leap)  # w + leap (w_earlier - w)
-            return leaped
-        return self._mean()
+            return leaped  # (...) each
+        return self._mean()  # (...) each
 
     @contextlib.contextmanager
-    def evaluation_weights(self, model: nn.Module) -> Iterator[None]:
+    def evaluation_weights(self, model: CandidateModel) -> Iterator[None]:
         live = [parameter.detach() for parameter in model.parameters()]
         scored = self._scored(live)
         if scored is None:

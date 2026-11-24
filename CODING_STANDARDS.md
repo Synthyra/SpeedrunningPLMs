@@ -100,23 +100,9 @@ comment of the body when the signature does not say them.
 - The cross entropy everywhere, training included, is the collapse-free one from `foundry.layers.cross_entropy`;
   PyTorch's appears only in a test, as the reference it is checked against away from the collapse margin.
 
-## What a change may touch
+## What a change may touch, and checking it
 
-A run changes a genome. A new idea is a new module under `src/speedrunning_plms/strategies/` (a config dataclass with
-the record's defaults and a strategy that overrides only the hooks it needs), listed in the registry; `train.py`
-changes only when the skeleton must offer a new hook point, and then the default genome must still equal the record
-bit for bit on a CPU smoke. The modules under `src/speedrunning_plms/benchmark/`, `prepare.py`,
-`baselines.py`, `probe.py`, `record.py` and `plots.py` define the benchmark; a change to them changes what every result
-means and is a separate, deliberate commit with its reason. `AGENTS.md` and `program.md` say how a candidate is tried,
-kept, reverted and recorded.
-
-## Checking
-
-```bash
-pip install -e ".[test]"
-python -m pytest -q
-```
-
-The tests cover every fixed part on the CPU, build every variant of every family and train it one CPU step, check
-that the default genome reproduces the record's frozen `train.py` exactly, check the banked optimizer against the
-per-matrix one, and run each search proposer on a toy objective. A candidate that fails them is not shipped.
+Which files are fixed, when `train.py` may change and how a candidate is tried, kept, reverted and recorded are in
+[`program.md`](program.md#what-a-change-may-touch). How to install, run the tests and add a strategy module (a config
+dataclass with the record's defaults and a strategy that overrides only the hooks it needs) is in
+[`CONTRIBUTING.md`](CONTRIBUTING.md).

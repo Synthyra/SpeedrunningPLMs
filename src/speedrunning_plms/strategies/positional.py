@@ -45,7 +45,7 @@ from typing import ClassVar
 from torch import Tensor, nn
 
 from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig, extension
+from speedrunning_plms.strategies.strategy import CandidateModel, ParameterGroup, Strategy, StrategyConfig, extension
 
 
 ScoreMod = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
@@ -68,11 +68,10 @@ class PositionalConfig(StrategyConfig):
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"rope_base": (1_000.0, 1_000_000.0), "slope_scale": (0.25, 4.0),
                                                         "rope_fraction": (0.1, 1.0), "nope_every": (0, 6),
                                                         "periodic_scale": (0.0, 1.0), "length_bins": (0, 16), "terminus": (0, 1)}
+    INTEGERS: ClassVar[tuple[str, ...]] = ("nope_every",)
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if not isinstance(self.nope_every, int):
-            raise ValueError(f"nope_every must be an integer, not {self.nope_every!r}")
         if self.length_bins not in (0, 8, 16):
             raise ValueError(f"length_bins is 0 (off), 8 or 16, not {self.length_bins!r}")
         if self.terminus not in (0, 1):
@@ -135,32 +134,31 @@ class Positional(Strategy):
     Config = PositionalConfig
     config: PositionalConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
-        attention = model.strategies.attention  # type: ignore[union-attr]
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
+        attention = model.strategies.attention
         holder = nn.Module()
-        holder.rotary = Rotary(benchmark.HIDDEN // attention.config.heads, self.config.rope_base, max_tokens,
-                               self.config.rope_fraction)
+        holder.rotary = Rotary(attention.config.qk_width(model.strategies.shape.config.hidden), self.config.rope_base, max_tokens, self.config.rope_fraction)
         if self.variant == "alibi":
             holder.register_buffer("slopes", geometric_slopes(attention.slope_heads(), self.config.slope_scale),
                                    persistent=False)  # (k,), one slope per attention head the kernel runs
         bins = self.config.length_bins
         if bins:
-            holder.length_table = nn.Embedding(bins, benchmark.HIDDEN, _weight=torch.zeros(bins, benchmark.HIDDEN))  # (bins, d)
+            holder.length_table = nn.Embedding(bins, model.strategies.shape.config.hidden, _weight=torch.zeros(bins, model.strategies.shape.config.hidden))  # (bins, d)
         if self.config.terminus:
-            holder.terminus = nn.Parameter(torch.zeros(2, benchmark.HIDDEN))  # (2, d): the N- and C-terminus vectors
-        model.extensions[self.family] = holder  # type: ignore[index]
+            holder.terminus = nn.Parameter(torch.zeros(2, model.strategies.shape.config.hidden))  # (2, d): the N- and C-terminus vectors
+        model.extensions[self.family] = holder
 
     def overrides(self, hook: str) -> bool:
         return hook == "embed" and (self.config.length_bins > 0 or self.config.terminus > 0)
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         holder = extension(model, self.family)
         tables = ([holder.length_table.weight] if self.config.length_bins else []) + ([holder.terminus] if self.config.terminus else [])
         if not tables:
             return []
-        return [ParameterGroup("input_priors", tables, "adam", model.strategies.optimizer.config.embed_lr)]  # type: ignore[union-attr]
+        return [ParameterGroup("input_priors", tables, "adam", model.strategies.optimizer.config.embed_lr)]
 
-    def embed(self, model: nn.Module, input_ids: Tensor, X: Tensor) -> Tensor:
+    def embed(self, model: CandidateModel, input_ids: Tensor, X: Tensor) -> Tensor:
         # input_ids: (b, l); X: (b, l, d).
         holder = extension(model, self.family)
         if self.config.length_bins:
@@ -171,14 +169,14 @@ class Positional(Strategy):
             X = X + first[..., None].to(X.dtype) * N + last[..., None].to(X.dtype) * C  # (b, l, d)
         return X  # (b, l, d)
 
-    def rotary(self, model: nn.Module) -> Rotary:
+    def rotary(self, model: CandidateModel) -> Rotary:
         return extension(model, self.family).rotary  # type: ignore[return-value]
 
     def rotates(self, index: int) -> bool:
         """False for the blocks `nope_every` leaves without RoPE."""
         return self.config.nope_every == 0 or (index + 1) % self.config.nope_every != 0
 
-    def slopes(self, model: nn.Module) -> Tensor | None:
+    def slopes(self, model: CandidateModel) -> Tensor | None:
         """The fixed slopes, one per attention head the kernel runs, or None without a distance prior."""
         return extension(model, self.family).slopes if self.variant == "alibi" else None  # (k,) or None
 

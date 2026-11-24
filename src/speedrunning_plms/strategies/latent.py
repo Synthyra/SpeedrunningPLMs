@@ -27,11 +27,15 @@ from __future__ import annotations
 import torch
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 from torch import Tensor, nn
 
 from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ForwardContext, ParameterGroup, Strategy, StrategyConfig, norm
+from speedrunning_plms.strategies.strategy import CandidateModel, ForwardContext, ParameterGroup, Strategy, StrategyConfig, norm
+
+
+if TYPE_CHECKING:  # the registry imports this module
+    from speedrunning_plms.strategies import Strategies
 
 
 SIGREG_SHARE = 0.05  # LeJEPA's default lambda between the prediction loss and SIGReg
@@ -48,11 +52,7 @@ class LatentConfig(StrategyConfig):
     weight: float = 0.1
     VARIANTS: ClassVar[tuple[str, ...]] = ("none", "next_layer", "neighbors")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"source_block": (6, 30), "weight": (0.01, 0.5)}
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if not isinstance(self.source_block, int):
-            raise ValueError(f"source_block must be an integer, not {self.source_block!r}")
+    INTEGERS: ClassVar[tuple[str, ...]] = ("source_block",)
 
 
 def epps_pulley(Z: Tensor, weights: Tensor) -> Tensor:
@@ -80,23 +80,30 @@ class Latent(Strategy):
     Config = LatentConfig
     config: LatentConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
-        if self.variant == "next_layer":
-            self.predictor = nn.Linear(benchmark.HIDDEN, benchmark.HIDDEN, bias=False)
-            model.extensions[self.family] = self.predictor  # type: ignore[index]
-        elif self.variant == "neighbors":
-            self.heads = nn.ModuleList(nn.Linear(benchmark.HIDDEN, benchmark.VOCAB_SIZE, bias=False) for _ in NEIGHBOR_OFFSETS)
-            model.extensions[self.family] = self.heads  # type: ignore[index]
+    def conflicts(self, strategies: Strategies) -> list[str]:
+        blocks = strategies.shape.config.blocks
+        if self.variant == "next_layer" and self.config.source_block >= blocks:
+            return [f"the predictor's source block {self.config.source_block} is not before the last of {blocks}"]
+        return []
 
-    def initialize(self, model: nn.Module) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
+        if self.variant == "next_layer":
+            d = model.strategies.shape.config.hidden
+            self.predictor = nn.Linear(d, d, bias=False)
+            model.extensions[self.family] = self.predictor
+        elif self.variant == "neighbors":
+            self.heads = nn.ModuleList(nn.Linear(model.strategies.shape.config.hidden, benchmark.VOCAB_SIZE, bias=False) for _ in NEIGHBOR_OFFSETS)
+            model.extensions[self.family] = self.heads
+
+    def initialize(self, model: CandidateModel) -> None:
         if self.variant == "next_layer":
             nn.init.normal_(self.predictor.weight, std=PREDICTOR_INIT_STD)  # (d, d)
         elif self.variant == "neighbors":
             for head in self.heads:
                 nn.init.normal_(head.weight, std=PREDICTOR_INIT_STD)  # (v, d), the record's head init
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
-        config = model.strategies.optimizer.config  # type: ignore[union-attr]
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
+        config = model.strategies.optimizer.config
         if self.variant == "next_layer":
             # AdamW, not Muon: the loop adds auxiliary losses only on the flex path, so on the CPU the predictor has no
             # gradient, which AdamW skips and Muon's bank of 768 x 768 matrices cannot hold.
@@ -105,7 +112,7 @@ class Latent(Strategy):
             return [ParameterGroup("neighbor_heads", list(self.heads.parameters()), "adam", config.head_lr)]
         return []
 
-    def auxiliary_loss(self, model: nn.Module, states: list[Tensor], labels: Tensor,
+    def auxiliary_loss(self, model: CandidateModel, states: list[Tensor], labels: Tensor,
                        context: ForwardContext) -> Tensor:
         # states: (b, l, d) each, 37 of them; labels: (b, l); returns ().
         if self.variant == "neighbors":

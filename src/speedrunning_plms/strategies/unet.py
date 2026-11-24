@@ -11,11 +11,14 @@ from __future__ import annotations
 import torch
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 from torch import Tensor, nn
 
-from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, ParameterGroup, Strategy, StrategyConfig
+
+
+if TYPE_CHECKING:  # the registry imports this module
+    from speedrunning_plms.strategies import Strategies
 
 
 @dataclass(frozen=True)
@@ -31,21 +34,26 @@ class UNet(Strategy):
     Config = UNetConfig
     config: UNetConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def conflicts(self, strategies: Strategies) -> list[str]:
+        blocks = strategies.shape.config.blocks
+        return [f"a mirror needs an even depth, not {blocks} blocks"] if self.active and blocks % 2 else []
+
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
+        self.half = model.strategies.shape.config.blocks // 2
         if self.variant == "mirrored":
-            self.weights = nn.Parameter(torch.full((benchmark.BLOCKS // 2,), self.config.initial_weight))  # (18,)
+            self.weights = nn.Parameter(torch.full((self.half,), self.config.initial_weight))  # (blocks / 2,)
             holder = nn.Module()
             holder.weights = self.weights
-            model.extensions[self.family] = holder  # type: ignore[index]
+            model.extensions[self.family] = holder
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if self.variant == "none":
             return []
-        return [ParameterGroup("unet", [self.weights], "adam", model.strategies.optimizer.config.embed_lr)]  # type: ignore[union-attr]
+        return [ParameterGroup("unet", [self.weights], "adam", model.strategies.optimizer.config.embed_lr)]
 
-    def block_input(self, model: nn.Module, index: int, X: Tensor, states: list[Tensor]) -> Tensor:
+    def block_input(self, model: CandidateModel, index: int, X: Tensor, states: list[Tensor]) -> Tensor:
         # X: (b, l, d); states: (b, l, d) each, the stream after j blocks at j.
-        half = benchmark.BLOCKS // 2
+        half = self.half
         if index < half:
             return X  # (b, l, d)
         return X + self.weights[index - half] * states[half - (index - half)]  # (b, l, d)

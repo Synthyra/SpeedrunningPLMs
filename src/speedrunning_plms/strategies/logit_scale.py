@@ -21,9 +21,8 @@ from dataclasses import dataclass
 from typing import ClassVar
 from torch import Tensor, nn
 
-from speedrunning_plms import benchmark
 from speedrunning_plms.strategies.attention import DIFFERENTIAL
-from speedrunning_plms.strategies.strategy import ForwardContext, ParameterGroup, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, ForwardContext, ParameterGroup, Strategy, StrategyConfig
 
 
 @dataclass(frozen=True)
@@ -39,22 +38,22 @@ class LogitScale(Strategy):
     Config = LogitScaleConfig
     config: LogitScaleConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         if self.variant == "none":
             return
-        strategies = model.strategies  # type: ignore[union-attr]
+        strategies = model.strategies
         attention = strategies.attention.config
         query_heads = 2 * attention.heads if attention.variant in DIFFERENTIAL else attention.heads  # q
         self.log_n = math.log(strategies.batch.config.window)
-        self.scales = nn.Parameter(torch.full((benchmark.BLOCKS, query_heads), self.config.initial_scale / self.log_n))  # (36, q)
+        self.scales = nn.Parameter(torch.full((model.strategies.shape.config.blocks, query_heads), self.config.initial_scale / self.log_n))  # (blocks, q)
         holder = nn.Module()
         holder.scales = self.scales
-        model.extensions[self.family] = holder  # type: ignore[index]
+        model.extensions[self.family] = holder
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if self.variant == "none":
             return []
-        return [ParameterGroup("ssmax", [self.scales], "adam", model.strategies.optimizer.config.scalar_lr)]  # type: ignore[union-attr]
+        return [ParameterGroup("ssmax", [self.scales], "adam", model.strategies.optimizer.config.scalar_lr)]
 
     def queries(self, index: int, Q: Tensor, context: ForwardContext) -> Tensor:
         # Q: (b, l, q, d_h).

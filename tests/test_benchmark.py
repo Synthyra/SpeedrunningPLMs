@@ -74,6 +74,38 @@ def test_prepare_builds_a_verifiable_benchmark(tiny_data: Path) -> None:
         corrupt_file.write_bytes(original)
 
 
+def test_an_exclusion_drops_training_proteins_and_keeps_everything_else(tiny_data: Path, tmp_path: Path) -> None:
+    excluded = np.array([7, 0, 299, 7, 150])  # out of order, repeated, both ends of the stream
+    derived_dir = tmp_path / "derived"
+    exclusion = {"rule": "a test", "benchmark": "none"}
+    manifest = benchmark.exclude_training(tiny_data, derived_dir, excluded, exclusion)
+    source_manifest = benchmark.load_manifest(tiny_data)
+    assert manifest == benchmark.load_manifest(derived_dir) and manifest["train"]["proteins"] == 296
+    assert manifest["train_exclusion"] == {**exclusion, "source_benchmark_id": benchmark.benchmark_id(source_manifest), "proteins": 4}
+    assert benchmark.benchmark_id(manifest) != benchmark.benchmark_id(source_manifest)
+    source, derived = benchmark.load_train(tiny_data), benchmark.load_train(derived_dir)
+    kept = [index for index in range(300) if index not in {0, 7, 150, 299}]
+    for position, index in enumerate(kept):  # the rest in their order, tokens and 3Di states intact
+        assert np.array_equal(derived.protein(position), source.protein(index))
+        assert np.array_equal(derived.three_di[derived.offsets[position] : derived.offsets[position + 1]],
+                              source.three_di[source.offsets[index] : source.offsets[index + 1]])
+    assert len(derived.offsets) == 297 and derived.offsets[-1] == len(derived.tokens) == manifest["train"]["tokens"]
+    families = json.loads((derived_dir / "train_families.json").read_text(encoding="utf-8"))
+    source_families = json.loads((tiny_data / "train_families.json").read_text(encoding="utf-8"))
+    assert families == [source_families[index] for index in kept]
+    assert derived.probe_subset.tolist() == [families.index(family) for family in dict.fromkeys(families)]  # each family's first
+    assert np.fromfile(derived_dir / "train_excluded.i64", dtype=np.int64).tolist() == [0, 7, 150, 299]
+    for split in data.HELD_OUT_SPLITS:
+        assert (derived_dir / f"{split}.pt").read_bytes() == (tiny_data / f"{split}.pt").read_bytes()
+        benchmark.load_held_out(derived_dir, split)  # the digests in the new manifest verify
+    with pytest.raises(ValueError, match="already derived"):
+        benchmark.exclude_training(derived_dir, tmp_path / "twice", excluded, exclusion)
+    with pytest.raises(ValueError, match="must lie in"):
+        benchmark.exclude_training(tiny_data, tmp_path / "outside", np.array([300]), exclusion)
+    with pytest.raises(FileExistsError):
+        benchmark.exclude_training(tiny_data, derived_dir, excluded, exclusion)
+
+
 class ToyScorer(torch.nn.Module):
     """Logits from a fixed table over the ESM2 alphabet, a different vocabulary width to exercise the column map."""
 
@@ -84,11 +116,11 @@ class ToyScorer(torch.nn.Module):
         self.residue_columns = torch.arange(tokens.NUM_CLASSES) + 5  # the 20 classes live at columns 5..24
 
     def forward(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
-        # input_ids: (b, l); returns (b, l, v).
-        return self.table[input_ids]
+        # input_ids, attention_mask: (b, l); returns (b, l, v).
+        return self.table[input_ids]  # (b, l, v)
 
     def hidden_states(self, input_ids: Tensor, attention_mask: Tensor) -> list[Tensor]:
-        return [self.table[input_ids][..., :8], self.table[input_ids][..., 8:16]]
+        return [self.table[input_ids][..., :8], self.table[input_ids][..., 8:16]]  # input_ids, attention_mask: (b, l); (b, l, w1), (b, l, w2), w1 = min(8, vocab), w2 = max(0, min(16, vocab) - 8)
 
 
 def test_evaluator_matches_a_direct_computation(tiny_data: Path) -> None:

@@ -33,6 +33,28 @@ def load_candidate_module(path: Path) -> ModuleType:
     return module
 
 
+def load_run_snapshot(run_dir: Path) -> ModuleType:
+    """A genome run's own `train.py`, importing the run's `strategies/` snapshot as `speedrunning_plms.strategies`, both
+    checked against the digests in its `result.json`: the run rebuilds as it ran, whatever the working modules are now.
+    Call it before anything imports the working strategy modules for another model in the same process."""
+    from speedrunning_plms.strategies import sources_sha256
+
+    parts = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))["candidate_parts"]
+    snapshot = run_dir / "strategies"
+    if benchmark.candidate_sha256(run_dir / "train.py") != parts["train.py"] or sources_sha256(snapshot) != parts["strategies"]:
+        raise ValueError(f"{run_dir}'s train.py or strategies/ snapshot is not what the run used")
+    for name in [name for name in sys.modules if name == "speedrunning_plms.strategies" or name.startswith("speedrunning_plms.strategies.")]:
+        del sys.modules[name]
+    specification = importlib.util.spec_from_file_location("speedrunning_plms.strategies", snapshot / "__init__.py",
+                                                           submodule_search_locations=[str(snapshot)])
+    if specification is None or specification.loader is None:
+        raise ImportError(f"cannot load {snapshot}")
+    package = importlib.util.module_from_spec(specification)
+    sys.modules["speedrunning_plms.strategies"] = package
+    specification.loader.exec_module(package)
+    return load_candidate_module(run_dir / "train.py")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-dir", type=Path, required=True)
@@ -67,7 +89,7 @@ def main() -> None:
     model.eval()
 
     stream = benchmark.load_train(arguments.data_dir)
-    head = probe.train_head(model, stream, device, hidden=benchmark.HIDDEN, num_hidden_states=benchmark.BLOCKS + 1)
+    head = probe.train_head(model, stream, device, hidden=model.embedding.embedding_dim, num_hidden_states=len(model.blocks) + 1)
     metrics = {split: probe.score_head(model, head, benchmark.load_held_out(arguments.data_dir, split), device,
                                        tokens_per_batch=arguments.tokens_per_batch)
                for split in ("validation", "test")}

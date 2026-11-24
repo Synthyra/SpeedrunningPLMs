@@ -15,8 +15,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 from torch import Tensor, nn
 
-from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, ParameterGroup, Strategy, StrategyConfig
 
 
 @dataclass(frozen=True)
@@ -32,22 +31,23 @@ class EmbeddingMix(Strategy):
     Config = EmbeddingMixConfig
     config: EmbeddingMixConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         if self.variant == "every_block":
             holder = nn.Module()
-            holder.stream = nn.Parameter(torch.ones(benchmark.BLOCKS))  # (36,): a, block 0's unused
-            holder.embedding = nn.Parameter(torch.full((benchmark.BLOCKS,), self.config.initial_share))  # (36,): c
+            blocks = model.strategies.shape.config.blocks
+            holder.stream = nn.Parameter(torch.ones(blocks))  # (blocks,): a, block 0's unused
+            holder.embedding = nn.Parameter(torch.full((blocks,), self.config.initial_share))  # (blocks,): c
             self.holder = holder
-            model.extensions[self.family] = holder  # type: ignore[index]
+            model.extensions[self.family] = holder
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if self.variant == "none":
             return []
         weights = [self.holder.stream, self.holder.embedding]
-        return [ParameterGroup("embedding_mix", weights, "adam", model.strategies.optimizer.config.scalar_lr)]  # type: ignore[union-attr]
+        return [ParameterGroup("embedding_mix", weights, "adam", model.strategies.optimizer.config.scalar_lr)]
 
-    def block_input(self, model: nn.Module, index: int, X: Tensor, states: list[Tensor]) -> Tensor:
-        # X: (b, l, d); states[0]: (b, l, d), the embedding.
+    def block_input(self, model: CandidateModel, index: int, X: Tensor, states: list[Tensor]) -> Tensor:
+        # X: (b, l, d); states: (b, l, d) each, the embedding then every earlier block's output; states[0] is the embedding.
         if index == 0:
             return X  # (b, l, d): the stream is the embedding
         return self.holder.stream[index] * X + self.holder.embedding[index] * states[0]  # (b, l, d)

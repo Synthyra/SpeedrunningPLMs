@@ -1,23 +1,25 @@
 # SpeedrunningPLMs: how to work here
 
-Read `program.md` first: it is the brief for running the loop. The short form:
+Read [`program.md`](program.md) first: it holds the benchmark's rules, the files a change may touch, the hook reference
+and the search, and your place in the loop. [`CONTRIBUTING.md`](CONTRIBUTING.md) holds every command: install, the
+tiny data, the CPU smoke, the tests, adding a module, running a genome and submitting a record attempt. What an agent
+needs beyond those two:
 
-- A candidate is a genome (a JSON file of family choices) built by `train.py`'s skeleton from the strategy modules in
-  `src/speedrunning_plms/strategies/`. A new idea is a module file listed in the registry, not a fork of `train.py`.
-  Everything under `src/speedrunning_plms/benchmark/` (data, tokens, the evaluator, the clock, the shape rule, the
-  result schema, the probe), `prepare.py`, `baselines.py`, `probe.py`, `record.py` and `plots.py` are fixed; a change
-  to them changes the benchmark and is a separate, deliberate commit.
-- `search.py` proposes genomes (screening, Bayes, genetic), ships them through `queue.sh`, and reads the results into
-  the campaign ledger with their proposer, parents and reason; its state file sits beside the ledger. The agent
-  reasons on top: reads the state and the screening effects, adds modules, retires inert ones, lets the proposers run.
-- A 600 s run is kept when its `val_select` loss is the lowest so far; seed 0 decides. Every run is recorded with its
-  verdict and reason. `ideas/README.md` is the module catalog: each family's variants and evidence, and the ideas
-  not yet a module. `results.md` holds the records and what each track learned; `README.md` only points to it, so a
-  new record changes the README's record table and `results.md`.
-- With no genome `train.py` equals 022 bit for bit on a CPU smoke (`tests/test_strategies.py`). Smoke a
-  new module on the CPU before it goes to the GPU: `python train.py --data-dir <tiny> --output-dir <out> --name smoke
-  --device cpu --no-compile --no-wandb --window 64 --windows-per-step 2 --max-steps 3 --skip-final-evals --genome g.json`.
-- The clock measures applied training steps only; compile warmup and in-run validation are outside it and capped.
-  A candidate that breaks a cap is `invalid`, not a record.
-- Python follows `CODING_STANDARDS.md`: import order, precise types, intent comments, and a shape trace on every
-  tensor line. `candidates/` snapshots are frozen bytes and exempt.
+- A new idea is a strategy module listed in the registry, never a fork of `train.py`. Smoke every new module on the
+  CPU before it goes to the GPU, and run the narrow test selection for its family; the whole suite takes about an hour
+  on a laptop CPU.
+- You reason on top of the search: read the state and the screening effects, add modules, retire inert ones, and let
+  the proposers run. Every run is recorded with its verdict and reason; the verdicts are defined in
+  [program.md](program.md#the-loop-by-hand).
+- [`ideas/README.md`](ideas/README.md) is the module catalog: record a module's evidence there when it runs.
+  [`results.md`](results.md) holds the records, the hand-run candidates and what each track learned. A new record
+  changes `results.md` and the record table of the public README (`README.md` on GitHub, `PUBLIC_README.md` in the
+  workspace this repository is published from); `tests/test_documents.py` checks that the two agree.
+- Python follows [`CODING_STANDARDS.md`](CODING_STANDARDS.md): import order, precise types, intent comments, and a
+  shape trace on every tensor line. `candidates/` snapshots are frozen bytes and exempt.
+
+In the workspace this repository is published from (not part of the repository): run the commands of
+`CONTRIBUTING.md` as `./ws.cmd run speedrunning_plms -- python ...` from the workspace root; the search states and the
+campaign ledgers are in `experiments/representation/speedrunning_plms/` (`2026-10-28_afdb_v6_speedrun` for the
+10-minute track, `2026-10-31_afdb_v6_speedrun_1h` for the 1-hour track); and the project's `README.md` is the
+workspace's manifest, never published.

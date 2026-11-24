@@ -21,23 +21,19 @@ from typing import ClassVar
 from torch import Tensor, nn
 
 from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ForwardContext, StepState, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, FadingWeight, ForwardContext, StepState, Strategy, StrategyConfig
 
 
 READS = (18, 27)  # the blocks whose outputs the head reads in training
 
 
 @dataclass(frozen=True)
-class DeepSupervisionConfig(StrategyConfig):
+class DeepSupervisionConfig(FadingWeight, StrategyConfig):
     variant: str = "none"
     weight: float = 0.1  # the intermediate losses' weight at the start of the clock
     until: float = 0.5  # the share of the clock where the weight reaches 0
     VARIANTS: ClassVar[tuple[str, ...]] = ("none", "mid_heads")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"weight": (0.02, 0.5), "until": (0.1, 0.9)}
-
-    def weight_at(self, progress: float) -> float:
-        """The intermediate losses' weight at this share of the clock."""
-        return self.weight * max(0.0, 1 - progress / self.until)
 
 
 class DeepSupervision(Strategy):
@@ -45,19 +41,19 @@ class DeepSupervision(Strategy):
     Config = DeepSupervisionConfig
     config: DeepSupervisionConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         if self.active:
             self.holder = nn.Module()
             self.holder.register_buffer("weight", torch.zeros(()), persistent=False)  # (), refilled each step
-            model.extensions[self.family] = self.holder  # type: ignore[index]
+            model.extensions[self.family] = self.holder
 
-    def initialize(self, model: nn.Module) -> None:
+    def initialize(self, model: CandidateModel) -> None:
         if self.active:
             self.holder.weight.fill_(self.config.weight_at(0.0))
 
-    def auxiliary_loss(self, model: nn.Module, states: list[Tensor], labels: Tensor, context: ForwardContext) -> Tensor:
+    def auxiliary_loss(self, model: CandidateModel, states: list[Tensor], labels: Tensor, context: ForwardContext) -> Tensor:
         # states: (b, l, d) each, the embedding then every block's output; labels: (b, l); returns ().
-        summed = sum(benchmark.masked_cross_entropy(model.logits(states[block + 1]), labels) for block in READS)  # type: ignore[operator]
+        summed = sum(benchmark.masked_cross_entropy(model.logits(states[block + 1]), labels) for block in READS)
         return self.holder.weight * summed  # ()
 
     def after_step(self, state: StepState) -> None:

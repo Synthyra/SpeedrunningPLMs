@@ -154,7 +154,11 @@ def _write_train(frame: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
         stream[start + 1 : end - 1] = np.asarray(tokens.encode_residues(sequence), dtype=np.uint8)  # (length,)
         stream[end - 1] = tokens.EOS_ID
         three_di[start + 1 : end - 1] = np.asarray(tokens.encode_three_di(state_string, len(sequence)), dtype=np.uint8)
-    # The probe subset: the first protein of each family in stream order, the first PROBE_SUBSET_SIZE families met.
+    return _write_train_files(output_dir, stream, offsets, three_di, families.tolist())
+
+
+def _probe_subset(families: list[str]) -> list[int]:
+    """The probe subset: the first protein of each family in stream order, the first PROBE_SUBSET_SIZE families met."""
     seen: set[str] = set()
     subset: list[int] = []
     for index, family in enumerate(families):
@@ -163,13 +167,60 @@ def _write_train(frame: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
             subset.append(index)
         if len(subset) == PROBE_SUBSET_SIZE:
             break
+    return subset
+
+
+def _write_train_files(output_dir: Path, stream: np.ndarray, offsets: np.ndarray, three_di: np.ndarray, families: list[str]) -> dict[str, Any]:
+    subset = _probe_subset(families)
     stream.tofile(output_dir / "train_tokens.u8")
     offsets.tofile(output_dir / "train_offsets.i64")
     three_di.tofile(output_dir / "train_three_di.u8")
     np.asarray(subset, dtype=np.int64).tofile(output_dir / "probe_subset.i64")
-    (output_dir / "train_families.json").write_text(json.dumps(families.tolist()), encoding="utf-8")
-    return {"proteins": int(len(sequences)), "tokens": int(offsets[-1]), "residues": int(lengths.sum()),
-            "families": int(len(set(families.tolist()))), "probe_subset": len(subset)}
+    (output_dir / "train_families.json").write_text(json.dumps(families), encoding="utf-8")
+    return {"proteins": len(families), "tokens": int(offsets[-1]), "residues": int(offsets[-1]) - 2 * len(families),
+            "families": len(set(families)), "probe_subset": len(subset)}
+
+
+def exclude_training(source_dir: Path, output_dir: Path, excluded: np.ndarray, exclusion: dict[str, Any]) -> dict[str, Any]:
+    """A data directory like the prepared `source_dir` without the training proteins at stream indices `excluded`.
+
+    The held-out files are copied byte for byte, the remaining proteins keep their stream order, the probe subset is
+    chosen again by its rule, and the manifest adds `train_exclusion`: `exclusion` (what was removed and why), the
+    source's benchmark id and the removed indices, also written as `train_excluded.i64`. The benchmark id changes.
+    """
+    import shutil
+
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"refusing to overwrite the nonempty data directory {output_dir}")
+    source = load_manifest(source_dir)
+    if "train_exclusion" in source:
+        raise ValueError(f"{source_dir} is already derived; exclude from the prepared original")
+    stream = load_train(source_dir)
+    proteins = len(stream.offsets) - 1
+    excluded = np.unique(np.asarray(excluded, dtype=np.int64))  # (x,)
+    if excluded.size and (excluded[0] < 0 or excluded[-1] >= proteins):
+        raise ValueError(f"excluded indices must lie in [0, {proteins})")
+    keep = np.ones(proteins, dtype=bool)  # (n_train,)
+    keep[excluded] = False
+    token_counts = np.diff(stream.offsets)  # (n_train,) residues + 2
+    kept_tokens = np.repeat(keep, token_counts)  # (t,)
+    offsets = np.zeros(int(keep.sum()) + 1, dtype=np.int64)  # (n_keep + 1,)
+    np.cumsum(token_counts[keep], out=offsets[1:])
+    families = json.loads((source_dir / "train_families.json").read_text(encoding="utf-8"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    train = _write_train_files(output_dir, np.asarray(stream.tokens)[kept_tokens], offsets, np.asarray(stream.three_di)[kept_tokens],
+                               [family for family, kept in zip(families, keep.tolist(), strict=True) if kept])
+    excluded.tofile(output_dir / "train_excluded.i64")
+    for split in HELD_OUT_SPLITS:
+        shutil.copyfile(source_dir / f"{split}.pt", output_dir / f"{split}.pt")
+    manifest = {**source, "train": train, "files": {},
+                "train_exclusion": {**exclusion, "source_benchmark_id": benchmark_id(source), "proteins": int(excluded.size)}}
+    for path in sorted(output_dir.iterdir()):
+        manifest["files"][path.name] = {"sha256": sha256_file(path), "bytes": path.stat().st_size}
+    for split in HELD_OUT_SPLITS:
+        assert manifest["files"][f"{split}.pt"] == source["files"][f"{split}.pt"], f"{split}.pt changed in the copy"
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
 
 
 def prepare(output_dir: Path, source_dir: Path) -> dict[str, Any]:

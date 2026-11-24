@@ -10,9 +10,11 @@ Three proposers share one interface (`propose(observations, count, rng)`):
 - `genetic`: a population of 8 by tournament from the observed genomes, uniform crossover over families and mutation of
   variants and numbers.
 Beside them, `manual` wraps genome files the agent names, each with its hypothesis (a pilot of new modules).
+Beside them, `random` draws uniformly over the open space: a track's first design, before the others have observations.
 Successive halving on the clock: an adaptive batch first runs at 180 s (scored on val_select alone) and only the top
 half runs the full 600 s. Every proposal, its parents and its proposer's reason are recorded in the ledger
-(`runs.jsonl`) when its result is collected, and the whole state lives in a JSON file beside the ledger.
+(`runs.jsonl`) when its result is collected, and the whole state lives in a JSON file beside the ledger. What a genome
+may vary, the screening switches and the compile costs are the catalog in `search_space.py`, read here as `search.<name>`.
 
     python search.py --state S propose --proposer screening --batch screen1 [--factors unet gates ...]
     python search.py --state S ship --batch screen1     # queue files, then $SPEEDRUN_LAUNCHER bash queue.sh --wait ...
@@ -34,22 +36,139 @@ import re
 import shlex
 import subprocess
 import numpy as np
+import pandas as pd
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, NotRequired, Protocol, TypedDict
 
-from speedrunning_plms.strategies import FAMILIES, Genome, default_genome, genome_document, genome_sha256, resolve
+from search_space import (BACKPROP_FREE_SWITCHES, COMPILE_SECONDS, NUMBER_VARIANTS, PEAK_CAP_GIB, PEAK_PREDICTION_ERROR,
+                          RECORD_PEAK_GIB, RECORD_WARMUP, SPACE, SWITCHES, WARMUP_CAP, WARMUP_MARGIN, Dimension, GenomeValue)
+from speedrunning_plms.strategies import FAMILIES, Genome, GenomeConflict, default_genome, genome_document, genome_sha256, resolve
+from speedrunning_plms.strategies.batch import STEP_TOKENS
+from speedrunning_plms.strategies.shape import ShapeConfig
+
+
+class Track(TypedDict):
+    """One clock's budgets and its queue arguments; a state may override `group` and add `final_splits`."""
+
+    budget: int  # the full run's seconds on the clock
+    rung: int  # the short rung of successive halving
+    rungs: list[int]  # the budgets an autosearch batch runs, in order
+    eval_cap: float
+    eval_interval: float
+    prefix: str  # keeps the tracks' batch and run names apart in the one runs folder
+    group: str  # the W&B group and experiment id
+    final_splits: NotRequired[list[str]]
+
+
+class RungResult(TypedDict):
+    """One run's outcome at one budget, as `collect` or `mark_crashed` writes it."""
+
+    run: str
+    val_select: float | None
+    test: float | None
+    steps: int
+    warmup_seconds: float | None
+    valid: bool
+    candidate_sha256: NotRequired[str]  # absent for a crash, which left no result.json
+    crash: NotRequired[str]
+
+
+class ProposalRecord(TypedDict):
+    batch: str
+    proposer: str
+    parents: list[str]
+    reason: str
+    genome: dict[str, dict[str, Any]]  # the genome document's families
+    genome_sha256: str
+    factors: dict[str, int]  # a screening run's switch levels, +1 or -1
+    results: dict[str, RungResult]  # by budget, as text
+    promoted: bool  # whether it runs the full budget
+
+
+class Shipment(TypedDict):
+    budget: int
+    names: list[str]
+    utc: str
+
+
+class BatchRecord(TypedDict):
+    proposer: str
+    rungs: list[int]
+    seed: int
+    names: list[str]  # its proposals' names, which are their full-budget run names
+    created_utc: str
+    shipments: list[Shipment]
+
+
+class SeededRun(TypedDict):
+    genome: dict[str, dict[str, Any]]
+    val_select: float
+
+
+class OtherTrackRow(TypedDict):
+    name: str
+    genome: dict[str, dict[str, Any]]
+    budget: int
+    val_select: float
+
+
+class TrimmedPick(TypedDict):
+    """A pick autosearch took out after a failed preflight or a crash, and what that retired."""
+
+    run: str
+    kind: str  # "preflight" or "crash"
+    why: str
+    retired: list[str]
+    genome: dict[str, dict[str, Any]]
+    reason: str
+    utc: str
+
+
+class SearchState(TypedDict):
+    """The `search.json` document. `load_state` fills `track`; the rest of the optional keys are a state's own choices."""
+
+    schema: int
+    track: str
+    batches: dict[str, BatchRecord]
+    proposals: dict[str, ProposalRecord]
+    seeded: dict[str, SeededRun]
+    retired: list[str]  # `family.variant=value` or `family.field` keys out of the space
+    proposers: NotRequired[list[str]]  # autosearch's turns
+    rungs: NotRequired[list[int]]  # autosearch's budgets for a batch
+    group: NotRequired[str]
+    prefix: NotRequired[str]  # its batch names, apart from another search seeded from the same track's state
+    final_splits: NotRequired[list[str]]
+    other_track_rows: NotRequired[list[OtherTrackRow]]
+    trimmed: NotRequired[list[TrimmedPick]]
+
+
+class RunName(NamedTuple):
+    """A run name read back: `<batch>_<index>` is the proposal's name and its full-budget run, `_r<budget>` a shorter rung."""
+
+    proposal: str
+    batch: str
+    index: int
+    budget: int
+
+
+class DueRun(NamedTuple):
+    """One run a shipment writes to the queue."""
+
+    batch: str
+    run: str
+    rung: int
 
 
 PROJECT = Path(__file__).resolve().parent
 NOISE_SD = 0.0015  # one seed's spread on val_select: 004 against 003, and 015 at seeds 0, 1 and 2
 # The tracks: a state names one, and `load_state` applies it to the module's budgets. The 1-hour track's rungs put
 # every proposal through 600 s first; its evals are spaced and capped at six times the 10-minute track's interval
-# (Logan, 2026-10-30: good selection without spending too much time on eval). `prefix` keeps the two tracks' batch and
-# run names apart in the one runs folder; `group` is the track's W&B group and experiment id.
-TRACKS: dict[str, dict[str, Any]] = {
+# (Logan, 2026-10-30: good selection without spending too much time on eval).
+TRACKS: dict[str, Track] = {
     "10min": {"budget": 600, "rung": 180, "rungs": [600], "eval_cap": 60.0, "eval_interval": 90.0, "prefix": "",
               "group": "2026-10-28_afdb_v6_speedrun"},
     "1h": {"budget": 3600, "rung": 600, "rungs": [600, 3600], "eval_cap": 360.0, "eval_interval": 180.0, "prefix": "h_",
@@ -60,342 +179,8 @@ FULL_BUDGET = TRACK["budget"]
 RUNG_BUDGET = TRACK["rung"]
 STATE_SCHEMA = 1
 DEFAULT_RECORD = "022_embed_head_lr"  # the run the default genome reproduces
-
-
-@dataclass(frozen=True)
-class Dimension:
-    """One searched coordinate of a genome: a family's variant or one numeric field."""
-
-    key: str  # "family.field"
-    choices: tuple[str | int, ...] = ()  # a variant's or a categorical number's allowed values; empty for a number
-    low: float = 0.0
-    high: float = 1.0
-    log: bool = False
-    integer: bool = False
-
-    @property
-    def family(self) -> str:
-        return self.key.split(".")[0]
-
-    @property
-    def name(self) -> str:
-        return self.key.split(".")[1]
-
-    @property
-    def categorical(self) -> bool:
-        return bool(self.choices)
-
-
-SPACE: tuple[Dimension, ...] = (
-    Dimension("attention.variant", ("standard", "differential", "triangle", "triangle_differential", "paired")),
-    Dimension("attention.heads", (12, 6)),
-    Dimension("positional.variant", ("none", "alibi")),
-    Dimension("positional.slope_scale", low=0.5, high=2.0, log=True),
-    Dimension("positional.rope_base", low=1e4, high=1e5, log=True),
-    Dimension("positional.rope_fraction", low=0.1, high=1.0, log=True),
-    Dimension("positional.nope_every", low=0, high=6, integer=True),
-    # Numbers whose 0 is off, as choices with 0 first, so a draw can leave them off.
-    Dimension("positional.periodic_scale", (0.0, 0.25, 0.5, 1.0)),
-    Dimension("positional.length_bins", (0, 8, 16)),
-    Dimension("positional.terminus", (0, 1)),
-    Dimension("attention.local_every", (0, 2, 3)),
-    Dimension("attention.kv_share", (0, 2, 3)),
-    Dimension("attention.key_offset", (0.0, 0.125, 0.25, 0.5)),
-    Dimension("attention.score_cap", (0.0, 4.0, 5.0, 6.0, 8.0)),
-    Dimension("kernel.variant", ("default", "flash", "cudagraphs")),
-    Dimension("head.variant", ("linear", "two_layer")),
-    Dimension("logit_scale.variant", ("none", "ssmax")),
-    Dimension("logit_scale.initial_scale", low=0.5, high=2.0, log=True),
-    Dimension("residual.variant", ("prenorm", "ngpt", "perinorm", "ln_scaling")),
-    Dimension("residual.alpha_init", low=0.02, high=0.2, log=True),
-    Dimension("residual.branch_multiplier", low=0.25, high=1.0, log=True),
-    Dimension("residual.branch_ramp", low=0.0, high=0.3),
-    Dimension("residual.branch_start", low=0.0, high=0.5),
-    Dimension("residual.learned_gain", (0.0, 0.1, 0.3, 1.0)),  # 0 is off; the gates' start otherwise
-    Dimension("activation.variant", ("relu2", "xielu")),
-    Dimension("latent.variant", ("none", "next_layer", "neighbors")),
-    Dimension("latent.source_block", low=6, high=30, integer=True),
-    Dimension("latent.weight", low=0.01, high=0.5, log=True),
-    Dimension("grouping.variant", ("none", "physchem")),
-    Dimension("grouping.weight", low=0.02, high=0.5, log=True),
-    Dimension("grouping.until", low=0.1, high=0.8),
-    Dimension("memory.variant", ("none", "product_keys", "shared_pool")),
-    Dimension("memory.block", low=6, high=30, integer=True),
-    Dimension("deep_supervision.variant", ("none", "mid_heads")),
-    Dimension("deep_supervision.weight", low=0.02, high=0.3, log=True),
-    Dimension("deep_supervision.until", low=0.3, high=0.8),
-    Dimension("stream.variant", ("single", "hyper", "dense", "attention_residual")),
-    Dimension("stream.streams", low=2, high=4, integer=True),
-    Dimension("unet.variant", ("none", "mirrored")),
-    Dimension("embedding_mix.variant", ("none", "every_block")),
-    Dimension("embedding_mix.initial_share", low=0.0, high=0.3),
-    Dimension("neighbor.variant", ("none", "pair_table", "bigram_table", "trigram_table")),
-    Dimension("loss.variant", ("plain", "entropy_weighted")),
-    Dimension("loss.z_weight", (0.0, 1e-4, 1e-3, 1e-2)),
-    Dimension("value_embeddings.variant", ("none", "ends")),
-    Dimension("value_embeddings.blocks_each_end", low=1, high=6, integer=True),
-    Dimension("value_residual.variant", ("none", "first_block")),
-    Dimension("value_residual.initial_share", low=0.2, high=0.8),
-    Dimension("gates.variant", ("none", "residual_channels", "head_sigmoid")),
-    Dimension("softcap.variant", ("none", "tanh")),
-    Dimension("softcap.cap", low=10.0, high=60.0, log=True),
-    Dimension("optimizer.variant", ("muon", "normuon", "muon_plus", "anvil", "amuse", "adamuon")),
-    Dimension("optimizer.plus_axis", ("col_row", "row_col", "row", "col")),
-    Dimension("optimizer.anvil_slow_beta", low=0.95, high=0.995),
-    Dimension("optimizer.anvil_fast_weight", low=0.2, high=0.7),
-    Dimension("optimizer.amuse_beta", low=0.3, high=0.7),
-    Dimension("optimizer.amuse_rho", low=0.4, high=1.0),
-    Dimension("optimizer.adam_beta1", low=0.7, high=0.95),
-    Dimension("optimizer.adam_beta2", low=0.95, high=0.999),
-    # Floors halved on 2026-10-31 for the 1-hour track: the LR-against-horizon laws put six times the steps at 0.41 to
-    # 0.56 times the 10-minute rates (`2026-10-31_budget_scaling_to_one_hour.md` 1), Muon near 0.016 to 0.022 and the
-    # AdamW groups at or just above the old floors; the ceilings stay for the 10-minute track.
-    Dimension("optimizer.muon_lr", low=0.01, high=0.08, log=True),
-    Dimension("optimizer.embed_lr", low=5e-4, high=1e-2, log=True),
-    Dimension("optimizer.head_lr", low=1.5e-4, high=3e-3, log=True),
-    Dimension("optimizer.scalar_lr", low=5e-4, high=1e-2, log=True),
-    Dimension("optimizer.cautious_weight_decay", low=0.0, high=0.1),
-    Dimension("optimizer.adam_beta2_end", low=0.95, high=0.9995),
-    Dimension("optimizer.decay_timescale", (0.0, 0.1, 0.3, 1.0, 3.0, 10.0)),  # in total runs, log-spaced
-    Dimension("optimizer.fused_polar", (0, 1)),
-    Dimension("optimizer.depth_taper", low=-0.5, high=0.5),  # 0, the record's flat rate, is inside
-    Dimension("schedule.variant", ("trapezoid", "one_sqrt")),
-    Dimension("schedule.warmup_fraction", low=0.0, high=0.05),
-    Dimension("schedule.cooldown_fraction", low=0.15, high=0.65),  # floor 0.25 to 0.15 for the 1-hour track (2026-10-31)
-    Dimension("schedule.momentum_start", low=0.85, high=0.95),
-    Dimension("schedule.momentum", low=0.95, high=0.99),  # the momentum at the end of its warmup ramp
-    Dimension("schedule.momentum_cooldown_end", low=0.95, high=0.995),
-    Dimension("schedule.muon_late_scale", (1.0, 1.5, 2.0, 3.0)),  # 1 is off
-    Dimension("schedule.muon_late_start", low=0.6, high=0.95),
-    Dimension("batch.variant", ("packed", "whole")),
-    Dimension("batch.window", (1024, 2048)),  # the count follows (`batch.windows_per_step` 0): 65,536 tokens a step
-    Dimension("regularization.variant", ("none", "early_dropout")),
-    Dimension("regularization.rate", low=0.05, high=0.2, log=True),
-    Dimension("regularization.until", low=0.05, high=0.3, log=True),
-    Dimension("curriculum.variant", ("none", "short_first", "family_tempered", "length_tempered")),
-    Dimension("curriculum.fraction", low=0.2, high=0.6),
-    Dimension("curriculum.alpha", low=0.0, high=1.0),
-    Dimension("curriculum.beta", low=-0.5, high=0.5),
-    Dimension("ema.variant", ("none", "tail", "latest_k", "drift_leap", "two_decay", "plateau_restart")),
-    Dimension("ema.start", low=0.4, high=0.9),
-    Dimension("ema.decay", low=0.98, high=0.998),
-    Dimension("ema.window", low=100, high=1000, log=True, integer=True),  # 10-minute steps, scaled with the run (ema.py)
-    Dimension("ema.leap", low=0.05, high=0.5, log=True),
-    Dimension("ema.decay_fast", low=0.9, high=0.99),
-    Dimension("sam.variant", ("none", "late")),
-    Dimension("sam.rho", low=0.01, high=0.2, log=True),
-    Dimension("sam.every", low=2, high=8, integer=True),
-    Dimension("sam.start", low=0.4, high=0.9),
-    Dimension("backprop_free.variant", ("none", "residual_es", "unit_select", "unit_random", "readout_warmstart",
-                                        "readout_boost", "unit_route")),
-    Dimension("backprop_free.readout_weight", low=0.05, high=1.0, log=True),
-    Dimension("backprop_free.switch", low=0.1, high=1.0),
-    Dimension("backprop_free.route_k", low=64, high=1024, log=True, integer=True),
-)
-
-# The binary switches a screening design may set high; low is the record's choice. Two attention switches combine:
-# both high is the composed triangle_differential kernel.
-SWITCHES: dict[str, dict[str, dict[str, Any]]] = {
-    "unet": {"unet": {"variant": "mirrored"}},
-    "embedding_mix": {"embedding_mix": {"variant": "every_block"}},
-    "value_embeddings": {"value_embeddings": {"variant": "ends"}},
-    "value_residual": {"value_residual": {"variant": "first_block"}},
-    "gates": {"gates": {"variant": "residual_channels"}},
-    "neighbor": {"neighbor": {"variant": "pair_table"}},
-    "ema": {"ema": {"variant": "tail"}},
-    "curriculum": {"curriculum": {"variant": "short_first"}},
-    "ngpt": {"residual": {"variant": "ngpt"}},
-    "differential": {"attention": {"variant": "differential"}},
-    "triangle": {"attention": {"variant": "triangle"}},
-    "hyper": {"stream": {"variant": "hyper"}},
-    "dense": {"stream": {"variant": "dense"}},
-    "residual_es": {"backprop_free": {"variant": "residual_es"}},
-    "readout_warmstart": {"backprop_free": {"variant": "readout_warmstart"}},
-    "unit_select": {"backprop_free": {"variant": "unit_select"}},
-    # Switches that change numbers or shapes, not the graph's size, so they add little compile time: queue 3's two
-    # near-record changes, the softcap off, plain Muon, and 6 heads of 128.
-    "heads_6": {"attention": {"heads": 6}},
-    "rope_1e5": {"positional": {"rope_base": 100_000.0}},
-    "slopes_x2": {"positional": {"slope_scale": 2.0}},
-    "no_softcap": {"softcap": {"variant": "none"}},
-    "muon": {"optimizer": {"variant": "muon"}},
-    # The 2026-10-30 modules: 2,048-token windows at the record's tokens a step, whole-protein packing, the tempered
-    # reading orders at their defaults, SSMax, Peri-LN, LayerNorm Scaling, a halved branch, xIELU, the latent loss,
-    # Muon+, the head-wise gate, a quarter of RoPE's pairs, and RoPE off in every fourth block.
-    "window_2048": {"batch": {"window": 2048}},
-    "whole": {"batch": {"variant": "whole"}},
-    "family_tempered": {"curriculum": {"variant": "family_tempered"}},
-    "length_tempered": {"curriculum": {"variant": "length_tempered", "beta": 0.5}},
-    "ssmax": {"logit_scale": {"variant": "ssmax"}},
-    "perinorm": {"residual": {"variant": "perinorm"}},
-    "ln_scaling": {"residual": {"variant": "ln_scaling"}},
-    "branch_half": {"residual": {"branch_multiplier": 0.5}},
-    "xielu": {"activation": {"variant": "xielu"}},
-    "latent": {"latent": {"variant": "next_layer"}},
-    "muon_plus": {"optimizer": {"variant": "muon_plus"}},
-    "head_gate": {"gates": {"variant": "head_sigmoid"}},
-    "rope_quarter": {"positional": {"rope_fraction": 0.25}},
-    "nope_4": {"positional": {"nope_every": 4}},
-    # Round 2: the Dust, noise and Boost hybrids inside backprop, the noise track's Adam beta1, ANVIL and AMUSE, LAWA,
-    # the 1-sqrt cooldown and the neighbor heads.
-    "readout_boost": {"backprop_free": {"variant": "readout_boost"}},
-    "unit_route": {"backprop_free": {"variant": "unit_route"}},
-    "branch_ramp": {"residual": {"branch_ramp": 0.1}},
-    "anvil": {"optimizer": {"variant": "anvil"}},
-    "amuse": {"optimizer": {"variant": "amuse"}},
-    "adam_beta1_0.7": {"optimizer": {"adam_beta1": 0.7}},
-    "latest_k": {"ema": {"variant": "latest_k"}},
-    "one_sqrt": {"schedule": {"variant": "one_sqrt"}},
-    "neighbors": {"latent": {"variant": "neighbors"}},
-    # Round 3: ESM-2's head, the bidirectional key offset, the helix and strand bias, a binding score cap, the drift
-    # leap, the two-decay average, the FlashAttention-4 backend.
-    "head_two_layer": {"head": {"variant": "two_layer"}},
-    "key_offset": {"attention": {"key_offset": 0.25}},
-    "periodic": {"positional": {"periodic_scale": 0.5}},
-    "score_cap": {"attention": {"score_cap": 5.0}},
-    "drift_leap": {"ema": {"variant": "drift_leap"}},
-    "two_decay": {"ema": {"variant": "two_decay"}},
-    "flash": {"kernel": {"variant": "flash"}},
-    # Round 4: the cooldown's Muon momentum and AdamW beta2, the constant-timescale decay, the selective losses, the
-    # context tables, the compiled Polar Express.
-    "momentum_0.98": {"schedule": {"momentum_cooldown_end": 0.98}},
-    "beta2_0.999": {"optimizer": {"adam_beta2_end": 0.999}},
-    "decay_timescale": {"optimizer": {"decay_timescale": 1.0}},
-    "entropy_weighted": {"loss": {"variant": "entropy_weighted"}},
-    "z_loss": {"loss": {"z_weight": 1e-3}},
-    "bigram_table": {"neighbor": {"variant": "bigram_table"}},
-    "trigram_table": {"neighbor": {"variant": "trigram_table"}},
-    "fused_polar": {"optimizer": {"fused_polar": 1}},
-    # Round 5: Attention Residuals, local blocks, CUDA graphs, the plateau restart, early dropout, the length table.
-    "attention_residual": {"stream": {"variant": "attention_residual"}},
-    "local_3": {"attention": {"local_every": 3}},
-    "cudagraphs": {"kernel": {"variant": "cudagraphs"}},
-    "plateau_restart": {"ema": {"variant": "plateau_restart"}},
-    "early_dropout": {"regularization": {"variant": "early_dropout"}},
-    "length_bins": {"positional": {"length_bins": 16}},
-    # Round 7, aimed at the 1-hour track: a product-key memory, cross-layer K and V, the residue-group loss, the
-    # terminus vectors, Muon's late widening.
-    "product_keys": {"memory": {"variant": "product_keys"}},
-    "kv_share_2": {"attention": {"kv_share": 2}},
-    "grouping": {"grouping": {"variant": "physchem"}},
-    "terminus": {"positional": {"terminus": 1}},
-    "muon_late_2": {"schedule": {"muon_late_scale": 2.0}},
-    # Round 8, for the 1-hour track's late run: SAM in the last 40 percent, AdaMuon, a depth-graded Muon rate, learned
-    # branch gains.
-    "sam_late": {"sam": {"variant": "late"}},
-    "adamuon": {"optimizer": {"variant": "adamuon"}},
-    "depth_taper": {"optimizer": {"depth_taper": 0.5}},
-    "branch_gains": {"residual": {"learned_gain": 0.3}},
-    # Round 8 from the 1-hour capacity scout: three reads of one memory pool, and intermediate heads early in the run.
-    "shared_pool": {"memory": {"variant": "shared_pool"}},
-    "mid_heads": {"deep_supervision": {"variant": "mid_heads"}},
-}
-BACKPROP_FREE_SWITCHES = ("residual_es", "readout_warmstart", "unit_select", "readout_boost", "unit_route")
-
-# The compile warmup is capped at 180 s and a new graph compiles from scratch: the record's in 106 s on the GH200
-# (pilot1_01). Each variant's seconds above it were measured alone on the record (pilot1 and pilot3 at the 180 s rung,
-# and 005, 010, 011, 026, 028 by hand); a variant not listed, and every number, added none measurable. The sum predicts a
-# genome's warmup; the margin covers compile costs that do not add exactly. The proposers skip a genome predicted over.
-WARMUP_CAP = 180.0
-RECORD_WARMUP = 106.0
-WARMUP_MARGIN = 15.0
-COMPILE_SECONDS: dict[str, float] = {
-    "attention.variant=differential": 24.0,
-    "attention.variant=triangle": 46.0,
-    "attention.variant=triangle_differential": 76.0,
-    "attention.variant=paired": 17.0,
-    "residual.variant=ngpt": 36.0,
-    "stream.variant=hyper": 37.0,
-    "stream.variant=dense": 108.0,
-    "backprop_free.variant=residual_es": 66.0,
-    "backprop_free.variant=unit_select": 5.0,
-    "backprop_free.variant=unit_random": 5.0,
-    "backprop_free.variant=readout_warmstart": 7.0,
-    "value_residual.variant=first_block": 11.0,
-    "gates.variant=residual_channels": 12.0,
-    "unet.variant=mirrored": 1.0,
-    "neighbor.variant=pair_table": 1.0,
-    "embedding_mix.variant=every_block": 5.0,
-    # Not measured yet, conservative until a 180 s pilot replaces them: 10 s for an elementwise change in every block,
-    # 25 s for a new module in every block, 10 s for a first compile at a new window shape.
-    "batch.window=2048": 3.0,  # pilot4_01: warmup 125 s against the record genome's 122
-    "logit_scale.variant=ssmax": 10.0,  # pilot4_02: 132 s
-    "residual.variant=perinorm": 16.0,  # pilot4_03: 138 s
-    "residual.variant=ln_scaling": 10.0,
-    "activation.variant=xielu": 19.0,  # pilot4_04: 140.6 s
-    "latent.variant=next_layer": 1.0,  # pilot4_06: 123.3 s
-    "gates.variant=head_sigmoid": 25.0,
-    "residual.branch_multiplier!=1.0": 10.0,  # `!=`: any value but the record's adds the hook
-    "residual.branch_ramp!=0.0": 10.0,
-    # pilot5_03: all 72 readouts compiled in 419.8 s (300 s over the record); now 10 readouts, at every sixth block, the
-    # warm start's 5 cost 7 s and the 72 about 4 s each, so 40 s until a pilot measures the 10.
-    "backprop_free.variant=readout_boost": 40.0,
-    "backprop_free.variant=unit_route": 25.0,  # a top-k and a scatter in every block
-    "latent.variant=neighbors": 10.0,
-    "head.variant=two_layer": 10.0,
-    "attention.key_offset!=0.0": 10.0,  # two shifted copies and a select on the keys in every block
-    "attention.score_cap!=0.0": 10.0,  # a tanh inside the flex score function
-    "positional.periodic_scale!=0.0": 10.0,  # two cosines inside the flex score function
-    "kernel.variant=flash": 30.0,  # the CuTe kernels' JIT; no published compile time, the pilot measures it
-    "neighbor.variant=bigram_table": 10.0,  # a gather, a sigmoid and an add after the last block
-    "neighbor.variant=trigram_table": 10.0,
-    "optimizer.fused_polar=1": 20.0,  # Polar Express compiled at the three bank shapes, outside the model's graph
-    # Round 5. Attention Residuals: pilot8_01 alone on confirm1_01 warmed up in 223 s against 114 to 137 s for the other
-    # pilot8 runs with fresh graphs, about 100 s of its own (the 666 weighted terms over the 37 values); 110 s keeps it
-    # out of any genome that carries another compile cost.
-    "stream.variant=attention_residual": 110.0,
-    # The local blocks' second flex kernel pair (a mask rule traced into the kernel) and the local mask's build; the
-    # catalog's second-mask cost is 20 to 50 s, the triangle's two masks with its other changes 46 s.
-    "attention.local_every!=0": 30.0,
-    "kernel.variant=cudagraphs": 10.0,  # graph-tree recording of the forward, backward and no-grad forward a shape
-    "regularization.variant=early_dropout": 10.0,  # a draw, a compare and a scale on each sublayer output
-    "positional.length_bins!=0": 5.0,  # a scatter, a gather and a table add once, at the embedding (pilot8: 119 s warmup)
-    # Round 7, estimates: the memory's query matmul, two top-k, the candidate sums and an embedding bag at one block,
-    # with its backward scatter (the idea file's 10 to 20 s, at the top); the group head is one more auxiliary graph
-    # (next_layer's measured 1 s, so 10 is conservative); the terminus vectors are two masked adds at the embedding, as
-    # cheap as the length table. `attention.kv_share` drops matmuls from an unchanged graph and `schedule.muon_late_*`
-    # is a float on Muon's groups: no entry.
-    "memory.variant=product_keys": 20.0,
-    "grouping.variant=physchem": 10.0,
-    "positional.terminus!=0": 5.0,
-    # Round 8: the learned gains are one more multiply on each sublayer output, `branch_multiplier`'s 10 s. SAM reruns the
-    # step's own graph, and AdaMuon and the depth taper live in the eager optimizer: no entry.
-    "residual.learned_gain!=0.0": 10.0,
-    # Three memory reads: the single read's 20 s plus the scout's 10 s for the extension (the reads share one pool and
-    # differ in their queries and keys). The intermediate heads reuse the head's graph twice in the auxiliary loss: the
-    # scout's 0 to 5 s, held at the group head's 10 s.
-    "memory.variant=shared_pool": 30.0,
-    "deep_supervision.variant=mid_heads": 10.0,
-    # No entry, since they run eagerly outside any compiled graph: the loss family (`training_loss`), the cooldown's
-    # momentum and beta2 (floats on the param groups), and the constant-timescale decay (a foreach multiply).
-}
-# A number that matters only under some of its family's variants; the rest follow `dimension_active`'s rule.
-NUMBER_VARIANTS: dict[str, tuple[str, ...]] = {
-    "positional.slope_scale": ("alibi",),
-    "residual.alpha_init": ("ngpt",),
-    "residual.branch_multiplier": ("prenorm", "ln_scaling"),  # ngpt and perinorm normalize the branch after it
-    "curriculum.fraction": ("short_first",),
-    "curriculum.alpha": ("family_tempered",),
-    "curriculum.beta": ("length_tempered",),
-    "residual.branch_ramp": ("prenorm", "ln_scaling"),
-    "residual.branch_start": ("prenorm", "ln_scaling"),
-    "latent.source_block": ("next_layer",),
-    "memory.block": ("product_keys",),  # shared_pool reads at 9, 18 and 27
-    "stream.streams": ("hyper",),
-    "optimizer.cautious_weight_decay": ("muon", "normuon", "muon_plus", "anvil", "adamuon"),  # amuse takes no decay
-    "optimizer.anvil_slow_beta": ("anvil",),
-    "optimizer.anvil_fast_weight": ("anvil",),
-    "optimizer.amuse_beta": ("amuse",),
-    "optimizer.amuse_rho": ("amuse",),
-    "ema.start": ("tail", "two_decay", "plateau_restart"),
-    "ema.decay": ("tail", "two_decay"),
-    "ema.window": ("latest_k", "drift_leap", "plateau_restart"),
-    "ema.leap": ("drift_leap",),
-    "ema.decay_fast": ("two_decay",),
-    "backprop_free.readout_weight": ("readout_boost",),
-    "backprop_free.switch": ("readout_boost",),
-    "backprop_free.route_k": ("unit_route",),
-}
+# A batch name may itself hold "_r" (h_auto01_random), so the index and the rung are read from the end.
+RUN_NAME = re.compile(r"(?P<proposal>(?P<batch>.+)_(?P<index>\d+))(?:_r(?P<budget>\d+))?")
 
 
 def read(genome: Genome, key: str) -> Any:
@@ -412,9 +197,40 @@ def written(genome: Genome, changes: dict[str, Any]) -> Genome:
     return resolve({"families": updated})
 
 
+RECORD_SHAPE = ShapeConfig()
+CONFLICT_PARTNERS = ("shape", "stream", "loop")  # the families every `Strategy.conflicts` reads besides its own
+
+
 def predicted_warmup(genome: Genome) -> float:
-    """The genome's compile warmup in seconds on the GH200, from each variant's measured cost."""
-    return RECORD_WARMUP + sum(COMPILE_SECONDS[key] for key in compile_costs(genome))
+    """The genome's compile warmup in seconds on the GH200: each variant's measured cost on the record's 36 blocks,
+    scaled by the blocks the compiled graph unrolls (an estimate away from 36 until a run measures one)."""
+    per_record_depth = RECORD_WARMUP + sum(COMPILE_SECONDS[key] for key in compile_costs(genome))
+    return per_record_depth * read(genome, "shape.blocks") / RECORD_SHAPE.blocks
+
+
+def predicted_peak_gib(genome: Genome) -> float:
+    """The genome's peak training memory: the record's measured peak scaled by the tokens one compiled step holds, the
+    depth, and a block's stored activations a token (about 7 d for the attention and its norms, 2 f for the MLP). An
+    estimate until runs away from the record's shape measure it."""
+    window = read(genome, "batch.window")
+    tokens = window * (read(genome, "batch.windows_per_step") or STEP_TOKENS // window) / read(genome, "batch.micro_divisor")
+    width = 7 * read(genome, "shape.hidden") + 2 * read(genome, "shape.intermediate")
+    record_width = 7 * RECORD_SHAPE.hidden + 2 * RECORD_SHAPE.intermediate
+    return RECORD_PEAK_GIB * tokens / STEP_TOKENS * read(genome, "shape.blocks") / RECORD_SHAPE.blocks * width / record_width
+
+
+def fits_machine(genome: Genome) -> bool:
+    """Predicted under the warmup cap and inside the GPU's memory, with the peak's worst measured under-prediction."""
+    return fits_warmup(genome) and predicted_peak_gib(genome) * PEAK_PREDICTION_ERROR <= PEAK_CAP_GIB
+
+
+def admissible(make: Callable[[], Genome]) -> Genome | None:
+    """The genome `make` draws, or None when its choices do not compose (a family's numbers that contradict each other,
+    or families that conflict): the feasible set is what resolves, so a proposer skips such a draw and draws again."""
+    try:
+        return make()
+    except ValueError:  # GenomeConflict and a config's own refusal; every value a proposer draws is inside its bounds
+        return None
 
 
 def compile_costs(genome: Genome) -> list[str]:
@@ -503,7 +319,7 @@ def encode(genome: Genome, space: list[Dimension]) -> np.ndarray:
     return np.asarray(coordinates)  # (D,)
 
 
-def sample_value(dimension: Dimension, rng: np.random.Generator) -> Any:
+def sample_value(dimension: Dimension, rng: np.random.Generator) -> GenomeValue:
     if dimension.categorical:
         return dimension.choices[int(rng.integers(len(dimension.choices)))]
     if dimension.log:
@@ -513,11 +329,28 @@ def sample_value(dimension: Dimension, rng: np.random.Generator) -> Any:
     return round(value) if dimension.integer else float(f"{value:.4g}")
 
 
-def random_genome(space: list[Dimension], rng: np.random.Generator) -> Genome:
-    return written(default_genome(), {dimension.key: sample_value(dimension, rng) for dimension in space})
+def random_genome(space: list[Dimension], rng: np.random.Generator, tries: int = 200) -> Genome:
+    """A uniform draw over the space, the families in a conflict drawn again until the genome composes (a loop on a
+    mixing stream, a layout past the depth, heads that do not divide the width); a config's own refusal draws all again.
+    Redrawing only the conflicting families keeps the rest of the draw: a whole new draw composes one time in ten."""
+    changes = {dimension.key: sample_value(dimension, rng) for dimension in space}
+    last = ""
+    for attempt in range(tries):
+        try:
+            return written(default_genome(), changes)
+        except GenomeConflict as conflict:
+            # Every second redraw takes the families conflicts are with as well, so a family whose open choices cannot
+            # fit the drawn shape (retirement can leave it so) gets a new shape instead of redrawing forever.
+            families: list[str] | None = conflict.families + (list(CONFLICT_PARTNERS) if attempt % 2 else [])
+            last = str(conflict)
+        except ValueError as refusal:
+            families, last = None, str(refusal)
+        changes.update({dimension.key: sample_value(dimension, rng) for dimension in space
+                        if families is None or dimension.family in families})
+    raise RuntimeError(f"no composing genome after {tries} redraws; the last refusal: {last}")
 
 
-def perturbed(dimension: Dimension, value: Any, rng: np.random.Generator) -> Any:
+def perturbed(dimension: Dimension, value: GenomeValue, rng: np.random.Generator) -> GenomeValue:
     """A mutation of one coordinate: another variant, or a number moved by a fifth of its range (log-scaled where marked)."""
     if dimension.categorical:
         others = [choice for choice in dimension.choices if choice != value]
@@ -546,11 +379,60 @@ def crossover(first: Genome, second: Genome, rng: np.random.Generator) -> tuple[
     return resolve({"families": child}), from_second
 
 
+class Child(NamedTuple):
+    genome: Genome
+    from_second: list[str]  # the families the second parent gave
+    mutated: list[str]  # the coordinates the mutation moved
+    repaired: bool  # costly choices were put back to fit the warmup cap
+
+
+def breed(first: Genome, second: Genome, space: list[Dimension], rng: np.random.Generator) -> Child | None:
+    """A child of two genomes: each family's config from one parent, a mutation, retired choices reset, and costly ones
+    repaired toward the warmup cap (parents over it breed children over it); None when its choices do not compose."""
+    try:
+        child, from_second = crossover(first, second, rng)
+        child, mutated = mutate(child, space, rng, rate=1.5 / len(space))
+        child = within(child, space)
+        repaired = not fits_warmup(child)
+        if repaired:
+            child = warmup_repaired(child, rng)
+    except ValueError:  # GenomeConflict or a config's refusal, as in `admissible`
+        return None
+    return Child(child, from_second, mutated, repaired)
+
+
+def candidate_pool(space: list[Dimension], parents: list[Observation], rng: np.random.Generator, size: int) -> list[Genome]:
+    """Half uniform draws over the space, half mutations of the five best `parents` (best first); a draw that does not
+    compose is skipped, so the pool can come out smaller than `size`."""
+    draws = [admissible(lambda: random_genome(space, rng)) for _ in range(size // 2)]
+    for _ in range(size // 2):
+        parent = parents[int(rng.integers(min(5, len(parents))))]
+        draws.append(admissible(lambda: mutate(parent.genome, space, rng, rate=2 / len(space))[0]))  # noqa: B023, called at once
+    return [genome for genome in draws if genome is not None]
+
+
+def feasible(pool: list[Genome], space: list[Dimension], seen: set[str], rng: np.random.Generator) -> list[Genome]:
+    """The pool's distinct genomes with retired choices reset and costly ones repaired, unseen, composing and predicted
+    to fit the warmup cap and the GPU's memory."""
+    repaired = [admissible(lambda: warmup_repaired(within(genome, space), rng)) for genome in pool]  # noqa: B023, called at once
+    distinct = {genome_sha256(genome): genome for genome in repaired if genome is not None}
+    kept = [genome for digest, genome in distinct.items() if digest not in seen and fits_machine(genome)]
+    if not kept:
+        raise ValueError(f"none of {len(pool)} candidates composes, fits the machine and is new; widen the space")
+    return kept
+
+
 @dataclass
 class Observation:
     name: str
     genome: Genome
-    value: float  # val_select of the selected weights at the full budget
+    value: float  # val_select of the selected weights
+    budget: int | None = None  # the run's seconds on the clock; None is the track's full budget
+    other_track: bool = False  # a result the state carries from another track: read by its budget, never an incumbent
+
+    @property
+    def full(self) -> bool:
+        return not self.other_track and (self.budget is None or self.budget == FULL_BUDGET)
 
 
 @dataclass
@@ -668,10 +550,14 @@ class RandomProposer:
         seen = {genome_sha256(observation.genome) for observation in observations}
         parents = [observations[0].name] if observations else []
         proposals: list[Proposal] = []
-        while len(proposals) < count:
-            genome = warmup_repaired(within(random_genome(self.space, rng), self.space), rng)
+        for _ in range(1000 * count):
+            if len(proposals) == count:
+                break
+            genome = admissible(lambda: warmup_repaired(within(random_genome(self.space, rng), self.space), rng))
+            if genome is None:
+                continue
             digest = genome_sha256(genome)
-            if digest in seen or not fits_warmup(genome):
+            if digest in seen or not fits_machine(genome):
                 continue
             seen.add(digest)
             changes = genome_document(genome)["families"]
@@ -742,46 +628,221 @@ def expected_improvement(mean: np.ndarray, sd: np.ndarray, incumbent: float) -> 
 
 
 class BayesianProposer:
+    """A squared-exponential GP over the encoding; production reads full-budget results only, and the next pick is the pool's
+    best expected improvement under its posterior."""
+
     name = "bayes"
+    reads_every_budget = False
 
     def __init__(self, space: list[Dimension], pool: int = 4000) -> None:
         self.space = space
         self.pool = pool
 
-    def propose(self, observations: list[Observation], count: int, rng: np.random.Generator) -> list[Proposal]:
-        if len(observations) < 3:
-            raise ValueError("the GP needs at least three observations at the full budget")
+    def candidates(self, parents: list[Observation], rng: np.random.Generator) -> list[Genome]:
+        """The pool the posterior ranks: uniform draws, and mutations of the five best parents by posterior mean."""
+        return candidate_pool(self.space, parents, rng, self.pool)
+
+    def view(self, observations: list[Observation]) -> tuple[np.ndarray, np.ndarray, float, float | None]:
+        """What the GP fits: the encoded rows, their targets, the level a prediction's target leaves out, and the extra
+        column a full-budget query carries, None when the rows have no such column."""
+        # Returns (n, D), (n,), and two numbers.
         X = np.stack([encode(observation.genome, self.space) for observation in observations])  # (n, D)
-        y = np.array([observation.value for observation in observations])  # (n,)
+        return X, np.array([observation.value for observation in observations]), 0.0, None  # (n, D), (n,)
+
+    def propose(self, observations: list[Observation], count: int, rng: np.random.Generator) -> list[Proposal]:
+        full = np.array([observation.full for observation in observations], dtype=bool)  # (n,)
+        if full.sum() < 3:
+            raise ValueError("the GP needs at least three observations at the full budget")
+        X, y, level, query_column = self.view(observations)  # (n, D), (n,)
         seen = {genome_sha256(observation.genome) for observation in observations}
         fitted_mean = gp_posterior(X, y, X)[0]  # (n,)
-        ranked = np.argsort(fitted_mean)  # by posterior mean, not by the noisy observation
+        rows = np.flatnonzero(full)  # (f,)
+        ranked = rows[np.argsort(fitted_mean[rows])]  # by posterior mean, not by the noisy observation
         incumbent = observations[int(ranked[0])]
-        pool = [random_genome(self.space, rng) for _ in range(self.pool // 2)]
-        for _ in range(self.pool // 2):
-            parent = observations[int(ranked[int(rng.integers(min(5, len(ranked))))])]
-            pool.append(mutate(parent.genome, self.space, rng, rate=2 / len(self.space))[0])
-        distinct = {genome_sha256(genome): genome for genome in (warmup_repaired(within(genome, self.space), rng) for genome in pool)}
-        pool = [genome for digest, genome in distinct.items() if digest not in seen and fits_warmup(genome)]
+        pool = feasible(self.candidates([observations[int(row)] for row in ranked], rng), self.space, seen, rng)
         X_pool = np.stack([encode(genome, self.space) for genome in pool])  # (m, D)
+        if query_column is not None:
+            X_pool = np.column_stack([X_pool, np.full(len(pool), query_column)])  # (m, D + 1)
         proposals: list[Proposal] = []
-        X_fit, y_fit = X, y
+        X_fit, y_fit, full_fit = X, y, full
         for _ in range(count):
             mean, sd, hyper = gp_posterior(X_fit, y_fit, X_pool)  # (m,), (m,)
-            best_mean = float(gp_posterior(X_fit, y_fit, X_fit)[0].min())
+            best_mean = float(gp_posterior(X_fit, y_fit, X_fit)[0][full_fit].min())
             gains = expected_improvement(mean, sd, best_mean)  # (m,)
             choice = int(np.argmax(gains))
             nearest = observations[int(np.argmin(((X - X_pool[choice]) ** 2).sum(-1)))]
             changes = genome_document(pool[choice])["families"]
             proposals.append(Proposal(pool[choice], [incumbent.name, nearest.name],
-                                      f"GP expected improvement {gains[choice]:.5f}: predicted val_select {mean[choice]:.4f} "
-                                      f"+- {sd[choice]:.4f} against the best posterior mean {best_mean:.4f} ({incumbent.name}); "
+                                      f"GP expected improvement {gains[choice]:.5f}: predicted val_select {mean[choice] + level:.4f} "
+                                      f"+- {sd[choice]:.4f} against the best posterior mean {best_mean + level:.4f} ({incumbent.name}); "
                                       f"nearest observed {nearest.name}; length {hyper['length']}, noise sd {hyper['noise_sd']:.4f}; "
                                       f"changes {json.dumps(changes, sort_keys=True)}"))
             # The kriging believer: the chosen point joins the data at its predicted mean, so the next pick looks elsewhere.
             X_fit = np.vstack([X_fit, X_pool[choice]])  # (n + 1, D)
             y_fit = np.append(y_fit, mean[choice])  # (n + 1,)
+            full_fit = np.append(full_fit, True)  # (n + 1,)
             X_pool = np.delete(X_pool, choice, axis=0)  # (m - 1, D)
+            del pool[choice]
+        return proposals
+
+
+class RungReadingProposer(BayesianProposer):
+    """The same GP, reading every result on the track, its rungs too, with the budget one more dimension and each budget's
+    level removed, since a stationary GP has no trend. The replay's `track` reading: on 54 adaptive rungs it ranks at rho
+    0.640 against production's 0.089 (`2026-11-03_tabular_surrogate_replay`), and it still proposes for the full budget."""
+
+    name = "bayes_rungs"
+    reads_every_budget = True
+
+    def view(self, observations: list[Observation]) -> tuple[np.ndarray, np.ndarray, float, float | None]:
+        # Returns (n, D + 1), (n,), and two numbers.
+        X, y, _, _ = super().view(observations)  # (n, D), (n,)
+        return budget_view(X, y, [observation.budget or FULL_BUDGET for observation in observations])  # (n, D + 1), (n,), and two numbers
+
+
+class HybridProposer(RungReadingProposer):
+    """The genetic algorithm proposes and the GP disposes: tournament parents from the full-budget results ranked by
+    posterior mean, family-wise crossover and mutation breed the pool, and the rung-reading GP's expected improvement
+    picks the batch from it, the kriging believer spreading the picks. Structure (which modules, which shape) moves by
+    crossover, numbers by mutation, and the surrogate spends runs only where it expects a gain. Logan, 2026-11-23: "some
+    sort of genetic algorithm in combination with Bayesian hyperparameter search to search over every aspect of the
+    speed run"."""
+
+    name = "hybrid"
+    tournament = 3
+
+    def candidates(self, parents: list[Observation], rng: np.random.Generator) -> list[Genome]:
+        # parents: best posterior mean first, so a tournament's winner is its lowest index.
+        children = []
+        for _ in range(self.pool):
+            first, second = (parents[int(rng.integers(len(parents), size=self.tournament).min())] for _ in range(2))
+            child = breed(first.genome, second.genome, self.space, rng)
+            if child is not None:
+                children.append(child.genome)
+        return children
+
+
+def budget_view(X: np.ndarray, y: np.ndarray, budgets: list[int]) -> tuple[np.ndarray, np.ndarray, float, float | None]:
+    """The rows with their budget as a column on [0, 1], by log2, and each budget's mean removed from the targets; the
+    full budget's mean and column are what a prediction there adds back and carries."""
+    # X: (n, D); y: (n,); returns (n, D + 1), (n,), and two numbers.
+    seconds = np.array(budgets, dtype=float)  # (n,)
+    levels = {budget: float(y[seconds == budget].mean()) for budget in np.unique(seconds)}
+    assert FULL_BUDGET in levels, "no row at the full budget"
+    position = np.log2(seconds)  # (n,)
+    low, high = position.min(), position.max()
+    spread = high - low if high > low else 1.0
+    centered = y - np.array([levels[budget] for budget in seconds])  # (n,)
+    full_column = float((np.log2(FULL_BUDGET) - low) / spread)
+    return np.column_stack([X, (position - low) / spread]), centered, levels[FULL_BUDGET], full_column  # (n, D + 1), (n,)
+
+
+NOVELTY_EVERY = 4  # one pick in this many must hold something no result holds; a batch is 4
+
+
+class Surrogate(Protocol):
+    def quantiles(self, context: pd.DataFrame, values: np.ndarray, query: pd.DataFrame) -> np.ndarray:
+        # values: (n,); returns (m, q), the predictive distribution on evenly spaced levels.
+        ...
+
+
+def genome_frame(genomes: list[Genome], budgets: list[int], space: list[Dimension]) -> pd.DataFrame:
+    """The genomes as named columns: categories as text, numbers as floats, a number inert under its genome's variants
+    missing, and the budget's log2. What a tabular foundation model reads, in place of the GP's one-hot encoding."""
+    rows = []
+    for genome, budget in zip(genomes, budgets, strict=True):
+        row: dict[str, Any] = {"x:log2_budget": math.log2(budget)}
+        for dimension in space:
+            value = read(genome, dimension.key)
+            if dimension.categorical:
+                row[f"g:{dimension.key}"] = str(value)
+            else:
+                row[f"g:{dimension.key}"] = float(value) if dimension_active(genome, dimension) else math.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def informative_frames(context: pd.DataFrame, query: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Both tables without the columns constant in the context, categories shared between the two. A choice the context has never
+    seen, in a column it varies, stays in the query as a category of its own: the model has to say it does not know."""
+    kept = [column for column in context.columns if context[column].nunique(dropna=True) > 1]
+    left, right = context[kept].copy(), query[kept].copy()
+    for column in kept:
+        if not pd.api.types.is_numeric_dtype(context[column]):
+            known = sorted(set(left[column].dropna().astype(str)) | set(right[column].dropna().astype(str)))
+            left[column], right[column] = pd.Categorical(left[column], categories=known), pd.Categorical(right[column], categories=known)
+    return left, right
+
+
+def novel_rows(context: pd.DataFrame, query: pd.DataFrame) -> np.ndarray:
+    """Which query rows hold what the context never has: a choice it never took, or another number in a column it never varied."""
+    # Returns (m,).
+    novel = np.zeros(len(query), dtype=bool)  # (m,)
+    for column in context.columns:
+        if not pd.api.types.is_numeric_dtype(context[column]):
+            novel |= ~query[column].isin(context[column]).to_numpy()  # (m,)
+            continue
+        known = context[column].dropna().unique()
+        if len(known) < 2:
+            values = query[column].to_numpy()  # (m,)
+            novel |= ~np.isnan(values) & ~np.isin(values, known)  # (m,)
+    return novel  # (m,)
+
+
+class TabularProposer:
+    """A tabular foundation model reading every result, on this track and any other the state carries, named columns as they
+    are. The same pool, warmup rule and believer as the GP's. The pick is the lowest predicted median, not the best expected
+    improvement: on the real rows Kumo's quantiles span about 0.2 nats where a genome far from the data is concerned, against the GP's
+    sd of 0.009, so its improvement picks were the widest distributions, with medians 0.05 nats behind the record. A pick joins the
+    context at its predicted median.
+
+    A model conditioned on the context has nothing to say about a column the context never varied, and it has no distance that
+    grows toward the unseen, as the GP's kernel does. So every `NOVELTY_EVERY`-th pick, counted over its batches by `picks_made`, must
+    hold something unseen, the best such genome by the same acquisition: mutated parents, in practice, as random draws rarely score
+    well. SMAC alternates random configurations with its model's picks to give later models unbiased data (Hutter et al., 2011); this
+    aims that idea at the unseen. Every other pick must hold nothing unseen: the model cannot see such a change, so it would ride along
+    at random (the head-to-head's `auto12_kumo_01` and `auto13_kumo_01`, predicted 2.709, scored 2.7189 and 2.7524)."""
+
+    name = "kumo"
+    reads_every_budget = True
+    reads_other_tracks = True
+
+    def __init__(self, space: list[Dimension], surrogate: Surrogate, pool: int = 4000, picks_made: int = 0) -> None:
+        self.space = space
+        self.surrogate = surrogate
+        self.pool = pool
+        self.picks_made = picks_made
+
+    def propose(self, observations: list[Observation], count: int, rng: np.random.Generator) -> list[Proposal]:
+        full = [observation for observation in observations if observation.full]
+        if len(full) < 3:
+            raise ValueError("the tabular model needs at least three observations at the full budget")
+        seen = {genome_sha256(observation.genome) for observation in observations}
+        ranked = sorted(full, key=lambda observation: observation.value)
+        incumbent = ranked[0]
+        pool = feasible(candidate_pool(self.space, ranked, rng, self.pool), self.space, seen, rng)
+        context = genome_frame([observation.genome for observation in observations],
+                               [observation.budget or FULL_BUDGET for observation in observations], self.space)
+        values = np.array([observation.value for observation in observations])  # (n,)
+        proposals: list[Proposal] = []
+        for index in range(count):
+            query = genome_frame(pool, [FULL_BUDGET] * len(pool), self.space)
+            informative_context, informative_query = informative_frames(context, query)
+            quantiles = self.surrogate.quantiles(informative_context, values, informative_query)  # (m, q)
+            medians = np.median(quantiles, axis=1)  # (m,)
+            novel = novel_rows(context, query)  # (m,)
+            exploring = (self.picks_made + index + 1) % NOVELTY_EVERY == 0 and bool(novel.any())
+            order = np.argsort(medians, kind="stable")  # (m,), the best predicted first
+            choice = int(order[novel[order] == (exploring or bool(novel.all()))][0])
+            kind = f"unseen pick, among {int(novel.sum())} genomes holding something no result holds: " if exploring else ""
+            changes = genome_document(pool[choice])["families"]
+            proposals.append(Proposal(pool[choice], [incumbent.name],
+                                      f"{kind}{self.name} lowest predicted median val_select {medians[choice]:.4f}, "
+                                      f"5 to 95 percent {np.quantile(quantiles[choice], 0.05):.4f} to {np.quantile(quantiles[choice], 0.95):.4f}, "
+                                      f"against the best observed {incumbent.value:.4f} ({incumbent.name}); changes {json.dumps(changes, sort_keys=True)}"))
+            # The believer, as the GP's: the pick joins the context at its predicted median, so the next pick looks elsewhere.
+            context = pd.concat([context, query.iloc[[choice]]], ignore_index=True)
+            values = np.append(values, medians[choice])  # (n + 1,)
             del pool[choice]
         return proposals
 
@@ -807,14 +868,12 @@ class GeneticProposer:
                 break
             first = self._select(observations, rng)
             second = self._select(observations, rng)
-            child, from_second = crossover(first.genome, second.genome, rng)
-            child, mutated = mutate(child, self.space, rng, rate=1.5 / len(self.space))
-            child = within(child, self.space)
-            repaired = not fits_warmup(child)  # parents over the cap breed children over it; repair as the Bayes pool does
-            if repaired:
-                child = warmup_repaired(child, rng)
+            bred = breed(first.genome, second.genome, self.space, rng)
+            if bred is None:
+                continue
+            child, from_second, mutated, repaired = bred
             digest = genome_sha256(child)
-            if digest in seen or not fits_warmup(child):
+            if digest in seen or not fits_machine(child):
                 continue
             seen.add(digest)
             changes = genome_document(child)["families"]
@@ -829,19 +888,22 @@ class GeneticProposer:
 
 # The state file and the ledger.
 
-def apply_track(state: dict[str, Any]) -> dict[str, Any]:
-    """Set the module's budgets to the state's track (states written before the tracks are the 10-minute one)."""
+def apply_track(state: SearchState) -> Track:
+    """Set the module's budgets to the state's track (states written before the tracks are the 10-minute one). A state may
+    name its own W&B group, as an experiment on a track does, its own batch-name `prefix`, and its own `final_splits` for a
+    full-budget run."""
     global TRACK, FULL_BUDGET, RUNG_BUDGET
     TRACK = TRACKS[state.setdefault("track", "10min")]
+    TRACK = {**TRACK, **{key: state[key] for key in ("group", "prefix", "final_splits") if key in state}}
     FULL_BUDGET = TRACK["budget"]
     RUNG_BUDGET = TRACK["rung"]
     return TRACK
 
 
-def load_state(path: Path, track: str = "10min") -> dict[str, Any]:
+def load_state(path: Path, track: str = "10min") -> SearchState:
     """The state at `path`, its track applied; a path without a state starts an empty one on `track`."""
     if not path.exists():
-        state = {"schema": STATE_SCHEMA, "track": track, "batches": {}, "proposals": {}, "seeded": {}, "retired": []}
+        state: SearchState = {"schema": STATE_SCHEMA, "track": track, "batches": {}, "proposals": {}, "seeded": {}, "retired": []}
     else:
         state = json.loads(path.read_text(encoding="utf-8"))
         assert state["schema"] == STATE_SCHEMA
@@ -849,13 +911,13 @@ def load_state(path: Path, track: str = "10min") -> dict[str, Any]:
     return state
 
 
-def save_state(state: dict[str, Any], path: Path) -> None:
+def save_state(state: SearchState, path: Path) -> None:
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     temporary.replace(path)
 
 
-def observations_of(state: dict[str, Any]) -> list[Observation]:
+def observations_of(state: SearchState) -> list[Observation]:
     """Every genome with a valid result at the full budget: the search's own and the seeded hand-written runs."""
     found = [Observation(name, resolve({"families": seeded["genome"]}), seeded["val_select"])
              for name, seeded in state["seeded"].items()]
@@ -866,12 +928,76 @@ def observations_of(state: dict[str, Any]) -> list[Observation]:
     return found
 
 
-def incumbent_of(state: dict[str, Any]) -> Observation:
+def observations_at_every_budget(state: SearchState) -> list[Observation]:
+    """`observations_of`, then every valid result of a shorter rung on this track, each at its own budget."""
+    found = observations_of(state)
+    for name, proposal in state["proposals"].items():
+        for budget, outcome in proposal["results"].items():
+            if int(budget) != FULL_BUDGET and outcome["valid"] and outcome["val_select"] is not None:
+                found.append(Observation(name, resolve({"families": proposal["genome"]}), outcome["val_select"], int(budget)))
+    return found
+
+
+def observations_on_other_tracks(state: SearchState) -> list[Observation]:
+    """The results of other tracks a state carries, frozen when it was seeded, each at its own budget. The clock and the split are the
+    same benchmark's, so a model with budget as a column can read them: Kumo's replay lead (rho 0.801) came from this reading."""
+    return [Observation(row["name"], resolve({"families": row["genome"]}), row["val_select"], row["budget"], other_track=True)
+            for row in state.get("other_track_rows", [])]
+
+
+def observations_read_by(proposer: Proposer, state: SearchState) -> list[Observation]:
+    """What a proposer reads: production's full-budget results, or the rungs too, or other tracks' results as well."""
+    if getattr(proposer, "reads_other_tracks", False):
+        return observations_at_every_budget(state) + observations_on_other_tracks(state)
+    return observations_at_every_budget(state) if getattr(proposer, "reads_every_budget", False) else observations_of(state)
+
+
+def unproven_keys(state: SearchState, genome: Genome) -> list[str]:
+    """What a genome holds that no valid result has, as `retire` keys: a choice none took, or another number in a column none varied.
+    What a result has held compiled, fit the memory and ran; these may not, so the loop tries them before they take a turn.
+    The default is the record's choice, which ran, so it is never unproven: retiring `loop.variant=none` beside
+    `stream.variant=single` would leave no loop that composes."""
+    rows = observations_at_every_budget(state) + observations_on_other_tracks(state)
+    default = default_genome()
+    keys = []
+    for dimension in SPACE:
+        value = read(genome, dimension.key)
+        held = {read(row.genome, dimension.key) for row in rows} | {read(default, dimension.key)}
+        if value in held or not dimension_active(genome, dimension):
+            continue
+        if dimension.categorical:
+            keys.append(f"{dimension.key}={value}")
+        elif len(held) < 2:
+            keys.append(dimension.key)
+    return keys
+
+
+def incumbent_of(state: SearchState) -> Observation:
     return min(observations_of(state), key=lambda observation: observation.value)
 
 
 def run_name(batch: str, index: int, budget: int) -> str:
-    return f"{batch}_{index:02d}" + ("" if budget == FULL_BUDGET else f"_r{budget}")
+    """A proposal's run at a budget: `<batch>_<index>`, with `_r<budget>` below the full budget."""
+    return rung_run(f"{batch}_{index:02d}", budget)
+
+
+def rung_run(proposal: str, budget: int) -> str:
+    """The run of a named proposal at a budget."""
+    return proposal + ("" if budget == FULL_BUDGET else f"_r{budget}")
+
+
+def parse_run_name(run: str) -> RunName:
+    """The proposal, batch, index and budget a run name holds; a name without the `_r` suffix is at the full budget."""
+    match = RUN_NAME.fullmatch(run)
+    if match is None:
+        raise ValueError(f"{run} is not a search run name")
+    budget = match["budget"]
+    return RunName(match["proposal"], match["batch"], int(match["index"]), int(budget) if budget else FULL_BUDGET)
+
+
+def due_at(proposal: ProposalRecord, rung: int) -> bool:
+    """Whether a proposal still has a run to do at a rung: none recorded there, and promoted when it is the full budget."""
+    return str(rung) not in proposal["results"] and (rung != FULL_BUDGET or proposal["promoted"])
 
 
 def write_queue_entry(name: str, genome: Genome, hypothesis: str, budget: int) -> None:
@@ -880,16 +1006,17 @@ def write_queue_entry(name: str, genome: Genome, hypothesis: str, budget: int) -
     queue.mkdir(parents=True, exist_ok=True)
     (queue / f"{name}.json").write_text(json.dumps(genome_document(genome), indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     (queue / f"{name}.txt").write_text(hypothesis.replace("\n", " ") + "\n", encoding="utf-8", newline="\n")
+    splits = TRACK.get("final_splits", []) if budget == FULL_BUDGET else ["val_select"]  # none: the benchmark's every split
     extra = (f"--budget {budget} --eval-cap {TRACK['eval_cap']} --eval-interval {TRACK['eval_interval']} "
-             f"--experiment-group {TRACK['group']}" + ("" if budget == FULL_BUDGET else " --final-splits val_select"))
+             f"--experiment-group {TRACK['group']}" + (f" --final-splits {' '.join(splits)}" if splits else ""))
     (queue / f"{name}.args").write_text(extra + "\n", encoding="utf-8", newline="\n")
 
 
-def propose(state: dict[str, Any], proposer: Proposer, batch: str, count: int, seed: int, rungs: list[int]) -> list[str]:
+def propose(state: SearchState, proposer: Proposer, batch: str, count: int, seed: int, rungs: list[int]) -> list[str]:
     if batch in state["batches"]:
         raise ValueError(f"batch {batch} exists")
     rng = np.random.default_rng(seed)
-    proposals = proposer.propose(observations_of(state), count, rng)
+    proposals = proposer.propose(observations_read_by(proposer, state), count, rng)
     names = []
     for index, proposal in enumerate(proposals, start=1):
         name = run_name(batch, index, FULL_BUDGET)
@@ -904,38 +1031,58 @@ def propose(state: dict[str, Any], proposer: Proposer, batch: str, count: int, s
     return names
 
 
-def next_rung(state: dict[str, Any], batch: str) -> int:
-    """The batch's first rung with a run still to do."""
+def next_rung(state: SearchState, batch: str) -> int | None:
+    """The batch's first rung with a run still to do, or None when every rung is done."""
     entry = state["batches"][batch]
-    return next(rung for rung in entry["rungs"] if any(
-        str(rung) not in state["proposals"][name]["results"] and (rung != FULL_BUDGET or state["proposals"][name]["promoted"])
-        for name in entry["names"]))
+    return next((rung for rung in entry["rungs"] if any(due_at(state["proposals"][name], rung) for name in entry["names"])), None)
 
 
-def ship(state: dict[str, Any], batches: list[str], budget: int | None = None) -> list[str]:
+def due_runs(state: SearchState, batch: str, rung: int) -> list[DueRun]:
+    """The batch's runs still to do at a rung, in proposal order."""
+    return [DueRun(batch, rung_run(name, rung), rung) for name in state["batches"][batch]["names"] if due_at(state["proposals"][name], rung)]
+
+
+def queue_runs(state: SearchState, runs: list[DueRun]) -> list[str]:
+    """Write each run's queue entry, its proposal's genome and reason at the run's budget, and record one shipment per
+    batch, at the batch's first listed rung; returns the run names in order."""
+    for due in runs:
+        proposal = state["proposals"][parse_run_name(due.run).proposal]
+        hypothesis = f"{proposal['proposer']} proposal ({due.rung} s): {proposal['reason']}"
+        write_queue_entry(due.run, resolve({"families": proposal["genome"]}), hypothesis, due.rung)
+    for batch in dict.fromkeys(due.batch for due in runs):
+        record_shipment(state, batch, next(due.rung for due in runs if due.batch == batch), [due.run for due in runs if due.batch == batch])
+    return [due.run for due in runs]
+
+
+def record_shipment(state: SearchState, batch: str, rung: int, runs: list[str]) -> None:
+    state["batches"][batch]["shipments"].append({"budget": rung, "names": runs, "utc": datetime.now(UTC).isoformat()})
+
+
+def ship(state: SearchState, batches: list[str], budget: int | None = None) -> list[str]:
     """Write the batches' queue entries, each at its next rung (or `budget`), and run the launcher with one queue.sh
-    over all of them, so the box runs them back to back; returns the run names."""
+    over all of them, so the box runs them back to back; returns the run names. A batch with nothing due still records
+    its empty shipment."""
     names = []
     for batch in batches:
         rung = budget or next_rung(state, batch)
-        shipped = []
-        for name in state["batches"][batch]["names"]:
-            proposal = state["proposals"][name]
-            if (rung == FULL_BUDGET and not proposal["promoted"]) or str(rung) in proposal["results"]:
-                continue
-            run = run_name(batch, int(name.rsplit("_", 1)[1]), rung)
-            hypothesis = f"{proposal['proposer']} proposal ({rung} s): {proposal['reason']}"
-            write_queue_entry(run, resolve({"families": proposal["genome"]}), hypothesis, rung)
-            shipped.append(run)
-        state["batches"][batch]["shipments"].append({"budget": rung, "names": shipped, "utc": datetime.now(UTC).isoformat()})
-        names += shipped
+        if rung is None:
+            raise ValueError(f"batch {batch} has no run left to do")
+        due = due_runs(state, batch, rung)
+        if not due:
+            record_shipment(state, batch, rung, [])
+        names += queue_runs(state, due)
+    launch_queue(names)
+    return names
+
+
+def launch_queue(names: list[str]) -> None:
+    """Run queue.sh over the runs through $SPEEDRUN_LAUNCHER, or print the command when it is unset."""
     command = ["bash", "queue.sh", "--wait", *names]
     launcher = os.environ.get("SPEEDRUN_LAUNCHER")
     if launcher is None:
         print("SPEEDRUN_LAUNCHER is unset; run on the box from the project:", shlex.join(command))
     else:
         subprocess.run([*shlex.split(launcher), *command], check=True)
-    return names
 
 
 def fetch(run: str, destination: Path) -> Path | None:
@@ -956,45 +1103,53 @@ def broken_caps(run_result: dict[str, Any]) -> str:
     return "invalid: " + ("; ".join(broken) or f"status {run_result['status']}")
 
 
-def collect(state: dict[str, Any], batch: str, results_dir: Path, ledger: Path) -> None:
+def collect(state: SearchState, batch: str, results_dir: Path, ledger: Path) -> None:
     """Read every finished run of the batch into the state and the ledger, then promote the top half of a finished
     short rung."""
-    import record
-
-    rungs = state["batches"][batch]["rungs"]
     for name in state["batches"][batch]["names"]:
-        proposal = state["proposals"][name]
-        for budget in rungs:
-            run = run_name(batch, int(name.rsplit("_", 1)[1]), budget)
-            if str(budget) in proposal["results"]:
+        for budget in state["batches"][batch]["rungs"]:
+            if str(budget) in state["proposals"][name]["results"]:
                 continue
-            path = fetch(run, results_dir)
-            if path is None:
-                continue
-            run_result = json.loads(path.read_text(encoding="utf-8"))
-            val_select = run_result["metrics"].get("val_select", {}).get("loss")
-            valid = run_result["status"] == "completed" and bool(run_result["clock"]["valid"])
-            incumbent = incumbent_of(state) if observations_of(state) else None  # before this result joins them
-            proposal["results"][str(budget)] = {
-                "run": run, "val_select": val_select, "test": run_result["metrics"].get("test", {}).get("loss"),
-                "steps": run_result["clock"]["steps"], "warmup_seconds": run_result["clock"]["warmup_seconds"],
-                "valid": valid, "candidate_sha256": run_result["candidate_sha256"],
-            }
-            if budget != FULL_BUDGET:
-                incumbent = None  # a short rung decides promotion within its batch, never a record
-            if not valid:
-                verdict = "invalid"
-            elif budget != FULL_BUDGET:
-                verdict = "reference"
-            else:
-                verdict = "keep" if incumbent is None or val_select < incumbent.value else "revert"
-            note = (f"{proposal['proposer']} batch {batch}, {budget} s rung, val_select {val_select:.4f}"
-                    + (f" against {incumbent.name} {incumbent.value:.4f}" if incumbent else "")
-                    + ("" if valid else f"; {broken_caps(run_result)}"))
-            record.append_row(ledger, run_result, verdict, note, incumbent.name if incumbent else None, {
-                "search_batch": batch, "proposer": proposal["proposer"], "parents": proposal["parents"],
-                "reason": proposal["reason"], "genome": proposal["genome"], "rung_seconds": budget,
-            })
+            path = fetch(rung_run(name, budget), results_dir)
+            if path is not None:
+                record_result(state, batch, name, budget, json.loads(path.read_text(encoding="utf-8")), ledger)
+    promote_top_half(state, batch)
+
+
+def record_result(state: SearchState, batch: str, name: str, budget: int, run_result: dict[str, Any], ledger: Path) -> None:
+    """One run's result.json into its proposal's results and one ledger row, with its verdict against the incumbent."""
+    import record  # a script beside this one, read only when a result is
+
+    proposal = state["proposals"][name]
+    val_select = run_result["metrics"].get("val_select", {}).get("loss")
+    valid = run_result["status"] == "completed" and bool(run_result["clock"]["valid"])
+    incumbent = incumbent_of(state) if observations_of(state) else None  # before this result joins them
+    proposal["results"][str(budget)] = {
+        "run": rung_run(name, budget), "val_select": val_select, "test": run_result["metrics"].get("test", {}).get("loss"),
+        "steps": run_result["clock"]["steps"], "warmup_seconds": run_result["clock"]["warmup_seconds"],
+        "valid": valid, "candidate_sha256": run_result["candidate_sha256"],
+    }
+    if budget != FULL_BUDGET:
+        incumbent = None  # a short rung decides promotion within its batch, never a record
+    if not valid:
+        verdict = "invalid"
+    elif budget != FULL_BUDGET:
+        verdict = "reference"
+    else:
+        verdict = "keep" if incumbent is None or val_select < incumbent.value else "revert"
+    note = (f"{proposal['proposer']} batch {batch}, {budget} s rung, val_select {val_select:.4f}"
+            + (f" against {incumbent.name} {incumbent.value:.4f}" if incumbent else "")
+            + ("" if valid else f"; {broken_caps(run_result)}"))
+    record.append_row(ledger, run_result, verdict, note, incumbent.name if incumbent else None, {
+        "search_batch": batch, "proposer": proposal["proposer"], "parents": proposal["parents"],
+        "reason": proposal["reason"], "genome": proposal["genome"], "rung_seconds": budget,
+    })
+
+
+def promote_top_half(state: SearchState, batch: str) -> None:
+    """Once every run of a batch's short rung has a result and none is promoted, promote the lower half of its val_select
+    losses, an invalid run ranked last."""
+    rungs = state["batches"][batch]["rungs"]
     if len(rungs) > 1:
         short = str(rungs[0])
         scored = [(state["proposals"][name]["results"].get(short), name) for name in state["batches"][batch]["names"]]
@@ -1005,26 +1160,22 @@ def collect(state: dict[str, Any], batch: str, results_dir: Path, ledger: Path) 
                 state["proposals"][name]["promoted"] = True
 
 
-def mark_crashed(state: dict[str, Any], run: str, note: str) -> None:
+def mark_crashed(state: SearchState, run: str, note: str) -> None:
     """A run that left no result.json: its rung counts as invalid, so promotion ranks it last; the launch log says why."""
-    match = re.fullmatch(r"(.+)_(\d+)(?:_r(\d+))?", run)
-    if match is None:
-        raise ValueError(f"{run} is not a search run name")
-    batch, index, rung = match.groups()
-    budget = int(rung) if rung else FULL_BUDGET
-    name = run_name(batch, int(index), FULL_BUDGET)
-    state["proposals"][name]["results"][str(budget)] = {"run": run, "val_select": None, "test": None, "steps": 0,
-                                                        "warmup_seconds": None, "valid": False, "crash": note}
+    parsed = parse_run_name(run)
+    state["proposals"][parsed.proposal]["results"][str(parsed.budget)] = {
+        "run": run, "val_select": None, "test": None, "steps": 0, "warmup_seconds": None, "valid": False, "crash": note}
 
 
-def effects_table(state: dict[str, Any], batch: str) -> str:
-    """The screening batch's main effects and leading interactions on val_select at the full budget, in Markdown."""
-    names = [name for name in state["batches"][batch]["names"] if str(FULL_BUDGET) in state["proposals"][name]["results"]]
+def effects_table(state: SearchState, batch: str, budget: int | None = None) -> str:
+    """The screening batch's main effects and leading interactions on val_select at a budget, by default the full one, in Markdown."""
+    key = str(budget or FULL_BUDGET)
+    names = [name for name in state["batches"][batch]["names"] if key in state["proposals"][name]["results"]]
     proposals = [state["proposals"][name] for name in names]
     factors = list(proposals[0]["factors"])
     levels = np.array([[proposal["factors"][factor] for factor in factors] for proposal in proposals])  # (n, k)
-    values = np.array([proposal["results"][str(FULL_BUDGET)]["val_select"] for proposal in proposals])  # (n,)
-    tests = [proposal["results"][str(FULL_BUDGET)]["test"] for proposal in proposals]
+    values = np.array([proposal["results"][key]["val_select"] for proposal in proposals])  # (n,)
+    tests = [proposal["results"][key]["test"] for proposal in proposals]
     effects = main_effects(levels, values)  # (k,)
     test_effects = main_effects(levels, np.array(tests)) if None not in tests else np.full(len(factors), np.nan)  # (k,)
     standard_error = NOISE_SD * math.sqrt(4 / len(values))
@@ -1044,17 +1195,41 @@ def effects_table(state: dict[str, Any], batch: str) -> str:
     return "\n".join(lines)
 
 
-def parse_arguments() -> argparse.Namespace:
+PROPOSER_NAMES = ("screening", "hybrid", "bayes", "bayes_rungs", "kumo", "genetic", "random", "manual")
+SPACE_PROPOSERS: dict[str, Callable[[list[Dimension]], Proposer]] = {
+    "hybrid": HybridProposer, "bayes": BayesianProposer, "bayes_rungs": RungReadingProposer, "genetic": GeneticProposer,
+    "random": RandomProposer}
+
+
+def proposer_of(name: str, space: list[Dimension], picks_made: int = 0, factors: Sequence[str] = (),
+                genomes: Sequence[Path] = (), hypotheses: Sequence[str] = ()) -> Proposer:
+    """One proposer by name, for the command line and the loop alike; a tabular model's package loads only when its arm
+    is asked for. `picks_made` is how many picks the tabular arm has made on this state, which counts toward its unseen
+    picks across batches; `factors` are screening's, `genomes` and `hypotheses` manual's. An unknown name is a KeyError."""
+    if name == "kumo":
+        from tabular_surrogate import KumoSurrogate  # its package lives only in the proposer's own image
+
+        return TabularProposer(space, KumoSurrogate(), picks_made=picks_made)
+    if name == "screening":
+        return ScreeningProposer(list(factors))
+    if name == "manual":
+        return ManualProposer(list(genomes), list(hypotheses))
+    return SPACE_PROPOSERS[name](space)
+
+
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    """The command line; `argv` None reads the process's arguments."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--state", type=Path, required=True, help="the search state JSON, beside the campaign ledger")
-    parser.add_argument("--track", choices=sorted(TRACKS), default="10min", help="the track of a state started by this call")
+    parser.add_argument("--track", choices=sorted(TRACKS), default="1h",
+                        help="the track of a state started by this call; the 1-hour track is the headline since 2026-11-23")
     commands = parser.add_subparsers(dest="command", required=True)
     proposing = commands.add_parser("propose")
-    proposing.add_argument("--proposer", choices=("screening", "bayes", "genetic", "manual"), required=True)
+    proposing.add_argument("--proposer", choices=PROPOSER_NAMES, required=True)
     proposing.add_argument("--batch", required=True)
     proposing.add_argument("--count", type=int, default=8)
     proposing.add_argument("--seed", type=int, default=0)
-    proposing.add_argument("--factors", nargs="+", default=None, help="screening: the switches, 2 to 11")
+    proposing.add_argument("--factors", nargs="+", default=[], help="screening: the switches, 2 to 11")
     proposing.add_argument("--genomes", nargs="+", type=Path, default=[], help="manual: genome files")
     proposing.add_argument("--hypotheses", nargs="+", default=[], help="manual: one sentence per genome")
     proposing.add_argument("--rungs", nargs="+", type=int, default=None,
@@ -1076,20 +1251,9 @@ def parse_arguments() -> argparse.Namespace:
     retiring.add_argument("keys", nargs="+")
     effects = commands.add_parser("effects")
     effects.add_argument("--batch", required=True)
+    effects.add_argument("--budget", type=int, default=None, help="the rung to read; the full budget by default")
     commands.add_parser("status")
-    return parser.parse_args()
-
-
-def proposer_named(arguments: argparse.Namespace, space: list[Dimension]) -> Proposer:
-    if arguments.proposer == "screening":
-        return ScreeningProposer(arguments.factors)
-    if arguments.proposer == "bayes":
-        return BayesianProposer(space)
-    if arguments.proposer == "genetic":
-        return GeneticProposer(space)
-    if arguments.proposer == "random":
-        return RandomProposer(space)
-    return ManualProposer(arguments.genomes, arguments.hypotheses)
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -1098,7 +1262,8 @@ def main() -> None:
     space = open_space(state["retired"])
     if arguments.command == "propose":
         rungs = arguments.rungs or ([FULL_BUDGET] if arguments.proposer == "screening" else [RUNG_BUDGET, FULL_BUDGET])
-        proposer = proposer_named(arguments, space)
+        proposer = proposer_of(arguments.proposer, space, factors=arguments.factors, genomes=arguments.genomes,
+                               hypotheses=arguments.hypotheses)
         names = propose(state, proposer, arguments.batch, arguments.count, arguments.seed, rungs)
         for name in names:
             print(name, state["proposals"][name]["reason"])
@@ -1115,7 +1280,7 @@ def main() -> None:
     elif arguments.command == "retire":
         state["retired"] = sorted(set(state["retired"]) | set(arguments.keys))
     elif arguments.command == "effects":
-        print(effects_table(state, arguments.batch))
+        print(effects_table(state, arguments.batch, arguments.budget))
     observations = observations_of(state)
     if observations:
         best = min(observations, key=lambda observation: observation.value)

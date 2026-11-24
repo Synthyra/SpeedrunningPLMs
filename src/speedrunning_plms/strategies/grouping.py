@@ -24,7 +24,7 @@ from torch import Tensor, nn
 from foundry.layers.cross_entropy import cross_entropy
 from speedrunning_plms import benchmark
 from speedrunning_plms.benchmark.tokens import STANDARD_RESIDUES
-from speedrunning_plms.strategies.strategy import ForwardContext, ParameterGroup, StepState, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, FadingWeight, ForwardContext, ParameterGroup, StepState, Strategy, StrategyConfig
 
 
 GROUPS = ("AVILM", "FWY", "KRH", "DE", "STNQ", "GPC")
@@ -33,16 +33,12 @@ GROUP_OF_CLASS = torch.tensor([next(group for group, members in enumerate(GROUPS
 
 
 @dataclass(frozen=True)
-class GroupingConfig(StrategyConfig):
+class GroupingConfig(FadingWeight, StrategyConfig):
     variant: str = "none"
     weight: float = 0.1  # the auxiliary weight at the start of the clock
     until: float = 0.5  # the share of the clock where the weight reaches 0
     VARIANTS: ClassVar[tuple[str, ...]] = ("none", "physchem")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"weight": (0.02, 0.5), "until": (0.1, 0.8)}
-
-    def weight_at(self, progress: float) -> float:
-        """The auxiliary weight at this share of the clock."""
-        return self.weight * max(0.0, 1 - progress / self.until)
 
 
 def group_labels(labels: Tensor) -> Tensor:
@@ -58,25 +54,25 @@ class Grouping(Strategy):
     Config = GroupingConfig
     config: GroupingConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         if self.active:
             self.holder = nn.Module()
-            self.holder.head = nn.Parameter(torch.zeros(len(GROUPS), benchmark.HIDDEN))  # (g, d)
+            self.holder.head = nn.Parameter(torch.zeros(len(GROUPS), model.strategies.shape.config.hidden))  # (g, d)
             self.holder.register_buffer("weight", torch.zeros(()), persistent=False)  # (), refilled each step
-            model.extensions[self.family] = self.holder  # type: ignore[index]
+            model.extensions[self.family] = self.holder
 
-    def initialize(self, model: nn.Module) -> None:
+    def initialize(self, model: CandidateModel) -> None:
         if self.active:
             self.holder.weight.fill_(self.config.weight_at(0.0))
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if not self.active:
             return []
-        return [ParameterGroup("group_head", [self.holder.head], "adam", model.strategies.optimizer.config.head_lr)]  # type: ignore[union-attr]
+        return [ParameterGroup("group_head", [self.holder.head], "adam", model.strategies.optimizer.config.head_lr)]
 
-    def auxiliary_loss(self, model: nn.Module, states: list[Tensor], labels: Tensor, context: ForwardContext) -> Tensor:
+    def auxiliary_loss(self, model: CandidateModel, states: list[Tensor], labels: Tensor, context: ForwardContext) -> Tensor:
         # states: (b, l, d) each, 37 of them; labels: (b, l); returns ().
-        features = model.head_features(states[-1])  # type: ignore[operator]  # (b, l, d)
+        features = model.head_features(states[-1])  # (b, l, d)
         logits = torch.nn.functional.linear(features, self.holder.head.to(features.dtype)).float()  # (b, l, g)
         summed = cross_entropy(logits.flatten(0, 1), group_labels(labels).flatten(), ignore_index=benchmark.IGNORE_LABEL,
                                reduction="sum")  # ()

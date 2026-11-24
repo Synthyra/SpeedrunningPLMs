@@ -9,9 +9,9 @@ import torch
 
 from dataclasses import dataclass
 from typing import ClassVar
-from torch import Tensor, nn
+from torch import Tensor
 
-from speedrunning_plms.strategies.strategy import Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, Strategy, StrategyConfig
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,6 @@ class Softcap(Strategy):
     Config = SoftcapConfig
     config: SoftcapConfig
 
-    def logits(self, model: nn.Module, logits: Tensor) -> Tensor:
+    def logits(self, model: CandidateModel, logits: Tensor) -> Tensor:
         # logits: (b, l, v).
         return self.config.cap * torch.tanh(logits / self.config.cap)  # (b, l, v)

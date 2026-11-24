@@ -30,8 +30,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 from torch import Tensor, nn
 
-from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ParameterGroup, Strategy, StrategyConfig, norm
+from speedrunning_plms.strategies.strategy import CandidateModel, ParameterGroup, Strategy, StrategyConfig, norm
 
 
 Stream = tuple[Tensor, ...]
@@ -56,15 +55,16 @@ class StreamMixer(Strategy):
     def active(self) -> bool:
         return False  # a role family: the skeleton calls it directly, never as a hook
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
-        blocks, d = benchmark.BLOCKS, benchmark.HIDDEN
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
+        blocks, d = model.strategies.shape.config.blocks, model.strategies.shape.config.hidden
+        self.blocks = blocks
         if self.variant == "hyper":
             n = int(self.config.streams)
             holder = nn.Module()
             holder.read = nn.Parameter(F.one_hot(torch.arange(blocks) % n, n).float())  # (36, n), A_m
             holder.mix = nn.Parameter(torch.eye(n).repeat(blocks, 1, 1))  # (36, n, n), A_r
             holder.write = nn.Parameter(torch.ones(blocks, n))  # (36, n), B
-            model.extensions[self.family] = holder  # type: ignore[index]
+            model.extensions[self.family] = holder
             self.holder = holder
         elif self.variant == "dense":
             k = min(int(self.config.span), blocks)
@@ -75,24 +75,24 @@ class StreamMixer(Strategy):
             if self.config.dynamic:
                 holder.down = nn.ModuleList(nn.Linear(d, k + 1, bias=False) for _ in range(blocks + 1))  # each (k + 1, d)
                 holder.up = nn.ModuleList(nn.Linear(k + 1, k + 1, bias=False) for _ in range(blocks + 1))  # each (k + 1, k + 1)
-            model.extensions[self.family] = holder  # type: ignore[index]
+            model.extensions[self.family] = holder
             self.holder = holder
             self.span = k
         elif self.variant == "attention_residual":
             holder = nn.Module()
             holder.logits = nn.Parameter(torch.zeros(blocks + 1, blocks + 1))  # (37, 37): row i reads its first i + 1
-            model.extensions[self.family] = holder  # type: ignore[index]
+            model.extensions[self.family] = holder
             self.holder = holder
 
-    def initialize(self, model: nn.Module) -> None:
+    def initialize(self, model: CandidateModel) -> None:
         if self.variant == "dense" and self.config.dynamic:
             for up in self.holder.up:
                 nn.init.zeros_(up.weight)  # (k + 1, k + 1): the per-token term starts at zero
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if self.variant == "single":
             return []
-        scalar_lr = model.strategies.optimizer.config.scalar_lr  # type: ignore[union-attr]
+        scalar_lr = model.strategies.optimizer.config.scalar_lr
         return [ParameterGroup(f"stream_{self.variant}", list(self.holder.parameters()), "adam", scalar_lr)]
 
     def begin(self, X: Tensor) -> Stream:
@@ -130,9 +130,9 @@ class StreamMixer(Strategy):
     def end(self, stream: Stream) -> Tensor:
         # Returns the state the head reads, (b, l, d).
         if self.variant == "dense":
-            return self._dense(stream, benchmark.BLOCKS)  # (b, l, d)
+            return self._dense(stream, self.blocks)  # (b, l, d)
         if self.variant == "attention_residual":
-            return self._attention_residual(stream[:-1], benchmark.BLOCKS)  # (b, l, d)
+            return self._attention_residual(stream[:-1], self.blocks)  # (b, l, d)
         return self.view(stream)  # (b, l, d)
 
     def view(self, stream: Stream) -> Tensor:

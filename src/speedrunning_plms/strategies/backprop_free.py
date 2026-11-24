@@ -37,11 +37,15 @@ from __future__ import annotations
 import torch
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 from torch import Tensor, nn
 
 from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ForwardContext, StepState, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, ForwardContext, StepState, Strategy, StrategyConfig
+
+
+if TYPE_CHECKING:  # the registry imports this module
+    from speedrunning_plms.strategies import Strategies
 
 
 SUBLAYERS = ("attention", "mlp")
@@ -65,17 +69,19 @@ class BackpropFreeConfig(StrategyConfig):
         "interval": (1, 50), "sigma": (0.005, 0.3), "es_lr": (0.001, 0.2), "keep": (0.05, 0.95), "stride": (1, 18),
         "fraction": (0.05, 0.8), "readout_weight": (0.05, 1.0), "switch": (0.1, 1.0), "route_k": (64, 1024),
     }
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if not isinstance(self.route_k, int):
-            raise ValueError(f"route_k must be an integer, not {self.route_k!r}")
+    INTEGERS: ClassVar[tuple[str, ...]] = ("route_k",)
 
 
 class BackpropFree(Strategy):
     family = "backprop_free"
     Config = BackpropFreeConfig
     config: BackpropFreeConfig
+
+    def conflicts(self, strategies: Strategies) -> list[str]:
+        blocks = strategies.shape.config.blocks
+        if self.variant in ("readout_warmstart", "readout_boost") and self.config.stride >= blocks - 1:
+            return [f"stride {self.config.stride} leaves no readout site before the last of {blocks} blocks"]
+        return []
 
     def overrides(self, hook: str) -> bool:
         uses = {"residual_es": ("sublayer_output", "after_step"),
@@ -86,9 +92,10 @@ class BackpropFree(Strategy):
                 "unit_route": ("mlp_hidden",)}
         return hook in uses.get(self.variant, ())
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         holder = nn.Module()
-        blocks, f = benchmark.BLOCKS, benchmark.INTERMEDIATE
+        blocks, f = model.strategies.shape.config.blocks, model.strategies.shape.config.intermediate
+        self.blocks = blocks
         if self.variant == "residual_es":
             holder.register_buffer("scales", torch.ones(blocks, 2))  # (36, 2): attention, MLP; kept in best.pt
         elif self.variant in ("unit_select", "unit_random"):
@@ -99,7 +106,7 @@ class BackpropFree(Strategy):
         elif self.variant == "readout_boost":
             holder.register_buffer("weight", torch.tensor(self.config.readout_weight), persistent=False)  # (), refilled each step
         if self.active:
-            model.extensions[self.family] = holder  # type: ignore[index]
+            model.extensions[self.family] = holder
             self.holder = holder
             self.generator: torch.Generator | None = None
 
@@ -125,13 +132,13 @@ class BackpropFree(Strategy):
         gradient = (loss_plus - loss_minus) / (2 * self.config.sigma) * eps  # (36, 2)
         scales.copy_(base - self.config.es_lr * state.lr_scale * gradient)
 
-    def initialize(self, model: nn.Module) -> None:
+    def initialize(self, model: CandidateModel) -> None:
         if self.variant == "unit_route":
             self.down_weights = [block.mlp.down.weight for block in model.blocks]  # type: ignore[union-attr]  # each (d, f)
 
     # Unit selection and routes.
-    def mlp_hidden(self, index: int, H: Tensor) -> Tensor:
-        # H: (b, l, f), relu^2 of the pre-activations under the record's activation.
+    def mlp_hidden(self, index: int, H: Tensor, X: Tensor) -> Tensor:
+        # H: (b, l, f), relu^2 of the pre-activations under the record's activation; X: (b, l, d), unused.
         if self.variant == "unit_route":
             down_norms = self.down_weights[index].detach().float().norm(dim=0)  # (f,)
             scores = H.detach().float() * down_norms  # (b, l, f)
@@ -151,9 +158,9 @@ class BackpropFree(Strategy):
 
     def _boost_blocks(self) -> range:
         """The blocks Boost's readouts read: every `stride`-th, the last one left to the training loss itself."""
-        return range(self.config.stride - 1, benchmark.BLOCKS - 1, self.config.stride)
+        return range(self.config.stride - 1, self.blocks - 1, self.config.stride)
 
-    def _rank_units(self, model: nn.Module) -> None:
+    def _rank_units(self, model: CandidateModel) -> None:
         masks = self.holder.masks  # (36, f)
         keep = int(self.config.keep * masks.shape[1])
         if self.variant == "unit_random":
@@ -166,19 +173,19 @@ class BackpropFree(Strategy):
 
     def after_backward(self, state: StepState) -> None:
         masks = self.holder.masks  # (36, f)
-        for index, block in enumerate(state.model.blocks):  # type: ignore[union-attr]
+        for index, block in enumerate(state.model.blocks):
             mask = masks[index]  # (f,)
             if block.mlp.up.weight.grad is not None:
                 block.mlp.up.weight.grad.mul_(mask[:, None].to(block.mlp.up.weight.grad.dtype))  # (f, d)
                 block.mlp.down.weight.grad.mul_(mask[None, :].to(block.mlp.down.weight.grad.dtype))  # (d, f)
 
     # Readout warm start.
-    def auxiliary_loss(self, model: nn.Module, states: list[Tensor], labels: Tensor, context: ForwardContext) -> Tensor:
+    def auxiliary_loss(self, model: CandidateModel, states: list[Tensor], labels: Tensor, context: ForwardContext) -> Tensor:
         # states: (b, l, d) each, 37 of them; labels: (b, l); returns (), the readouts' summed loss averaged over readouts.
         if self.variant == "readout_boost":
             streams = [context.stored[f"readout_{index}_{sublayer}"] for index in self._boost_blocks() for sublayer in SUBLAYERS]
         else:
-            streams = [states[index] for index in range(self.config.stride, benchmark.BLOCKS, self.config.stride)]
+            streams = [states[index] for index in range(self.config.stride, self.blocks, self.config.stride)]
         total = sum(benchmark.masked_cross_entropy(model.logits(X), labels) for X in streams)  # ()
         return self.holder.weight * total / len(streams)  # ()
 

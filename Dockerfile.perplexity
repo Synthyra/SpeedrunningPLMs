@@ -1,0 +1,10 @@
+# The perplexity plot's image (perplexity.py): the speedrun image plus MMseqs2, which clusters the corpus, and
+# sentencepiece and protobuf, which ProtT5's and ANKH's tokenizers load through, so the image that trains and scores stays
+# the record's. Built through run_gh200.sh; MMseqs2 is the multi-architecture release FastPLMs pins, by digest.
+FROM ghcr.io/soedinglab/mmseqs2:18-8cc5c@sha256:41b12b0d5f41432fa1b9976123da6e2e06e7fab49a34964f3b54ec038e5845d9 AS mmseqs
+
+FROM speedrun_plm:afdb_v6
+
+# On aarch64 the release's binary is `mmseqs_arch` (its entrypoint links to it; the x86 variants are empty files).
+COPY --from=mmseqs /usr/local/bin/mmseqs_arch /usr/local/bin/mmseqs
+RUN mmseqs version && pip install "sentencepiece==0.2.0" "protobuf==5.29.3"

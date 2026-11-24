@@ -10,6 +10,9 @@
 #   bash queue.sh --wait --probe 015_normuon --reprobe-baselines
 #       wait for the GPU, probe a kept run first, run the queue, then re-probe the reference models
 #
+# Every probe and run first waits for an idle GPU (`run_gh200.sh wait-gpu`): on a shared box another session's work
+# goes first, and `--wait` also waits for this project's own train, probe and baselines processes.
+#
 # Each queued file is a complete train.py built on the incumbent; it becomes the shipped tree's train.py for its run
 # and `run_gh200.sh train` snapshots it into the run folder. A run that already has a result is skipped. The queue
 # does not decide verdicts: the driver reads every result.json afterwards, keeps the best candidate that beats the
@@ -34,10 +37,13 @@ done
 exec 9>"$STATE/queue.lock"
 flock 9  # one queue at a time: a later shipment waits here until the earlier one has finished
 if [ "$wait_for_gpu" = 1 ]; then
-  while pgrep -f "[t]rain.py|[p]robe.py|[b]aselines.py" >/dev/null; do sleep 30; done
+  # The container's own process, anchored: an unanchored name also matched a waiting chain whose script mentions
+  # train.py, which on 2026-11-23 held the queue for 16 minutes while that chain waited for this one.
+  while pgrep -f "^python[0-9.]* (train|probe|baselines)\.py" >/dev/null; do sleep 30; done
   echo "queue: gpu free $(date -u +%H:%M:%S)" >&2
 fi
 for run in "${probe_runs[@]}"; do
+  bash run_gh200.sh wait-gpu
   echo "queue: probe $run $(date -u +%H:%M:%S)" >&2
   bash run_gh200.sh probe --run-dir "/state/runs/$run" || echo "queue: probe $run failed" >&2  # the container path
 done
@@ -66,10 +72,12 @@ for name in "${names[@]}"; do
   else
     cp "candidates/queue/$name.py" train.py
   fi
+  bash run_gh200.sh wait-gpu  # every run starts on an idle GPU, after any other session's work
   echo "queue: $name starts $(date -u +%H:%M:%S)" >&2
   bash run_gh200.sh train --name "$name" --hypothesis "$hypothesis" "${extra[@]}" || echo "queue: $name failed" >&2
 done
 if [ "$reprobe_baselines" = 1 ]; then
+  bash run_gh200.sh wait-gpu
   echo "queue: reprobe baselines $(date -u +%H:%M:%S)" >&2
   bash run_gh200.sh baselines --probe-only || echo "queue: reprobe failed" >&2
 fi

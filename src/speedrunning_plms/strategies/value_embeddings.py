@@ -9,11 +9,15 @@ Symbols: b windows or proteins, l tokens, d = 768, h heads, d_h per-head width, 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 from torch import Tensor, nn
 
 from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ForwardContext, ParameterGroup, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, ForwardContext, ParameterGroup, Strategy, StrategyConfig
+
+
+if TYPE_CHECKING:  # the registry imports this module
+    from speedrunning_plms.strategies import Strategies
 
 
 @dataclass(frozen=True)
@@ -29,25 +33,30 @@ class ValueEmbeddings(Strategy):
     Config = ValueEmbeddingsConfig
     config: ValueEmbeddingsConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def conflicts(self, strategies: Strategies) -> list[str]:
+        blocks, k = strategies.shape.config.blocks, int(self.config.blocks_each_end)
+        return [f"{k} tabled blocks at each end overlap in {blocks} blocks"] if self.active and 2 * k > blocks else []
+
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         if self.variant == "none":
             return
         k = int(self.config.blocks_each_end)
-        tabled = tuple(range(k)) + tuple(range(benchmark.BLOCKS - k, benchmark.BLOCKS))
+        blocks = model.strategies.shape.config.blocks
+        tabled = tuple(range(k)) + tuple(range(blocks - k, blocks))
         self.position = {block: index for index, block in enumerate(tabled)}
-        self.tables = nn.ModuleList(nn.Embedding(benchmark.VOCAB_SIZE, benchmark.HIDDEN) for _ in tabled)  # each (v, d)
-        model.extensions[self.family] = self.tables  # type: ignore[index]
+        self.tables = nn.ModuleList(nn.Embedding(benchmark.VOCAB_SIZE, model.strategies.shape.config.hidden) for _ in tabled)  # each (v, d)
+        model.extensions[self.family] = self.tables
 
-    def initialize(self, model: nn.Module) -> None:
+    def initialize(self, model: CandidateModel) -> None:
         if self.variant == "ends":
             for table in self.tables:
                 nn.init.zeros_(table.weight)  # (v, d)
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if self.variant == "none":
             return []
         tables = [table.weight for table in self.tables]
-        return [ParameterGroup("value_embeddings", tables, "adam", model.strategies.optimizer.config.embed_lr)]  # type: ignore[union-attr]
+        return [ParameterGroup("value_embeddings", tables, "adam", model.strategies.optimizer.config.embed_lr)]
 
     def values(self, index: int, V: Tensor, context: ForwardContext) -> Tensor:
         # V: (b, l, h, d_h).

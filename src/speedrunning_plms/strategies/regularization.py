@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 from torch import Tensor, nn
 
-from speedrunning_plms.strategies.strategy import StepState, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, StepState, Strategy, StrategyConfig
 
 
 @dataclass(frozen=True)
@@ -40,13 +40,13 @@ class Regularization(Strategy):
     Config = RegularizationConfig
     config: RegularizationConfig
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
         if self.active:
             self.holder = nn.Module()
             self.holder.register_buffer("rate", torch.zeros(()), persistent=False)  # (), refilled each step
-            model.extensions[self.family] = self.holder  # type: ignore[index]
+            model.extensions[self.family] = self.holder
 
-    def initialize(self, model: nn.Module) -> None:
+    def initialize(self, model: CandidateModel) -> None:
         if self.active:
             self.holder.rate.fill_(self.config.rate_at(0.0))
 

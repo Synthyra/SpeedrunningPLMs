@@ -6,7 +6,8 @@ autocast, `torch.compile`, flex attention over packed windows with a document ma
 masked residues, and validation on `val_select` every 90 s of clock to select the weights. Everything else comes from
 the genome (`--genome`, a JSON file; `speedrunning_plms.strategies`): the attention kernel and its positional prior,
 the residual form and stream, skips, tables, gates, the head's cap, the optimizer and its schedule, the batch, the
-window curriculum, weight averaging and the backprop-free pieces. Without a genome every family takes its default,
+window curriculum, weight averaging, the backprop-free pieces, and a looped core with its routers. Without a genome every
+family takes its default,
 which is the record (022).
 
 What the benchmark fixes and this file may not touch: the data and its corruption, the clock and its caps, the
@@ -37,6 +38,7 @@ from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 
 from speedrunning_plms import benchmark
+from speedrunning_plms.evidence import RunEvidence
 from speedrunning_plms.strategies import Genome, Strategies, default_genome, genome_document, genome_sha256, load_genome, sources_sha256
 from speedrunning_plms.strategies.activation import Activation
 from speedrunning_plms.strategies.attention import Attention, document_dense_mask
@@ -64,7 +66,7 @@ class MLP(nn.Module):
         # X: (b, l, d)
         H = self.activation.apply(self.index, self.up(X))  # (b, l, f), ReLU squared in the record
         for hook in self.hidden_hooks:
-            H = hook.mlp_hidden(self.index, H)  # (b, l, f)
+            H = hook.mlp_hidden(self.index, H, X)  # (b, l, f); a router reads the normalized input X
         return self.down(H)  # (b, l, d)
 
 
@@ -73,31 +75,32 @@ class Block(nn.Module):
         super().__init__()
         self.index = index
         self.attention = attention
-        self.mlp = MLP(index, benchmark.HIDDEN, benchmark.INTERMEDIATE, strategies.activation, strategies.hooked("mlp_hidden"))
+        shape = strategies.shape.config
+        self.mlp = MLP(index, shape.hidden, shape.intermediate, strategies.activation, strategies.hooked("mlp_hidden"))
         self.residual = strategies.residual
         self.normalized_hooks = strategies.hooked("normalized_input")
         self.output_hooks = strategies.hooked("sublayer_output")
         self.stream_hooks = strategies.hooked("updated_stream")
 
-    def sublayer_input(self, sublayer: str, X: Tensor) -> Tensor:
+    def sublayer_input(self, sublayer: str, X: Tensor, context: ForwardContext) -> Tensor:
         # X: (b, l, d), the stream; returns the sublayer's normalized input (b, l, d).
-        H = self.residual.sublayer_input(X)  # (b, l, d)
+        H = self.residual.sublayer_input(self.index, sublayer, X, context)  # (b, l, d)
         for hook in self.normalized_hooks:
             H = hook.normalized_input(self.index, sublayer, H)  # (b, l, d)
         return H  # (b, l, d)
 
     def forward(self, X: Tensor, context: ForwardContext) -> Tensor:
         # X: (b, l, d)
-        A = self.attention(self.sublayer_input("attention", X), context)  # (b, l, d)
+        A = self.attention(self.sublayer_input("attention", X, context), context)  # (b, l, d)
         for hook in self.output_hooks:
             A = hook.sublayer_output(self.index, "attention", A)  # (b, l, d)
-        X = self.residual.update(self.index, "attention", X, A)  # (b, l, d)
+        X = self.residual.update(self.index, "attention", X, A, context)  # (b, l, d)
         for hook in self.stream_hooks:
             X = hook.updated_stream(self.index, "attention", X, context)  # (b, l, d)
-        M = self.mlp(self.sublayer_input("mlp", X))  # (b, l, d)
+        M = self.mlp(self.sublayer_input("mlp", X, context))  # (b, l, d)
         for hook in self.output_hooks:
             M = hook.sublayer_output(self.index, "mlp", M)  # (b, l, d)
-        X = self.residual.update(self.index, "mlp", X, M)  # (b, l, d)
+        X = self.residual.update(self.index, "mlp", X, M, context)  # (b, l, d)
         for hook in self.stream_hooks:
             X = hook.updated_stream(self.index, "mlp", X, context)  # (b, l, d)
         return X  # (b, l, d)
@@ -106,14 +109,14 @@ class Block(nn.Module):
 class Candidate(nn.Module):
     def __init__(self, strategies: Strategies, max_tokens: int) -> None:
         super().__init__()
-        d = benchmark.HIDDEN
+        d = strategies.shape.config.hidden
         self.strategies = strategies
         self.extensions = nn.ModuleDict()  # what the strategies add, by family
         self.embedding = nn.Embedding(benchmark.VOCAB_SIZE, d)
         for strategy in strategies:
             strategy.build(self, max_tokens)
         self.blocks = nn.ModuleList(Block(index, strategies.attention.attention(self, index), strategies)
-                                    for index in range(benchmark.BLOCKS))
+                                    for index in range(strategies.shape.config.blocks))
         self.head = nn.Linear(d, benchmark.VOCAB_SIZE, bias=False)
         self.residue_columns = benchmark.ESM2_RESIDUE_COLUMNS  # (c,), the evaluator's view of this vocabulary
         self.embed_hooks = strategies.hooked("embed")
@@ -196,16 +199,17 @@ def build_candidate(genome: Genome, max_tokens: int) -> Candidate:
 def windows(steps: Iterator[np.ndarray], step_tokens: int, window_of_step: Callable[[], int]) -> Iterator[Tensor]:
     """Each step's block of the batch family's reader as windows; the record reads consecutive blocks of the shuffled
     stream (`batch.contiguous_steps`)."""
-    # Each yield: (step_tokens / window, window) uint8 on the CPU, the window read from `window_of_step` at each step.
+    # steps: (step_tokens,) each; each yield: (step_tokens / window, window) uint8 on the CPU, the window read from `window_of_step` at each step.
     for chunk in steps:
         window = window_of_step()
         yield torch.from_numpy(chunk).view(step_tokens // window, window)  # (b, l)
 
 
 def train_step(model: nn.Module, corrupted: Tensor, labels: Tensor, block_masks: tuple[BlockMask, ...] | None,
-               dense_mask: Tensor | None, device: torch.device, auxiliary: bool, loss_hooks: list[Strategy]) -> tuple[Tensor, Tensor]:
-    """One forward and backward; returns the summed masked loss (without auxiliary terms or the loss hooks' changes)
-    and the masked count. The loss hooks turn that loss into the objective the backward differentiates."""
+               dense_mask: Tensor | None, device: torch.device, auxiliary: bool, loss_hooks: list[Strategy], accumulation: int = 1) -> tuple[Tensor, Tensor]:
+    """One forward and backward, its gradient one of `accumulation` to be summed; returns the summed masked loss (without
+    auxiliary terms or the loss hooks' changes) and the masked count. The loss hooks turn that loss into the objective the
+    backward differentiates."""
     # corrupted, labels: (b, l); dense_mask: (b, 1, l, l) or None.
     extra: Tensor | None = None
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -222,7 +226,7 @@ def train_step(model: nn.Module, corrupted: Tensor, labels: Tensor, block_masks:
     for hook in loss_hooks:
         objective = hook.training_loss(logits, labels, objective)  # ()
     total = objective if extra is None else objective + extra  # ()
-    (total / count.clamp(min=1)).backward()
+    (total / count.clamp(min=1) / accumulation).backward()
     return loss.detach(), count  # (), ()
 
 
@@ -311,6 +315,7 @@ def main() -> None:
         raise FileExistsError(f"{output_dir} already holds a result")
     output_dir.mkdir(parents=True, exist_ok=True)
     started_utc = datetime.now(UTC)
+    evidence = RunEvidence.start(output_dir, arguments.data_dir, device, candidate_digest(strategies.genome))  # before data loads
 
     manifest = benchmark.load_manifest(arguments.data_dir)
     data_id = benchmark.benchmark_id(manifest)
@@ -459,21 +464,29 @@ def main() -> None:
                       budget_seconds=arguments.budget, receipt=output_dir / "pilot.json")
         batches = pilot.watch(batches)
 
+    evidence.mark_training()  # after the compile warmup, before the first step on the clock
     model.train()
     step = 0
+    micro_batches = 0  # those summed so far into the optimizer step being built; a step takes one in the record
     for window_batch in batches:
         if arguments.max_steps is not None and step >= arguments.max_steps:
             break
-        clock.start_step()
+        if not micro_batches:
+            clock.start_step()
+            accumulation = batch.accumulation(clock.progress) if strategies.sam.variant == "none" else 1  # SAM's second pass reads one batch
         input_ids = window_batch.to(device, non_blocking=True).long()  # (b, l)
         corrupted, labels = benchmark.corrupt(input_ids, generator)  # each (b, l)
         block_masks, dense_mask = masks_of(corrupted)
         if mark_steps:
             torch.compiler.cudagraph_mark_step_begin()
-        loss, count = train_step(compiled, corrupted, labels, block_masks, dense_mask, device, auxiliary, loss_hooks)
+        loss, count = train_step(compiled, corrupted, labels, block_masks, dense_mask, device, auxiliary, loss_hooks, accumulation)
         if clock.expired():
             model.zero_grad(set_to_none=True)
             break
+        micro_batches += 1
+        if micro_batches < accumulation:
+            continue
+        micro_batches = 0
         progress = clock.progress
         scale = schedule.lr_scale(progress, cooldown=not strategies.optimizer.schedule_free)
         state = step_state(step, progress, scale, corrupted, labels, block_masks, dense_mask)
@@ -537,6 +550,7 @@ def main() -> None:
         "started_utc": started_utc.isoformat(), "finished_utc": datetime.now(UTC).isoformat(),
     }
     benchmark.write_result(output_dir, run_result)
+    evidence.finish(run_result)  # before the run closes, so the ledger row stays the last line of standard output
     summary = {f"{split}/loss": values["loss"] for split, values in metrics.items()}
     run.finish(status="completed", summary={**summary, "cost/steps": clock_receipt["steps"]})
     print(json.dumps(benchmark.ledger_row(run_result)), flush=True)

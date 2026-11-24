@@ -31,11 +31,7 @@ class SamConfig(StrategyConfig):
     start: float = 0.6  # the share of the clock from which SAM runs
     VARIANTS: ClassVar[tuple[str, ...]] = ("none", "late")
     BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {"rho": (0.005, 0.5), "every": (1, 16), "start": (0.0, 0.95)}
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if not isinstance(self.every, int):
-            raise ValueError(f"every must be an integer, not {self.every!r}")
+    INTEGERS: ClassVar[tuple[str, ...]] = ("every",)
 
 
 class Sam(Strategy):

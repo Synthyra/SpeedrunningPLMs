@@ -24,7 +24,7 @@ from typing import ClassVar
 from torch import Tensor, nn
 
 from speedrunning_plms import benchmark
-from speedrunning_plms.strategies.strategy import ForwardContext, ParameterGroup, Strategy, StrategyConfig
+from speedrunning_plms.strategies.strategy import CandidateModel, ForwardContext, ParameterGroup, Strategy, StrategyConfig
 
 
 TRIGRAM_ROWS = 2**16
@@ -65,15 +65,16 @@ class GatedTable(nn.Module):
     """A context table and the logit of the sigmoid gate it enters through. The table is built from zeros, so it draws
     nothing from the generator and the record's weights initialize as they do without it."""
 
-    def __init__(self, rows: int) -> None:
+    def __init__(self, rows: int, d: int) -> None:
         super().__init__()
-        self.table = nn.Embedding(rows, benchmark.HIDDEN, _weight=torch.zeros(rows, benchmark.HIDDEN))  # (rows, d)
+        self.table = nn.Embedding(rows, d, _weight=torch.zeros(rows, d))  # (rows, d)
         self.gate = nn.Parameter(torch.zeros(()))  # ()
 
 
 class Neighbor(Strategy):
     family = "neighbor"
     Config = NeighborConfig
+    config: NeighborConfig
 
     @property
     def gated(self) -> bool:
@@ -84,37 +85,39 @@ class Neighbor(Strategy):
             return self.variant == "pair_table"
         return hook == "updated_stream" and self.gated
 
-    def build(self, model: nn.Module, max_tokens: int) -> None:
+    def build(self, model: CandidateModel, max_tokens: int) -> None:
+        shape = model.strategies.shape.config
+        self.last_block = shape.blocks - 1
         if self.variant == "pair_table":
-            self.table = nn.Embedding(TABLE_ROWS[self.variant], benchmark.HIDDEN)  # (v * v, d)
-            model.extensions[self.family] = self.table  # type: ignore[index]
+            self.table = nn.Embedding(TABLE_ROWS[self.variant], shape.hidden)  # (v * v, d)
+            model.extensions[self.family] = self.table
         elif self.gated:
-            self.gated_table = GatedTable(TABLE_ROWS[self.variant])
+            self.gated_table = GatedTable(TABLE_ROWS[self.variant], shape.hidden)
             self.table = self.gated_table.table
-            model.extensions[self.family] = self.gated_table  # type: ignore[index]
+            model.extensions[self.family] = self.gated_table
 
-    def initialize(self, model: nn.Module) -> None:
+    def initialize(self, model: CandidateModel) -> None:
         if self.active:
             nn.init.zeros_(self.table.weight)  # (rows, d): the table starts silent
         if self.gated:
             nn.init.zeros_(self.gated_table.gate)  # (): sigmoid 0.5
 
-    def parameter_groups(self, model: nn.Module) -> list[ParameterGroup]:
+    def parameter_groups(self, model: CandidateModel) -> list[ParameterGroup]:
         if not self.active:
             return []
-        config = model.strategies.optimizer.config  # type: ignore[union-attr]
+        config = model.strategies.optimizer.config
         groups = [ParameterGroup("neighbor_table", [self.table.weight], "adam", config.embed_lr)]
         if self.gated:
             groups.append(ParameterGroup("neighbor_gate", [self.gated_table.gate], "adam", config.scalar_lr))
         return groups
 
-    def embed(self, model: nn.Module, input_ids: Tensor, X: Tensor) -> Tensor:
+    def embed(self, model: CandidateModel, input_ids: Tensor, X: Tensor) -> Tensor:
         # input_ids: (b, l); X: (b, l, d).
         return X + self.table(pair_index(input_ids))  # (b, l, d)
 
     def updated_stream(self, index: int, sublayer: str, X: Tensor, context: ForwardContext) -> Tensor:
         # X: (b, l, d), the stream after block `index`'s sublayer; the table enters after the last block's MLP.
-        if index != benchmark.BLOCKS - 1 or sublayer != "mlp":
+        if index != self.last_block or sublayer != "mlp":
             return X  # (b, l, d)
         rows = pair_index(context.input_ids) if self.variant == "bigram_table" else trigram_index(context.input_ids)  # (b, l)
         return X + torch.sigmoid(self.gated_table.gate) * self.table(rows).to(X.dtype)  # (b, l, d)
