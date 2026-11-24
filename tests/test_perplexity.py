@@ -5,16 +5,15 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
-import numpy as np
-import pytest
 import sys
-import torch
 import types
+import numpy as np
+import perplexity
+import pytest
+import torch
 
 from pathlib import Path
 from types import SimpleNamespace
-
-import perplexity
 
 from speedrunning_plms import benchmark
 
