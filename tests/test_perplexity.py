@@ -191,3 +191,62 @@ def test_reference_labels_keep_their_gap_and_order() -> None:
     assert min(a - b for a, b in zip(heights, heights[1:])) >= 0.05 - 1e-12
     assert np.mean(heights) == pytest.approx(np.mean(values))
     assert perplexity.spread([1.0, 2.0], 0.5) == [1.0, 2.0]  # far enough apart: untouched
+
+
+def test_the_served_scorer_masks_one_residue_reads_its_row_retries_and_resumes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import email.message
+    import io
+    import urllib.error
+
+    monkeypatch.setenv("FOUNDRY_SECRETS", str(tmp_path / "absent.env"))  # loads nothing: the test's token stands
+    monkeypatch.setenv("BIOHUB_TOKEN", "test-token")
+    monkeypatch.setattr(perplexity.time, "sleep", lambda seconds: None)
+    sequence, positions = "MKTAYIAKQR", (1, 8)
+    bodies, failures = [], [1]  # the first request is rate limited once
+
+    class Response:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *exception: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.payload
+
+    def fake_urlopen(request: object, timeout: float) -> Response:
+        assert request.headers["Authorization"] == "Bearer test-token"  # type: ignore[attr-defined]
+        if failures:
+            failures.pop()
+            headers = email.message.Message()
+            headers["Retry-After"] = "0"
+            raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", headers, io.BytesIO(b"slow down"))  # type: ignore[attr-defined, arg-type]
+        body = json.loads(request.data)  # type: ignore[attr-defined]
+        bodies.append(body)
+        rows = [[0.0] * 64 for _ in body["inputs"]["sequence"]]
+        masked = body["inputs"]["sequence"].index(perplexity.ESM3_MASK)
+        rows[masked] = [0.1 * column for column in range(64)]
+        return Response(json.dumps({"model": body["model"], "tokens_used": len(sequence), "logits": {"sequence": rows}}).encode())
+
+    monkeypatch.setattr(perplexity.urllib.request, "urlopen", fake_urlopen)
+    spec = perplexity.MODELS["esm3_large"]
+    cache = tmp_path / "esm3_large.partial.jsonl"
+    scorer = perplexity.BiohubScorer(spec, cache, workers=2)
+    log_probs = scorer(sequence, positions)  # (K,)
+    assert scorer.retries == {"HTTP 429": 1}  # the rate limit was waited out and counted
+    vocabulary = list(perplexity.ESM3_SEQUENCE_VOCAB)
+    for body, position in zip(sorted(bodies, key=lambda body: body["inputs"]["sequence"].index(perplexity.ESM3_MASK)), positions, strict=True):
+        ids = body["inputs"]["sequence"]  # (L + 2,)
+        assert body["model"] == "esm3-large-2024-03" and ids[0] == perplexity.ESM3_BOS and ids[-1] == perplexity.ESM3_EOS
+        assert ids.index(perplexity.ESM3_MASK) == position + 1 and ids.count(perplexity.ESM3_MASK) == 1
+        assert [vocabulary[token] for token in ids[1:-1] if token != perplexity.ESM3_MASK] == list(sequence[:position] + sequence[position + 1:])
+    residue_logits = torch.tensor([0.1 * vocabulary.index(residue) for residue in perplexity.STANDARD_RESIDUES])  # (c,)
+    expected = [float(residue_logits.log_softmax(0)[perplexity.STANDARD_RESIDUES.index(sequence[position])]) for position in positions]
+    assert log_probs == pytest.approx(expected, abs=1e-6)
+    resumed = perplexity.BiohubScorer(spec, cache)
+    calls = len(bodies)
+    assert resumed(sequence, positions) == pytest.approx(log_probs) and len(bodies) == calls  # read back, nothing requested
+    assert resumed.tokens_used == len(positions) * len(sequence)

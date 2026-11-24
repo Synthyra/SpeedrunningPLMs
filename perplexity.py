@@ -6,6 +6,8 @@ release date. This is that plot for protein language models:
     python perplexity.py corpus --state-dir /state/perplexity --threads 48
     python perplexity.py fetch --state-dir /state/perplexity
     python perplexity.py score --state-dir /state/perplexity --models esm2_650m prot_t5_xl_uniref50 ...
+    python perplexity.py check-served --state-dir /state/perplexity --model esm3-open-2024-03 --against esm3_small
+    python perplexity.py score --state-dir /state/perplexity --models esm3_large
     python perplexity.py star --state-dir /state/perplexity --run h_auto11_bayes_01
     python perplexity.py copies --state-dir /state/perplexity --data-dir /state/data/afdb_v6
     python perplexity.py relatives --state-dir /state/perplexity --data-dir /state/data/afdb_v6 --threads 48
@@ -20,7 +22,9 @@ The measure. Each sampled residue is masked alone with every other residue visib
 residue is renormalized over the 20 standard residues, and -log2 of it is averaged over the corpus's sampled residues:
 bits per residue, which is bits per byte of a FASTA sequence. Masking one residue gives every model the same context
 whatever its objective: a masked language model reads the mask, a T5 denoiser (ProtT5, ANKH) reads it through its
-decoder, so all are scored on one problem. Autoregressive models see only the left context and are left out.
+decoder, so all are scored on one problem. Autoregressive models see only the left context and are left out. ESM3
+large (98B) has no public weights: the Biohub API serves it, one request a masked residue (`BiohubScorer`, token
+`BIOHUB_TOKEN`), and `check-served` first scores the open ESM3 that way beside its local port on the dev set.
 
 The corpus. Every UniProtKB entry first released on or after 2026-11-01 (release 2026_04, 2026-11-04), 50 to 1,022
 residues, not a fragment, of the 20 standard residues only, is clustered by MMseqs2 at 30% identity over 80% coverage.
@@ -41,15 +45,19 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import subprocess
+import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 import numpy as np
 import torch
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from torch import Tensor
@@ -87,7 +95,7 @@ class ModelSpec:
     label: str
     family: str
     repo: str
-    kind: str  # "masked", "e1" or "t5"
+    kind: str  # "masked", "e1", "t5" or "biohub" (served by the Biohub API, `repo` its model name)
     # "masked_lm" (AutoModelForMaskedLM), "auto" (AutoModel, ESM3's sequence head) or "bert" (BertForMaskedLM, for
     # ProtBERT, whose config.json has no model_type for the Auto classes to read)
     loader: str = "masked_lm"
@@ -119,6 +127,7 @@ MODELS: dict[str, ModelSpec] = {spec.model_id: spec for spec in (
     ModelSpec("esmc_600m", "ESMC 600M", "ESMC", "Synthyra/ESMplusplus_large", "masked"),
     ModelSpec("esmc_6b", "ESMC 6B", "ESMC", "Synthyra/ESMplusplus_6B", "masked"),
     ModelSpec("esm3_small", "ESM3 open", "ESMC", "Synthyra/ESM3_small", "masked", loader="auto", logits_field="sequence_logits"),
+    ModelSpec("esm3_large", "ESM3 large", "ESMC", "esm3-large-2024-03", "biohub"),
     ModelSpec("prot_bert", "ProtBERT", "ProtTrans", "Rostlab/prot_bert", "masked", loader="bert", tokenizer="vocab_file"),
     ModelSpec("prot_bert_bfd", "ProtBERT-BFD", "ProtTrans", "Rostlab/prot_bert_bfd", "masked", loader="bert", tokenizer="vocab_file"),
     ModelSpec("prot_t5_xl_uniref50", "ProtT5-XL-U50", "ProtTrans", "Rostlab/prot_t5_xl_uniref50", "t5", formats=T5_PROTT5),
@@ -148,6 +157,7 @@ RELEASES: dict[str, tuple[str, str]] = {
     **{f"esmc_{size}": ("2024-12-04", "evolutionaryscale.ai/blog/esm-cambrian, dated 12.4.24 (the site writes month first)")
        for size in ("300m", "600m", "6b")},
     "esm3_small": ("2024-06-25", "evolutionaryscale.ai/blog/esm3-release, dated 6.25.24: open weights released"),
+    "esm3_large": ("2024-06-25", "evolutionaryscale.ai/blog/esm3-release, dated 6.25.24: the 98B model announced, served only by API"),
     "prot_bert": ("2020-07-12", "bioRxiv 10.1101/2020.07.12.199554 v1 (BERT on UniRef100 and BFD)"),
     "prot_bert_bfd": ("2020-07-12", "bioRxiv 10.1101/2020.07.12.199554 v1 (BERT on UniRef100 and BFD)"),
     "prot_t5_xl_uniref50": ("2021-05-04", "bioRxiv 10.1101/2020.07.12.199554 v3, the first version naming T5"),
@@ -162,6 +172,9 @@ RELEASES: dict[str, tuple[str, str]] = {
     **{f"e1_{size}": ("2025-11", "bioRxiv DOI 10.1101/2025.11.12, linked from github.com/Profluent-AI/E1") for size in ("150m", "300m", "600m")},
 }
 assert RELEASES.keys() == MODELS.keys(), sorted(RELEASES.keys() ^ MODELS.keys())
+# A served model's size as its provider states it, read on 2026-11-24 from docs.biohub.ai/models/esm3 (Variants).
+SERVED_PARAMETERS = {"esm3_large": 98_000_000_000}
+assert SERVED_PARAMETERS.keys() == {model_id for model_id, spec in MODELS.items() if spec.kind == "biohub"}
 
 # Left out: AMPLIFY (its remote code imports xformers, which has no aarch64 wheel for the GH200), SaProt (its tokens pair
 # each residue with a structure letter), ProGen2 and ProtGPT2 (autoregressive: left context only).
@@ -644,7 +657,127 @@ def residue_token_ids(tokenizer: object) -> list[int]:
     return ids
 
 
-def build_scorer(spec: ModelSpec, revision: str, device: torch.device, form: tuple[str, str, str] | None = None) -> object:
+# ESM3's sequence vocabulary (`esm/utils/constants/esm3.py` in github.com/Biohub/esm): cls, pad, eos, unk, the residues.
+ESM3_SEQUENCE_VOCAB = ("<cls>", "<pad>", "<eos>", "<unk>", "L", "A", "G", "V", "S", "E", "R", "T", "I", "D", "P", "K", "Q", "N",
+                       "F", "Y", "M", "H", "W", "C", "X", "B", "U", "Z", "O", ".", "-", "|", "<mask>")
+ESM3_BOS, ESM3_EOS, ESM3_MASK = 0, 2, 32
+# The sequence track only; the service refuses or ignores the others (docs.biohub.ai/api/protein/models/logits).
+SERVED_LOGITS_CONFIG = {"sequence": True, "structure": False, "secondary_structure": False, "sasa": False, "function": False,
+                        "residue_annotations": False, "return_embeddings": False, "return_mean_embedding": False,
+                        "return_hidden_states": False, "return_mean_hidden_states": False, "ith_hidden_layer": -1}
+SERVED_ATTEMPTS = 8
+
+
+class BiohubScorer:
+    """A model the Biohub API serves and nobody can download (ESM3 large): one `logits` request a masked residue, every
+    other residue visible, the row a local model's scorer reads. Each protein's K log-probabilities are appended to
+    `cache` as they land, so an interrupted run resumes without paying for a request twice; `tokens_used` sums what the
+    service reported billing (one token a residue, measured 2026-11-24).
+
+    `workers` proteins are requested at once (`prefetch`), so K x workers requests are in flight. Biohub publishes no
+    limit for `logits`, so its answers set the pace: a 429 or a server error pauses every request for its Retry-After
+    (else a doubling wait), each is printed and counted in `retries`, and a run that sees them should use fewer workers."""
+
+    def __init__(self, spec: ModelSpec, cache: Path, workers: int = 1) -> None:
+        from foundry.biohub import BIOHUB_TOKEN_ENV_KEY, DEFAULT_BIOHUB_URL
+        from foundry.secrets_env import load_secrets_env
+
+        load_secrets_env(names=[BIOHUB_TOKEN_ENV_KEY])
+        assert os.environ.get(BIOHUB_TOKEN_ENV_KEY), f"{BIOHUB_TOKEN_ENV_KEY} is not set"
+        assert workers >= 1, workers
+        self.spec, self.cache, self.token_name, self.workers = spec, cache, BIOHUB_TOKEN_ENV_KEY, workers
+        self.url = f"{DEFAULT_BIOHUB_URL}/api/v1/logits"
+        self.residue_ids = torch.tensor([ESM3_SEQUENCE_VOCAB.index(residue) for residue in STANDARD_RESIDUES])  # (c,)
+        self.lock = threading.Lock()  # the cache file, the counts and the shared pause
+        self.paused_until = 0.0  # time.monotonic() before which no request is sent
+        self.retries: dict[str, int] = {}
+        self.done: dict[str, list[float]] = {}
+        self.tokens_used = 0
+        if cache.exists():
+            for line in cache.read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                self.done[row["key"]] = row["log_probs"]
+                self.tokens_used += row["tokens_used"]
+
+    @staticmethod
+    def key(sequence: str, positions: tuple[int, ...]) -> str:
+        return f"{hashlib.sha256(sequence.encode()).hexdigest()[:16]}:{','.join(map(str, positions))}"
+
+    def __call__(self, sequence: str, positions: tuple[int, ...]) -> np.ndarray:
+        key = self.key(sequence, positions)
+        if key not in self.done:
+            self.fetch(sequence, positions)
+        return np.asarray(self.done[key], dtype=np.float64)  # (K,)
+
+    def prefetch(self, proteins: list[Protein]) -> None:
+        """Request every protein not yet cached, `workers` at a time, printing the pace every 100 proteins."""
+        missing = [protein for protein in proteins if self.key(protein.sequence, protein.positions) not in self.done]
+        started, finished = time.perf_counter(), 0
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            for _ in pool.map(lambda protein: self.fetch(protein.sequence, protein.positions), missing):
+                finished += 1
+                if finished % 100 == 0 or finished == len(missing):
+                    minutes = (time.perf_counter() - started) / 60
+                    print(f"{self.spec.model_id}: {finished}/{len(missing)} proteins, {finished / minutes:.1f} a minute, "
+                          f"{self.tokens_used:,} tokens, retries {self.retries}", flush=True)
+
+    def fetch(self, sequence: str, positions: tuple[int, ...]) -> None:
+        with ThreadPoolExecutor(max_workers=len(positions)) as pool:  # a protein's K requests side by side
+            replies = list(pool.map(lambda position: self.request(sequence, position), positions))
+        rows = torch.tensor([row for row, _ in replies], dtype=torch.float32)  # (K, V)
+        log_probs = residue_log_probs(rows, self.residue_ids, sequence, positions)  # (K,)
+        tokens = sum(billed for _, billed in replies)
+        with self.lock:
+            with self.cache.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"key": self.key(sequence, positions), "log_probs": log_probs.tolist(), "tokens_used": tokens}) + "\n")
+            self.done[self.key(sequence, positions)] = log_probs.tolist()
+            self.tokens_used += tokens
+
+    def wait_out_pause(self) -> None:
+        while (remaining := self.paused_until - time.monotonic()) > 0:
+            time.sleep(remaining)
+
+    def pause(self, wait: float, reason: str) -> None:
+        with self.lock:
+            self.retries[reason] = self.retries.get(reason, 0) + 1
+            self.paused_until = max(self.paused_until, time.monotonic() + wait)
+        print(f"{self.spec.model_id}: {reason}, every request waits {wait:.0f} s", flush=True)
+
+    def request(self, sequence: str, position: int) -> tuple[list[float], int]:
+        """The masked row's logits over ESM3's vocabulary and the tokens billed; a rate limit or a server error pauses
+        every request (its Retry-After, else doubling) and tries again, anything else fails the run."""
+        from foundry.biohub import RETRY_STATUS_CODES, BiohubAPIError
+
+        ids = [ESM3_BOS, *(ESM3_SEQUENCE_VOCAB.index(residue) for residue in sequence), ESM3_EOS]  # L + 2
+        ids[position + 1] = ESM3_MASK
+        body = json.dumps({"model": self.spec.repo, "inputs": {"sequence": ids}, "logits_config": SERVED_LOGITS_CONFIG}).encode()
+        headers = {"Authorization": f"Bearer {os.environ[self.token_name]}", "Content-Type": "application/json", "Accept": "application/json"}
+        for attempt in range(SERVED_ATTEMPTS):
+            self.wait_out_pause()
+            last = attempt == SERVED_ATTEMPTS - 1
+            try:
+                with urllib.request.urlopen(urllib.request.Request(self.url, data=body, headers=headers, method="POST"), timeout=300) as response:  # nosec: the service's fixed https URL
+                    data = json.loads(response.read())
+                break
+            except urllib.error.HTTPError as error:
+                if error.code not in RETRY_STATUS_CODES or last:
+                    raise BiohubAPIError(error.code, error.read().decode(errors="replace")[:500]) from error
+                self.pause(min(float(error.headers.get("Retry-After") or 2 ** attempt), 120.0), f"HTTP {error.code}")
+            except (urllib.error.URLError, TimeoutError) as error:
+                if last:
+                    raise
+                self.pause(min(float(2 ** attempt), 120.0), type(error).__name__)
+        assert data["model"] == self.spec.repo, f"asked for {self.spec.repo}, served {data['model']}"
+        logits = data["logits"]["sequence"]  # (L + 2, V)
+        assert len(logits) == len(ids), f"{len(logits)} rows of logits for {len(ids)} tokens"
+        return logits[position + 1], int(data["tokens_used"])
+
+
+def build_scorer(spec: ModelSpec, revision: str, device: torch.device, form: tuple[str, str, str] | None = None,
+                 cache: Path | None = None, served_workers: int = 1) -> object:
+    if spec.kind == "biohub":
+        assert cache is not None, f"{spec.model_id} is served, and its requests are cached"
+        return BiohubScorer(spec, cache, served_workers)
     if spec.kind == "masked":
         return MaskedScorer(spec, revision, device, form)
     if spec.kind == "e1":
@@ -655,6 +788,8 @@ def build_scorer(spec: ModelSpec, revision: str, device: torch.device, form: tup
 
 def score_proteins(scorer: object, proteins: list[Protein]) -> np.ndarray:
     """ln p of every protein's K true residues."""
+    if isinstance(scorer, BiohubScorer):
+        scorer.prefetch(proteins)  # every request in flight `workers` proteins at a time; the stack below reads the cache
     return np.stack([scorer(protein.sequence, protein.positions) for protein in proteins])  # type: ignore[operator]  # (n, K)
 
 
@@ -684,7 +819,7 @@ def fetch_models(state_dir: Path, model_ids: list[str]) -> None:
         print(f"{model_id}: {spec.repo}@{pins[model_id][:12]} in {time.perf_counter() - started:.0f} s", flush=True)
 
 
-def score_models(state_dir: Path, model_ids: list[str], device: torch.device) -> None:
+def score_models(state_dir: Path, model_ids: list[str], device: torch.device, served_workers: int = 1) -> None:
     corpus, dev = read_proteins(state_dir / "corpus.jsonl"), read_proteins(state_dir / "dev.jsonl")
     manifest = json.loads((state_dir / "corpus.json").read_text(encoding="utf-8"))
     assert sha256(state_dir / "corpus.jsonl") == manifest["corpus_sha256"], "corpus.jsonl changed since it was built"
@@ -697,8 +832,10 @@ def score_models(state_dir: Path, model_ids: list[str], device: torch.device) ->
         if output.exists():
             print(f"{model_id}: done", flush=True)
             continue
+        # A served model's name carries its version (`esm3-large-2024-03`); a downloaded one is pinned by `fetch`.
+        revision = MODELS[model_id].repo if MODELS[model_id].kind == "biohub" else revisions[model_id]
         try:
-            score_model(model_id, revisions[model_id], corpus, dev, manifest, output, device)
+            score_model(model_id, revision, corpus, dev, manifest, output, device, served_workers)
             (output_dir / f"{model_id}.error.txt").unlink(missing_ok=True)  # an earlier attempt's traceback no longer holds
         except Exception:  # one model's failure is its record, and the list goes on; the command still fails at the end
             (output_dir / f"{model_id}.error.txt").write_text(traceback.format_exc(), encoding="utf-8")
@@ -710,7 +847,7 @@ def score_models(state_dir: Path, model_ids: list[str], device: torch.device) ->
 
 
 def score_model(model_id: str, revision: str, corpus: list[Protein], dev: list[Protein], manifest: dict[str, object],
-                output: Path, device: torch.device) -> None:
+                output: Path, device: torch.device, served_workers: int = 1) -> None:
     """One model's bits per residue on the corpus at a pinned revision, its input format (a T5 model's, DPLM2's layout)
     first chosen on the dev set."""
     spec = MODELS[model_id]
@@ -729,21 +866,38 @@ def score_model(model_id: str, revision: str, corpus: list[Protein], dev: list[P
         usable = [row for row in dev_formats if row["dev_bits"] is not None]
         assert usable, f"{model_id}: no candidate format loads"
         form = tuple(min(usable, key=lambda row: row["dev_bits"])["format"])  # type: ignore[arg-type, return-value]
-    scorer = build_scorer(spec, revision, device, form)
+    cache = output.with_suffix(".partial.jsonl")  # a served model's requests so far; the figure reads only *.json
+    scorer = build_scorer(spec, revision, device, form, cache, served_workers)
     dev_summary = summary(score_proteins(scorer, dev))
     log_probs = score_proteins(scorer, corpus)  # (n, K)
-    parameters = sum(parameter.numel() for parameter in scorer.model.parameters())  # type: ignore[attr-defined]
+    served = spec.kind == "biohub"
+    parameters = SERVED_PARAMETERS[model_id] if served else sum(parameter.numel() for parameter in scorer.model.parameters())  # type: ignore[attr-defined]
     report = {"model_id": model_id, "label": spec.label, "family": spec.family, "repo": spec.repo, "revision": revision,
               "kind": spec.kind, "format": list(form) if form else None, "dev_formats": dev_formats,
               "dev_bits_per_residue": dev_summary["bits_per_residue"], "parameters": parameters,
               "corpus_sha256": manifest["corpus_sha256"], **summary(log_probs),
               "log_probs": log_probs.round(6).tolist(), "seconds": round(time.perf_counter() - started, 1),
+              **({"tokens_used": scorer.tokens_used, "served_retries": scorer.retries} if served else {}),  # type: ignore[attr-defined]
               "environment": benchmark.environment(device)}
     output.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+    cache.unlink(missing_ok=True)  # the report holds every log-probability the cache did
     print(json.dumps({model_id: {key: report[key] for key in ("bits_per_residue", "ci95", "dev_bits_per_residue", "format", "seconds")}}),
           flush=True)
     del scorer
     torch.cuda.empty_cache()
+
+
+def check_served(state_dir: Path, model: str, against: str) -> None:
+    """A served model's dev-set bits beside a downloaded model's: the open ESM3 served by Biohub against the local port
+    of its weights checks the request, the vocabulary and the row read before a model only the service has is scored."""
+    spec = ModelSpec(f"check_{model}", model, "", model, "biohub")
+    scorer = BiohubScorer(spec, state_dir / f"check_{model}.partial.jsonl")
+    served = summary(score_proteins(scorer, read_proteins(state_dir / "dev.jsonl")))["bits_per_residue"]
+    local = json.loads((state_dir / "scores" / f"{against}.json").read_text(encoding="utf-8"))["dev_bits_per_residue"]
+    report = {"served": model, "local": against, "served_dev_bits": served, "local_dev_bits": local,
+              "difference": served - local, "tokens_used": scorer.tokens_used}
+    (state_dir / f"check_{model}.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(report), flush=True)
 
 
 # The star: a speedrun run rebuilt from its own snapshot (`probe.load_run_snapshot`).
@@ -928,6 +1082,7 @@ FIGURE_EXCLUDED = {
 SERIES: tuple[tuple[str, ...], ...] = (
     ("esm2_8m", "esm2_35m", "esm2_150m", "esm2_650m", "esm2_3b", "esm2_15b"),
     ("esmc_300m", "esmc_600m", "esmc_6b"),
+    ("esm3_small", "esm3_large"),
     ("ankh_base", "ankh_large"),
     ("dplm_150m", "dplm_650m", "dplm_3b"),
     ("dplm2_150m", "dplm2_650m", "dplm2_3b"),
@@ -1051,10 +1206,18 @@ def main() -> None:
     corpus.add_argument("--threads", type=int, default=32)
     score = commands.add_parser("score")
     score.add_argument("--state-dir", type=Path, required=True)
-    score.add_argument("--models", nargs="+", default=list(MODELS), choices=list(MODELS))
+    # A served model spends the account's credits, so only naming it scores it.
+    score.add_argument("--models", nargs="+", default=[model_id for model_id, spec in MODELS.items() if spec.kind != "biohub"],
+                       choices=list(MODELS))
+    score.add_argument("--served-workers", type=int, default=1, help="a served model's proteins requested at once, K requests each")
     fetch = commands.add_parser("fetch")
     fetch.add_argument("--state-dir", type=Path, required=True)
-    fetch.add_argument("--models", nargs="+", default=list(MODELS), choices=list(MODELS))
+    fetch.add_argument("--models", nargs="+", default=[model_id for model_id, spec in MODELS.items() if spec.kind != "biohub"],
+                       choices=[model_id for model_id, spec in MODELS.items() if spec.kind != "biohub"])
+    served = commands.add_parser("check-served")
+    served.add_argument("--state-dir", type=Path, required=True)
+    served.add_argument("--model", default="esm3-open-2024-03", help="a model name the Biohub API serves")
+    served.add_argument("--against", default="esm3_small", choices=list(MODELS), help="the scored local model of the same weights")
     star = commands.add_parser("star")
     star.add_argument("--state-dir", type=Path, required=True)
     source = star.add_mutually_exclusive_group(required=True)
@@ -1091,8 +1254,10 @@ def main() -> None:
         search_relatives(arguments.state_dir, arguments.data_dir, arguments.threads, arguments.searches)
     elif arguments.command == "fetch":
         fetch_models(arguments.state_dir, arguments.models)
+    elif arguments.command == "check-served":
+        check_served(arguments.state_dir, arguments.model, arguments.against)
     elif arguments.command == "score":
-        score_models(arguments.state_dir, arguments.models, torch.device(arguments.device))
+        score_models(arguments.state_dir, arguments.models, torch.device(arguments.device), arguments.served_workers)
     elif arguments.command == "star":
         score_star(arguments.state_dir, arguments.run, arguments.run_dir, arguments.output, torch.device(arguments.device))
     else:

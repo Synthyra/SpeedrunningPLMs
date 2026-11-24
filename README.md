@@ -31,10 +31,10 @@ by protein length: the records and ESM2 lose less on long proteins, ESMC more.
 
 OpenAI follows its models on one held-out code set by log-perplexity
 ([Perplexity and intelligence](https://openai.com/index/perplexity-and-intelligence/), 2026-11-22). The protein version
-below scores 28 popular protein language models and the 1-hour record on 2,000 proteins that first entered UniProtKB in
+below scores 29 popular protein language models and the 1-hour record on 2,000 proteins that first entered UniProtKB in
 release 2026_04, months after every one of the models was public, and the record's star moves whenever the record does.
 
-![Bits per residue of 28 protein language models and the 1-hour record on new UniProt proteins](assets/perplexity_frontier.png)
+![Bits per residue of 29 protein language models and the 1-hour record on new UniProt proteins](assets/perplexity_frontier.png)
 
 **A.** Bits per residue against each model's first public release. **B.** The same against parameters, the sizes of one
 model joined. The star is the 1-hour record, the dashed line uniform guessing over the 20 residues, and the dotted lines
@@ -46,7 +46,8 @@ table's 4.120. Each protein is one uniformly drawn member of one of 2,000 unifor
 over 80% coverage), so no family counts twice and a cluster's representative is no likelier than its other members.
 Eight residues of each are masked one at a time, and the model's probability of the true residue, renormalized over
 the 20 standard residues, gives the bits. The input formats of the T5 models and DPLM2's track layout were chosen on a
-separate 100-protein dev set. The other models trained on large sequence databases such as UniRef, which hold
+separate 100-protein dev set. ESM3 large (98B) has no public weights and was scored the same way through the Biohub
+API; the open ESM3 scored through the API matches its local copy within 0.0003 bits on the dev set. The other models trained on large sequence databases such as UniRef, which hold
 relatives of many of these proteins, while the record trained for one hour on AFDB v6 alone, without the 2 training
 proteins that are exact copies of benchmark proteins, and 1,203 of the 2,100 benchmark proteins still have a relative
 in its training data at 30% identity over half of either sequence. ANKH3 large and XL are scored but left out. With
@@ -62,6 +63,7 @@ either.
 |---|---|---|---|---|
 | ESMC 6B | 2024-12-04 | 6.4B | 2.567 | 2.515 to 2.619 |
 | ESM2 15B | 2022-08 | 15.1B | 2.777 | 2.730 to 2.825 |
+| ESM3 large (Biohub API) | 2024-06-25 | 98.0B | 2.803 | 2.755 to 2.850 |
 | ANKH2 large (sentinel, `<extra_id_0>`) | 2024-07-07 | 1.9B | 2.845 | 2.797 to 2.892 |
 | ProtT5-XL-U50 (bart, `<extra_id_0>`) | 2021-05-04 | 2.8B | 2.905 | 2.859 to 2.953 |
 | ESM2 3B | 2022-08 | 2.8B | 2.929 | 2.884 to 2.973 |
