@@ -31,26 +31,31 @@ by protein length: the records and ESM2 lose less on long proteins, ESMC more.
 
 OpenAI follows its models on one held-out code set by log-perplexity
 ([Perplexity and intelligence](https://openai.com/index/perplexity-and-intelligence/), 2026-11-22). The protein version
-below scores 29 popular protein language models and the 1-hour record on 2,000 proteins that first entered UniProtKB in
-release 2026_04, months after every one of the models was public, and the record's star moves whenever the record does.
+below scores 29 popular protein language models and the speedrun's records on 2,000 proteins that first entered
+UniProtKB in release 2026_04, months after every one of the models was public, and a record's star moves whenever the
+record does.
 
-![Bits per residue of 29 protein language models and the 1-hour record on new UniProt proteins](assets/perplexity_frontier.png)
+![Bits per residue of 29 protein language models and the speedrun's records on new UniProt proteins](assets/perplexity_frontier.png)
 
 **A.** Bits per residue against each model's first public release. **B.** The same against parameters, the sizes of one
-model joined. The star is the 1-hour record, the dashed line uniform guessing over the 20 residues, and the dotted lines
-lookup tables counted on the speedrun's training data that predict the masked residue from 0, 1, or 2 residues on
-each side.
+model joined. The stars are the 10-minute and 1-hour records and this repository's first trainer's 9-hour run of
+December 2024, the dashed line uniform guessing over the 20 residues, and the dotted lines lookup tables counted on the
+speedrun's training data that predict the masked residue from 0, 1, or 2 residues on each side.
 
-ESMC 6B leads at 2.567 bits per residue, and the record reads 3.805, behind ESM2 8M's 3.699 and ahead of the 5-mer
-table's 4.120. Each protein is one uniformly drawn member of one of 2,000 uniformly drawn clusters (MMseqs2, 30% identity
-over 80% coverage), so no family counts twice and a cluster's representative is no likelier than its other members.
-Eight residues of each are masked one at a time, and the model's probability of the true residue, renormalized over
-the 20 standard residues, gives the bits. The input formats of the T5 models and DPLM2's track layout were chosen on a
-separate 100-protein dev set. ESM3 large (98B) has no public weights and was scored the same way through the Biohub
-API; the open ESM3 scored through the API matches its local copy within 0.0003 bits on the dev set. The other models trained on large sequence databases such as UniRef, which hold
-relatives of many of these proteins, while the record trained for one hour on AFDB v6 alone, without the 2 training
-proteins that are exact copies of benchmark proteins, and 1,203 of the 2,100 benchmark proteins still have a relative
-in its training data at 30% identity over half of either sequence. ANKH3 large and XL are scored but left out. With
+ESMC 6B leads at 2.567 bits per residue. The 1-hour record reads 3.805, behind ESM2 8M's 3.699 and ahead of the 5-mer
+table's 4.120, and the 10-minute record reads 3.863. The first trainer, a 132M U-Net transformer run for 9 hours on OMG
+prot50, reads 3.702, level with ESM2 8M; its data, architecture and recipe all differ from the records', so its lead
+does not separate time from method. Its 45-hour run's weights no longer exist, so it has no star. Each protein is one
+uniformly drawn member of one of 2,000 uniformly drawn clusters (MMseqs2, 30% identity over 80% coverage), so no family
+counts twice and a cluster's representative is no likelier than its other members. Eight residues of each are masked
+one at a time, and the model's probability of the true residue, renormalized over the 20 standard residues, gives the
+bits. The input formats of the T5 models and DPLM2's track layout were chosen on a separate 100-protein dev set. ESM3
+large (98B) has no public weights and was scored the same way through the Biohub API; the open ESM3 scored through the
+API matches its local copy within 0.0003 bits on the dev set. The other models trained on large sequence databases
+such as UniRef, which hold relatives of many of these proteins, while the 1-hour record trained on AFDB v6 alone,
+without the 2 training proteins that are exact copies of benchmark proteins (the 10-minute record kept them), and 1,203
+of the 2,100 benchmark proteins still have a relative in its training data at 30% identity over half of either
+sequence. ANKH3 large and XL are scored but left out. With
 the authors' own likelihood code, ANKH3 XL reads 3.58 bits with one masked residue and 2.97 with 15% of residues masked
 at once, the condition it trained under, so the one-mask rule misreads it, and ANKH3 large stays near uniform under
 either.
@@ -90,7 +95,9 @@ either.
 | ANKH base (sentinel, `<extra_id_0>`) | 2023-01-16 | 736M | 3.620 | 3.577 to 3.668 |
 | DPLM2 150M (aa only) | 2024-10-17 | 159M | 3.678 | 3.647 to 3.707 |
 | ESM2 8M | 2022-08 | 8M | 3.699 | 3.668 to 3.729 |
+| **speedrun, 9 h (2024)** (`esm150_speedrun_20000_steps`) | 2024-12-28 | 132M | 3.702 | 3.671 to 3.732 |
 | **speedrun, 1 h** (`h_auto11_bayes_01_minus_2026_04`) | 2026-11-23 | 199M | 3.805 | 3.778 to 3.833 |
+| **speedrun, 10 min** (`auto01_bayes_02`) | 2026-10-30 | 198M | 3.863 | 3.836 to 3.891 |
 | 5-mer lookup table (reference) | | | 4.120 | 4.105 to 4.134 |
 | 3-mer lookup table (reference) | | | 4.139 | 4.127 to 4.151 |
 | 1-mer lookup table (reference) | | | 4.192 | 4.181 to 4.202 |

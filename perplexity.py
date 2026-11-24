@@ -9,6 +9,8 @@ release date. This is that plot for protein language models:
     python perplexity.py check-served --state-dir /state/perplexity --model esm3-open-2024-03 --against esm3_small
     python perplexity.py score --state-dir /state/perplexity --models esm3_large
     python perplexity.py star --state-dir /state/perplexity --run h_auto11_bayes_01
+    python perplexity.py star --state-dir /state/perplexity --run auto01_bayes_02 --output star_10min.json
+    python perplexity.py star --state-dir /state/perplexity --hub-2024 Synthyra/esm150_speedrun_20000_steps --output star_9h_2024.json
     python perplexity.py copies --state-dir /state/perplexity --data-dir /state/data/afdb_v6
     python perplexity.py relatives --state-dir /state/perplexity --data-dir /state/data/afdb_v6 --threads 48
     python perplexity.py kmers --state-dir /state/perplexity --data-dir /state/data/afdb_v6_minus_uniprot_2026_04
@@ -33,8 +35,10 @@ uniformly from each member. A disjoint 100 clusters, drawn the same way, are the
 format and smoke-tests every model, and never enters a reported number. Every scored model was public before
 2026-06-01, so none trained on these entries; a sequence may still have close relatives in a model's training data.
 
-The star is a speedrun run (`star`), rebuilt from its own `train.py` and `strategies/` snapshot in the private Hub
-repository `Synthyra/SpeedrunningPLMs-runs` and scored the same way; rerun it when the record moves.
+A star is a speedrun record (`star`, the files `STARS` names), scored the same way: the 10-minute and 1-hour records
+rebuilt from their own `train.py` and `strategies/` snapshots in the private Hub repository
+`Synthyra/SpeedrunningPLMs-runs` (rerun when a record moves), and the repository's first trainer's 9-hour run of
+December 2024 from its public Hub weights through `esm_speedrun_2024.py`.
 
 Symbols: K positions a protein, L residues, V a model's vocabulary, c = 20 standard residues.
 """
@@ -928,6 +932,51 @@ class SpeedrunScorer:
         return residue_log_probs(logits[rows, columns], self.residue_ids, sequence, positions)  # (K,)
 
 
+class Speedrun2024Scorer:
+    """The repository's first trainer's model (`esm_speedrun_2024.py`) on the same ESM2 alphabet. Its forward takes one
+    sequence, so a protein's K masked copies run one after another, in the dtypes it trained in."""
+
+    def __init__(self, repo: str, revision: str, device: torch.device) -> None:
+        from esm_speedrun_2024 import load_esm_speedrun_2024
+
+        self.model = load_esm_speedrun_2024(repo, revision, device)
+        self.device = device
+        self.residue_ids = benchmark.ESM2_RESIDUE_COLUMNS.to(device)  # (c,)
+
+    def __call__(self, sequence: str, positions: tuple[int, ...]) -> np.ndarray:
+        ids = torch.tensor([benchmark.CLS_ID, *(benchmark.tokens.ESM2_IDS[residue] for residue in sequence), benchmark.EOS_ID],
+                           device=self.device)  # (L + 2,)
+        rows = []
+        with torch.inference_mode():
+            for position in positions:
+                masked = ids.clone()  # (L + 2,)
+                masked[position + 1] = benchmark.MASK_ID
+                rows.append(self.model.sdpa_forward(masked)[0, position + 1])  # (1, L + 2, 33) -> (33,)
+        return residue_log_probs(torch.stack(rows), self.residue_ids, sequence, positions)  # (K, 33) -> (K,)
+
+
+def score_star_2024(state_dir: Path, repo: str, output: str, device: torch.device) -> None:
+    """The first trainer's run scored as a star, from its public Hub repository at the current revision."""
+    from huggingface_hub import HfApi
+
+    info = HfApi().model_info(repo)
+    corpus = read_proteins(state_dir / "corpus.jsonl")
+    manifest = json.loads((state_dir / "corpus.json").read_text(encoding="utf-8"))
+    started = time.perf_counter()
+    scorer = Speedrun2024Scorer(repo, info.sha, device)
+    log_probs = score_proteins(scorer, corpus)  # (n, K)
+    run = SPEEDRUN_2024[repo]
+    report = {"model_id": repo.split("/")[-1], "label": f"speedrun {run['hours']:g} h (2024)", "family": "speedrun", "repo": repo,
+              "revision": info.sha, "kind": "speedrun_2024", "parameters": sum(parameter.numel() for parameter in scorer.model.parameters()),
+              "budget_seconds": run["hours"] * 3600, **{key: value for key, value in run.items() if key != "hours"},
+              "run_finished_utc": info.created_at.isoformat(),  # the push that created the repository ended the run
+              "corpus_sha256": manifest["corpus_sha256"], **summary(log_probs),
+              "log_probs": log_probs.round(6).tolist(), "seconds": round(time.perf_counter() - started, 1),
+              "environment": benchmark.environment(device)}
+    (state_dir / output).write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps({repo: {key: report[key] for key in ("bits_per_residue", "ci95", "parameters", "seconds")}}), flush=True)
+
+
 def score_star(state_dir: Path, run: str | None, run_dir: Path | None, output: str, device: torch.device) -> None:
     """A speedrun run scored as a model: by name from the private runs repository, or a run folder on this machine."""
     from huggingface_hub import HfApi, snapshot_download
@@ -1090,7 +1139,21 @@ SERIES: tuple[tuple[str, ...], ...] = (
 )
 assert all(model_id in MODELS for series in SERIES for model_id in series)
 assert FIGURE_EXCLUDED.keys() <= MODELS.keys() and not FIGURE_EXCLUDED.keys() & {model_id for series in SERIES for model_id in series}
-STAR_LABEL = "speedrun, 1 h"
+# The speedrun's records, one star each: the file `star` wrote in the state directory, the label, and where the label
+# sits from the star in panels A and B (points, right of the star when positive). The headline 1-hour record stays
+# `star.json`; the 9-hour run is the repository's first trainer (December 2024, OMG prot50), the only one of its long
+# runs whose weights are still on the Hub (the 45-hour run's `Synthyra/esm_speedrun_100000` is gone).
+STARS: tuple[tuple[str, str, tuple[float, float], tuple[float, float]], ...] = (
+    # The 10-minute and 1-hour records sit 0.06 bits apart at one size and a month apart, so their labels split up and down.
+    ("star_10min.json", "speedrun, 10 min", (-8, 5), (8, 5)),
+    ("star.json", "speedrun, 1 h", (-8, -5), (8, -5)),
+    # The 9-hour run sits on DPLM2 150M (panel B) and beside it (panel A): its label reads left, clear of the lines.
+    ("star_9h_2024.json", "speedrun, 9 h (2024)", (-8, 7), (-8, 0)),
+)
+# The first trainer's run, read from its log (`logs_to_keep/e631bf18-f202-492b-a3b8-fbae2cb7484a.txt` in the repository
+# before commit 651248c): 20,000 steps of 524,288 tokens on OMG prot50 in 9.00 hours, test loss 2.2093 there.
+SPEEDRUN_2024 = {"Synthyra/esm150_speedrun_20000_steps": {"hours": 9.00, "steps": 20_000, "batch_tokens": 524_288, "data": "OMG prot50",
+                                                          "log_test_loss": 2.2093}}
 
 
 def release_date(text: str) -> np.datetime64:
@@ -1125,9 +1188,9 @@ def plot(state_dir: Path, output: Path) -> None:
         if report["model_id"] in FIGURE_EXCLUDED:
             print(f"left out: {report['model_id']} ({report['bits_per_residue']:.3f} bits), {FIGURE_EXCLUDED[report['model_id']]}")
     reports = [report for report in reports if report["model_id"] not in FIGURE_EXCLUDED]
-    star = json.loads((state_dir / "star.json").read_text(encoding="utf-8"))
+    stars = [(json.loads((state_dir / name).read_text(encoding="utf-8")), label, offsets) for name, label, *offsets in STARS]
     kmers = json.loads((state_dir / "kmers.json").read_text(encoding="utf-8"))
-    for report in [*reports, star, kmers]:
+    for report in [*reports, *(star for star, _, _ in stars), kmers]:
         assert report["corpus_sha256"] == manifest["corpus_sha256"], f"{report.get('model_id', 'kmers')} scored another corpus"
     references = [("uniform", float(np.log2(len(STANDARD_RESIDUES))), (0, (4, 3)))]
     references += [(name, model["bits_per_residue"], (0, (1, 2))) for name, model in kmers["models"].items()]
@@ -1136,7 +1199,6 @@ def plot(state_dir: Path, output: Path) -> None:
     plt.rcParams.update({"font.size": 7, "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": MUTED, "ytick.color": MUTED,
                          "axes.linewidth": 0.6, "xtick.major.width": 0.6, "ytick.major.width": 0.6, "xtick.minor.width": 0.4})
     figure, axes = plt.subplots(1, 2, figsize=(7.2, 3.0), sharey=True, constrained_layout=True)
-    star_date = np.datetime64(star["run_finished_utc"][:10])
     for axis, letter, x_of in ((axes[0], "A", lambda report: release_date(RELEASES[report["model_id"]][0])),
                                (axes[1], "B", lambda report: report["parameters"])):
         for _, reference, style in references:
@@ -1151,12 +1213,13 @@ def plot(state_dir: Path, output: Path) -> None:
             axis.scatter([x_of(report) for report in members], [report["bits_per_residue"] for report in members], s=24,
                          marker=MARKER[family], color=LINEAGE[family], edgecolors="white", linewidths=0.7, zorder=3,
                          label=LEGEND[family] if letter == "A" else None)
-        star_x = star_date if letter == "A" else star["parameters"]
-        axis.scatter([star_x], [star["bits_per_residue"]], s=120, marker="*", color=INK, edgecolors="white", linewidths=0.6,
-                     zorder=4, label=STAR_LABEL if letter == "A" else None)
-        left = letter == "A"  # the newest point sits at panel A's right edge, so its label reads leftward there
-        axis.annotate(STAR_LABEL, (star_x, star["bits_per_residue"]), xytext=(-8 if left else 8, 0), textcoords="offset points",
-                      ha="right" if left else "left", va="center", fontsize=6.5, color=INK)
+        for index, (star, label, offsets) in enumerate(stars):
+            star_x = np.datetime64(star["run_finished_utc"][:10]) if letter == "A" else star["parameters"]
+            axis.scatter([star_x], [star["bits_per_residue"]], s=90, marker="*", color=INK, edgecolors="white", linewidths=0.6,
+                         zorder=4, label="speedrun records" if letter == "A" and index == 0 else None)
+            offset = offsets[0] if letter == "A" else offsets[1]
+            axis.annotate(label.removeprefix("speedrun, "), (star_x, star["bits_per_residue"]), xytext=offset, textcoords="offset points",
+                          ha="right" if offset[0] < 0 else "left", va="center", fontsize=6.5, color=INK)
         axis.grid(axis="y", color=GRID, linewidth=0.5, zorder=0)
         axis.spines[["top", "right"]].set_visible(False)
         axis.text(-0.02, 1.02, letter, transform=axis.transAxes, fontsize=9, fontweight="bold", ha="right", va="bottom")
@@ -1175,19 +1238,19 @@ def plot(state_dir: Path, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=300)
     print(f"wrote {output}")
-    print(markdown_table(reports, star, kmers))
+    print(markdown_table(reports, [(star, label) for star, label, _ in stars], kmers))
 
 
 def parameter_text(parameters: int) -> str:
     return f"{parameters / 1e9:.1f}B" if parameters >= 1e9 else f"{parameters / 1e6:.0f}M"
 
 
-def markdown_table(reports: list[dict], star: dict, kmers: dict) -> str:
-    """Every scored point and reference, best first: the README's table of the figure."""
+def markdown_table(reports: list[dict], stars: list[tuple[dict, str]], kmers: dict) -> str:
+    """Every scored point, star and reference, best first: the README's table of the figure."""
     rows = [(report["bits_per_residue"], report["ci95"], report["label"], RELEASES[report["model_id"]][0], parameter_text(report["parameters"]),
              report.get("format")) for report in reports]
-    rows.append((star["bits_per_residue"], star["ci95"], f"**{STAR_LABEL}** (`{star['model_id']}`)", star["run_finished_utc"][:10],
-                 parameter_text(star["parameters"]), None))
+    rows += [(star["bits_per_residue"], star["ci95"], f"**{label}** (`{star['model_id']}`)", star["run_finished_utc"][:10],
+              parameter_text(star["parameters"]), None) for star, label in stars]
     rows += [(model["bits_per_residue"], model["ci95"], f"{name} lookup table (reference)", "", "", None) for name, model in kmers["models"].items()]
     lines = ["| Model | Released | Parameters | Bits per residue | 95% CI |", "|---|---|---|---|---|"]
     for bits, (low, high), label, released, parameters, form in sorted(rows, key=lambda row: row[0]):
@@ -1223,7 +1286,9 @@ def main() -> None:
     source = star.add_mutually_exclusive_group(required=True)
     source.add_argument("--run", help=f"a run's name in {RUNS_REPO}")
     source.add_argument("--run-dir", type=Path, help="a run folder on this machine")
-    star.add_argument("--output", default="star.json", help="the report's name in the state directory; the figure reads star.json")
+    source.add_argument("--hub-2024", choices=list(SPEEDRUN_2024), help="a run of the repository's first trainer, on the Hub")
+    star.add_argument("--threads", type=int, default=0, help="CPU threads for torch, 0 for its default")
+    star.add_argument("--output", default="star.json", help="the report's name in the state directory; the figure reads those `STARS` names")
     for command in (score, star):
         command.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     figure = commands.add_parser("plot")
@@ -1259,7 +1324,12 @@ def main() -> None:
     elif arguments.command == "score":
         score_models(arguments.state_dir, arguments.models, torch.device(arguments.device), arguments.served_workers)
     elif arguments.command == "star":
-        score_star(arguments.state_dir, arguments.run, arguments.run_dir, arguments.output, torch.device(arguments.device))
+        if arguments.threads:
+            torch.set_num_threads(arguments.threads)  # a CPU star on a shared machine keeps to its share
+        if arguments.hub_2024:
+            score_star_2024(arguments.state_dir, arguments.hub_2024, arguments.output, torch.device(arguments.device))
+        else:
+            score_star(arguments.state_dir, arguments.run, arguments.run_dir, arguments.output, torch.device(arguments.device))
     else:
         plot(arguments.state_dir, arguments.output)
 

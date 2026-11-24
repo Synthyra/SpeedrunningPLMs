@@ -177,10 +177,39 @@ def test_the_table_sorts_by_bits_and_writes_each_format_as_given() -> None:
                 "ci95": [3.3, 3.5], "format": ["aa_only", "", ""]}]
     star = {"model_id": "run", "parameters": 199_000_000, "bits_per_residue": 3.2, "ci95": [3.1, 3.3], "run_finished_utc": "2026-11-23T20:00:00Z"}
     kmers = {"models": {"1-mer": {"bits_per_residue": 4.19, "ci95": [4.18, 4.2]}}}
-    lines = perplexity.markdown_table(reports, star, kmers).splitlines()
+    old = {"model_id": "old_run", "parameters": 132_475_500, "bits_per_residue": 3.3, "ci95": [3.2, 3.4], "run_finished_utc": "2024-12-28T00:00:00Z"}
+    lines = perplexity.markdown_table(reports, [(star, "speedrun, 1 h"), (old, "speedrun, 9 h (2024)")], kmers).splitlines()
     assert lines[2].startswith("| ANKH3 large (sentinel, `<extra_id_0>`, `[NLU]`) | 2025-05-26 | 1.9B | 3.100 |")
-    assert lines[3].startswith(f"| **{perplexity.STAR_LABEL}** (`run`) | 2026-11-23 | 199M | 3.200 |")
-    assert lines[4].startswith("| DPLM2 150M (aa only) |") and lines[5].startswith("| 1-mer lookup table (reference) |")
+    assert lines[3].startswith("| **speedrun, 1 h** (`run`) | 2026-11-23 | 199M | 3.200 |")
+    assert lines[4].startswith("| **speedrun, 9 h (2024)** (`old_run`) | 2024-12-28 | 132M | 3.300 |")
+    assert lines[5].startswith("| DPLM2 150M (aa only) |") and lines[6].startswith("| 1-mer lookup table (reference) |")
+
+
+def test_the_2024_model_holds_the_checkpoints_tensors_and_reads_one_sequence() -> None:
+    import esm_speedrun_2024
+
+    # Synthyra/esm150_speedrun_20000_steps's safetensors header: 183 tensors, 132,477,036 values (the log's 132,475,500
+    # parameters and 24 rotary buffers of 64), float32 matrices and bfloat16 embeddings, scalars and buffers.
+    config = esm_speedrun_2024.ModelConfig(vocab_size=33, hidden_size=768, num_hidden_layers=24, num_attention_heads=6, expansion_ratio=8 / 3)
+    with torch.device("meta"):
+        model = esm_speedrun_2024.ESM(config).bfloat16()
+    for module in model.modules():
+        if isinstance(module, esm_speedrun_2024.CastedLinear):
+            module.float()
+    state = model.state_dict()
+    assert len(state) == 183 and sum(tensor.numel() for tensor in state.values()) == 132_477_036
+    assert sum(parameter.numel() for parameter in model.parameters()) == 132_475_500
+    expected = {"embed.weight": (torch.bfloat16, (33, 768)), "lm_head.weight": (torch.float32, (33, 768)), "skip_weights": (torch.bfloat16, (12,)),
+                "value_embeds.embed.11.weight": (torch.bfloat16, (33, 768)), "blocks.23.attn.qkv.weight": (torch.float32, (2304, 768)),
+                "blocks.23.attn.o_proj.weight": (torch.float32, (768, 768)), "blocks.23.attn.lambdas": (torch.bfloat16, (2,)),
+                "blocks.23.attn.rotary.inv_freq": (torch.bfloat16, (64,)), "blocks.23.lambdas": (torch.bfloat16, (2,)),
+                "blocks.23.mlp.up.weight": (torch.float32, (2048, 768)), "blocks.23.mlp.down.weight": (torch.float32, (768, 2048))}
+    for name, (dtype, shape) in expected.items():
+        assert (state[name].dtype, tuple(state[name].shape)) == (dtype, shape), name
+    small = esm_speedrun_2024.ESM(esm_speedrun_2024.ModelConfig(hidden_size=64, num_hidden_layers=4, num_attention_heads=4)).eval()
+    with torch.inference_mode():
+        logits = small.sdpa_forward(torch.tensor([0, 5, 6, 32, 7, 2]))  # (1, 6, 33)
+    assert logits.shape == (1, 6, 33) and logits.dtype == torch.float32 and bool(logits.abs().max() <= 30)
 
 
 def test_reference_labels_keep_their_gap_and_order() -> None:
